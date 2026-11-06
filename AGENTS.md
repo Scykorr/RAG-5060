@@ -11,6 +11,21 @@ Use only the RTX5060Ti pair: `ROADMAP_local_RAG_RTX5060Ti_16GB.md` + `CODEX_CURS
 
 Офлайн Python: один раз онлайн `bash scripts/vendor-python-wheels.sh` → `vendor/python-wheels*`; Dockerfile/`Обучение` harness ставят пакеты `--no-index`.
 
+## Chat: произвольные RU-запросы
+
+Перед правками чата/retrieval читать `docs/SKILLS.md` (S33–S34) и `apps/api/services/query_intent.py`.
+
+Система **разбирает intent** локально (не «свободный интернет-чат»):
+
+| Intent | Примеры | Как отвечает |
+| --- | --- | --- |
+| `catalog` | «сколько Чехова в базе? названия» | счётчик + список из имён файлов |
+| `author_overview` | «что сказать о творчестве Пушкина?» | фрагменты автора → обзор по источникам |
+| `summarize` | «изложение рассказа «Дуэль»» | поиск по названию → краткий пересказ |
+| `extractive` / `general` / `cloze` | факты, цитаты, пропуски | как раньше, с prefix корпуса |
+
+Ограничения: авторы из локального словаря alias; ответ только из индекса; без dense (N1) перефразы слабее. Новые авторы/интенты — расширять `query_intent.py` + обе копии SKILLS/ABILITIES.
+
 ## Multi-chat + Git (обязательно)
 
 Несколько чатов Cursor работают в **одном** дереве файлов. Чужую историю чата не видно — только диск и git.

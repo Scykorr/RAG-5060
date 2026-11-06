@@ -17,6 +17,14 @@ Closed remaining items from `.cursor/plans/admin_ui_launcher_1e36b3e7.plan.md`:
 
 ## 2026-11-06 — F14 Corpus Quality Loop
 
+## 2026-11-06 — Query intent (произвольные RU-запросы)
+
+- `apps/api/services/query_intent.py` + routing в `chat.py`: catalog / author_overview / summarize / extractive|cloze
+- Smoke: «сколько Чехова…» → catalog, 77 названий; AGENTS.md секция «Chat: произвольные RU-запросы»
+- Канон: S33–S34, A12; зеркала `Обучение/docs/*`
+
+## earlier — quality loop
+
 Implemented offline quality loop + doc search + incremental reload:
 - `/api/documents?q=` + corpus counts; Storage corpus metrics
 - `/api/admin/quality/*` (level, runs, eval import/synth, auto-improve)
