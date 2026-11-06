@@ -36,3 +36,5 @@
 | S30 | Служебные `_manifest`/служебные файлы — deny-list / tombstone | Чистый корпус | N6 |
 | S31 | Авто-категория: preview → UI выбор existing/new → confirm import | Пользователь жмёт итоговую кнопку | corpus_packs + UI |
 | S32 | `POST /documents/import-folder/preview` до загрузки; import только с `pack_mode`/`pack_id` | Не писать в индекс без выбора | documents.py |
+| S33 | Разбор intent запроса: catalog / author_overview / summarize / extractive / cloze | Произвольные RU вопросы | query_intent.py |
+| S34 | Catalog «сколько/названия Чехова» — из имён файлов, без LLM | Точный счётчик корпуса | chat catalog |

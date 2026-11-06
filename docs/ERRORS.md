@@ -55,3 +55,9 @@
 - root_cause: cloze-tail chunk without passage; highlight/quoted noise
 - fix: full-doc retrieve + ranker; attempt10 @0.95
 - status: fixed
+
+## 2026-11-06 — Arbitrary RU query intents
+- symptom: вопросы вида «о творчестве Пушкина», «сколько Чехова», «изложение рассказа» не маршрутизировались
+- root_cause: один extractive/general путь без intent
+- fix: query_intent (catalog/overview/summarize) + filename author catalog
+- status: fixed (Chekhov catalog smoke 77 titles)

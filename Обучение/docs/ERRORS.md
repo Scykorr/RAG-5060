@@ -287,3 +287,8 @@
 - root_cause: chat-eval-config only
 - fix: corpus_packs auto resolve on import-folder
 - status: fixed
+
+## 2026-11-06 — Arbitrary RU query intents
+- symptom: произвольные вопросы не разбирались
+- fix: query_intent + catalog/overview/summarize
+- status: fixed

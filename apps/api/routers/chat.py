@@ -13,6 +13,7 @@ from apps.api.auth import AuthUser, get_current_user
 from apps.api.db import get_db
 from apps.api.models import AppSetting, ChatMessage, ChatSession, Chunk, Document, DocumentVersion
 from apps.api.services import ollama as ollama_svc
+from apps.api.services import query_intent as qi
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -630,6 +631,9 @@ def _retrieve(
     limit: int = 8,
     scan: int = 600,
     filename_prefix: str = "",
+    name_contains: str | None = None,
+    title_contains: str | None = None,
+    require_terms: bool = True,
 ) -> list[Chunk]:
     focus = _retrieve_focus_text(question)
     terms = [
@@ -642,7 +646,9 @@ def _retrieve(
         for p in re.findall(r"[«\"]([^»\"]{4,80})[»\"]", question)
         if len(_norm_ru(p)) >= 5
     ]
-    if not terms and not phrases:
+    if title_contains and len(title_contains.strip()) >= 2:
+        phrases = [_norm_ru(title_contains)] + phrases
+    if require_terms and not terms and not phrases and not name_contains:
         return []
     from sqlalchemy import or_
 
@@ -664,17 +670,29 @@ def _retrieve(
         q = q.filter(DocumentVersion.original_name.startswith(prefixes[0]))
     elif len(prefixes) > 1:
         q = q.filter(or_(*[DocumentVersion.original_name.startswith(p) for p in prefixes]))
+    if name_contains:
+        q = q.filter(DocumentVersion.original_name.ilike(f"%{name_contains}%"))
+    if title_contains and len(title_contains.strip()) >= 2:
+        # Title tokens in filename (underscores) or free text
+        tnorm = title_contains.strip().replace(" ", "_")
+        q = q.filter(
+            or_(
+                DocumentVersion.original_name.ilike(f"%{tnorm}%"),
+                DocumentVersion.original_name.ilike(f"%{title_contains.strip()}%"),
+                Chunk.text.ilike(f"%{title_contains.strip()}%"),
+            )
+        )
     # Prefilter for large corpora: one distinctive quoted phrase OR the single
     # longest term. Multi-AND ILIKE was too brittle; multi-OR flooded LIMIT.
-    if phrases:
+    if phrases and not name_contains:
         q = q.filter(Chunk.text.ilike(f"%{phrases[0]}%"))
-    else:
+    elif not name_contains:
         rare = [t for t in sorted(set(terms), key=len, reverse=True) if len(t) >= 6]
         if rare:
             q = q.filter(Chunk.text.ilike(f"%{rare[0]}%"))
         elif terms:
             q = q.filter(or_(*[Chunk.text.ilike(f"%{t}%") for t in terms[:5]]))
-    max_scan = 8000 if prefixes else 5000
+    max_scan = 8000 if prefixes or name_contains else 5000
     q = q.limit(max(50, min(max_scan, int(scan))))
     # Distinctive multi-word needles from the question (helps RuCoS when query is embedded in doc).
     q_needles: list[str] = []
@@ -741,6 +759,83 @@ def _retrieve(
 def _title_from_question(q: str) -> str:
     t = " ".join(q.strip().split())
     return (t[:72] + "…") if len(t) > 72 else t or "Новый чат"
+
+
+def _list_author_works(
+    db: Session,
+    tenant_id,
+    *,
+    author_key: str,
+    filename_prefix: str = "",
+) -> list[dict[str, str]]:
+    """Catalog works for an author from document filenames (offline metadata)."""
+    from sqlalchemy import or_
+
+    q = (
+        db.query(DocumentVersion)
+        .join(Document, Document.id == DocumentVersion.document_id)
+        .filter(
+            Document.tenant_id == tenant_id,
+            Document.deleted_at.is_(None),
+            Document.status != "deleted",
+            Document.active_version_id == DocumentVersion.id,
+            DocumentVersion.original_name.ilike(f"%_{author_key}_%"),
+        )
+    )
+    prefixes = [p.strip() for p in (filename_prefix or "").split(",") if p.strip()]
+    if len(prefixes) == 1:
+        q = q.filter(DocumentVersion.original_name.startswith(prefixes[0]))
+    elif len(prefixes) > 1:
+        q = q.filter(or_(*[DocumentVersion.original_name.startswith(p) for p in prefixes]))
+    rows = q.order_by(DocumentVersion.original_name.asc()).all()
+    seen: set[str] = set()
+    out: list[dict[str, str]] = []
+    for ver in rows:
+        title = qi.parse_title_from_filename(ver.original_name)
+        key = _norm_ru(title)
+        if not key or key in seen:
+            continue
+        # Skip pure fragment duplicates by collapsing «фрагмент N»
+        base = re.sub(r"\s*фрагмент\s*\d+\s*$", "", title, flags=re.I).strip()
+        bkey = _norm_ru(base)
+        if bkey in seen:
+            continue
+        seen.add(key)
+        seen.add(bkey)
+        out.append(
+            {
+                "title": base or title,
+                "filename": ver.original_name,
+                "document_id": str(ver.document_id),
+            }
+        )
+    return out
+
+
+def _plural_works(n: int) -> str:
+    n_abs = abs(n) % 100
+    n1 = n_abs % 10
+    if 11 <= n_abs <= 14:
+        return "произведений"
+    if n1 == 1:
+        return "произведение"
+    if 2 <= n1 <= 4:
+        return "произведения"
+    return "произведений"
+
+
+def _format_catalog_answer(intent: qi.QueryIntent, works: list[dict[str, str]]) -> str:
+    who = intent.author_ru or intent.author_key or "автора"
+    who = who[:1].upper() + who[1:] if who else "Автора"
+    n = len(works)
+    lines = [f"В базе сейчас {n} {_plural_works(n)} {who}."]
+    if not works:
+        lines.append("Названия не найдены — проверьте категорию/импорт корпуса.")
+        return "\n".join(lines)
+    lines.append("Названия:")
+    for i, w in enumerate(works, start=1):
+        lines.append(f"{i}. {w['title']}")
+    return "\n".join(lines)
 
 
 def _session_for_user(db: Session, user: AuthUser, session_id: uuid.UUID | None) -> ChatSession:
@@ -852,83 +947,140 @@ def chat(
     db.add(user_msg)
     db.commit()
 
-    chunks = _retrieve(
-        db,
-        user.tenant_id,
-        body.question,
-        limit=cfg["limit"],
-        scan=cfg["scan"],
-        filename_prefix=cfg["prefix"],
-    )
-    if not chunks:
-        answer = "не найдено в документах"
-        outcome = "not_found"
-        used: list[dict] = []
+    intent = qi.analyze_query(body.question, prompt_mode=cfg["mode"])
+    if intent.intent in {"cloze", "catalog", "author_overview", "summarize"}:
+        effective_mode = intent.intent
+    elif intent.intent in {"extractive", "general"}:
+        effective_mode = intent.intent
     else:
-        numbered = []
-        citations = []
-        for i, ch in enumerate(chunks, start=1):
-            numbered.append(f"[{i}] {ch.text[:1200]}")
-            citations.append(
-                {
-                    "document_id": str(ch.document_id),
-                    "version_id": str(ch.version_id),
-                    "chunk_id": str(ch.id),
-                    "page": ch.page_start,
-                    "section": None,
-                    "label": i,
-                }
+        effective_mode = cfg["mode"] if cfg["mode"] in {"extractive", "cloze", "general"} else "general"
+
+    used: list[dict] = []
+    answer = ""
+    outcome = "partial"
+
+    # --- Catalog: count + titles from index metadata (no LLM required) ---
+    if effective_mode == "catalog" and intent.author_key:
+        works = _list_author_works(
+            db,
+            user.tenant_id,
+            author_key=intent.author_key,
+            filename_prefix=cfg["prefix"],
+        )
+        answer = _format_catalog_answer(intent, works)
+        used = [
+            {"document_id": w["document_id"], "version_id": None, "chunk_id": None, "page": None, "section": w["title"]}
+            for w in works[:40]
+        ]
+        outcome = "answer" if works else "partial"
+    else:
+        name_contains = f"_{intent.author_key}_" if intent.author_key else None
+        title_contains = intent.title
+        # Overview/summarize need broader scan inside author/title docs
+        scan = cfg["scan"]
+        limit = cfg["limit"]
+        if effective_mode in {"author_overview", "summarize"}:
+            scan = max(scan, 2500)
+            limit = max(limit, 12)
+        chunks = _retrieve(
+            db,
+            user.tenant_id,
+            body.question,
+            limit=limit,
+            scan=scan,
+            filename_prefix=cfg["prefix"],
+            name_contains=name_contains,
+            title_contains=title_contains,
+            require_terms=effective_mode not in {"author_overview", "summarize"},
+        )
+        # Fallback: author filter alone if title filter too strict
+        if not chunks and name_contains and title_contains:
+            chunks = _retrieve(
+                db,
+                user.tenant_id,
+                body.question,
+                limit=limit,
+                scan=scan,
+                filename_prefix=cfg["prefix"],
+                name_contains=name_contains,
+                title_contains=None,
+                require_terms=False,
             )
-        candidates = _extract_entity_candidates([c.text for c in chunks]) if cfg["mode"] == "cloze" else []
-        if cfg["mode"] == "cloze":
-            # Deterministic fill first — RuCoS blanks are entity spans attested in the passage.
-            fb = _cloze_fallback(body.question, chunks)
-            if fb and _norm_ru(fb) not in _ENTITY_DENY:
-                answer = fb
-            else:
-                prompt = _prompt_for_mode(cfg["mode"], body.question, numbered, candidates=candidates or None)
+        if not chunks:
+            answer = "не найдено в документах"
+            outcome = "not_found"
+        else:
+            numbered = []
+            citations = []
+            for i, ch in enumerate(chunks, start=1):
+                numbered.append(f"[{i}] {ch.text[:1200]}")
+                citations.append(
+                    {
+                        "document_id": str(ch.document_id),
+                        "version_id": str(ch.version_id),
+                        "chunk_id": str(ch.id),
+                        "page": ch.page_start,
+                        "section": None,
+                        "label": i,
+                    }
+                )
+            if effective_mode == "cloze" or (cfg["mode"] == "cloze" and "_____" in body.question):
+                candidates = _extract_entity_candidates([c.text for c in chunks])
+                fb = _cloze_fallback(body.question, chunks)
+                if fb and _norm_ru(fb) not in _ENTITY_DENY:
+                    answer = fb
+                else:
+                    prompt = _prompt_for_mode("cloze", body.question, numbered, candidates=candidates or None)
+                    try:
+                        answer = ollama_svc.generate(prompt, model, think=False)
+                    except Exception as exc:  # noqa: BLE001
+                        raise HTTPException(status_code=503, detail=f"LLM unavailable: {exc}") from exc
+                    answer = _postprocess_cloze_answer(answer or "", candidates)
+                    if (
+                        not answer
+                        or "не найдено" in (answer or "").lower()
+                        or _norm_ru(answer) in _ENTITY_DENY
+                        or len(answer) > 120
+                    ):
+                        answer = fb or answer
+            elif effective_mode in {"author_overview", "summarize"}:
+                prompt = qi.prompt_for_intent(intent, body.question, numbered)
                 try:
                     answer = ollama_svc.generate(prompt, model, think=False)
                 except Exception as exc:  # noqa: BLE001
                     raise HTTPException(status_code=503, detail=f"LLM unavailable: {exc}") from exc
-                answer = _postprocess_cloze_answer(answer or "", candidates)
-                if (
-                    not answer
-                    or "не найдено" in (answer or "").lower()
-                    or _norm_ru(answer) in _ENTITY_DENY
-                    or len(answer) > 120
-                ):
-                    answer = fb or answer
-        else:
-            prompt = _prompt_for_mode(cfg["mode"], body.question, numbered, candidates=None)
-            try:
-                answer = ollama_svc.generate(prompt, model, think=False)
-            except Exception as exc:  # noqa: BLE001
-                raise HTTPException(status_code=503, detail=f"LLM unavailable: {exc}") from exc
+            else:
+                mode = "extractive" if effective_mode == "extractive" else cfg["mode"]
+                if mode not in {"extractive", "cloze", "general"}:
+                    mode = "general"
+                prompt = _prompt_for_mode(mode, body.question, numbered, candidates=None)
+                try:
+                    answer = ollama_svc.generate(prompt, model, think=False)
+                except Exception as exc:  # noqa: BLE001
+                    raise HTTPException(status_code=503, detail=f"LLM unavailable: {exc}") from exc
 
-        used = []
-        referenced = False
-        for c in citations:
-            if f"[{c['label']}]" in (answer or ""):
-                referenced = True
-                used.append({k: v for k, v in c.items() if k != "label"})
-        if not referenced:
-            used = [{k: v for k, v in c.items() if k != "label"} for c in citations]
-        low = (answer or "").lower()
-        refuse = any(
-            x in low
-            for x in (
-                "не найдено",
-                "no relevant",
-                "not mentioned",
-                "not found",
-                "insufficient",
-                "cannot answer",
-                "don't know",
-                "do not know",
+            referenced = False
+            for c in citations:
+                if f"[{c['label']}]" in (answer or ""):
+                    referenced = True
+                    used.append({k: v for k, v in c.items() if k != "label"})
+            if not referenced:
+                used = [{k: v for k, v in c.items() if k != "label"} for c in citations]
+            low = (answer or "").lower()
+            refuse = any(
+                x in low
+                for x in (
+                    "не найдено",
+                    "no relevant",
+                    "not mentioned",
+                    "not found",
+                    "insufficient",
+                    "cannot answer",
+                    "don't know",
+                    "do not know",
+                )
             )
-        )
-        outcome = "partial" if refuse else ("answer" if answer else "partial")
+            outcome = "partial" if refuse else ("answer" if answer else "partial")
 
     asst = ChatMessage(
         session_id=session.id,
@@ -953,4 +1105,5 @@ def chat(
         "citations": used[:8],
         "model": model,
         "message_id": str(asst.id),
+        "intent": intent.to_dict(),
     }

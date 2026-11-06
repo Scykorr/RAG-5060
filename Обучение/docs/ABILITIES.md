@@ -1,6 +1,6 @@
-# Умения / способности системы (abilities)
+# Умения — зеркало docs/ABILITIES.md
 
-Зеркало канона `docs/ABILITIES.md`. История прогонов: `RESULTS.md`.
+Канон: `docs/ABILITIES.md`. Зеркало: `Обучение/docs/ABILITIES.md` (+ `RESULTS.md` прогонов).
 
 | ID | Умение | Уровень | Корпус/тест | Примечание |
 | --- | --- | --- | --- | --- |
@@ -16,6 +16,7 @@
 | A09 | Мультипакетный retrieval (comma prefixes) | yes | chat retrieve | `classic_,wildlife_` |
 | A10 | Авто-категория/префикс при импорте папки | yes | corpus_packs | preview + выбор пользователя |
 | A11 | UI: existing dropdown / new pack + «Загрузить» | yes | documents UI | без автозаписи до confirm |
+| A12 | Анализ произвольного RU-запроса (каталог/обзор/изложение) | yes | query_intent + chat | intent в ответе API |
 
 ## Контекст для смены документов
 
