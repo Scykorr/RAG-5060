@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RAG5060</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div id="toasts"></div>
+
+    <div id="login-gate">
+      <div class="login-card">
+        <div class="brand">RAG5060</div>
+        <h1>Локальный RAG</h1>
+        <p class="muted">Работает offline на этом ПК. По умолчанию: admin / admin</p>
+        <form id="login-form">
+          <input id="login-user" autocomplete="username" value="admin" placeholder="Логин" required />
+          <input id="login-pass" type="password" autocomplete="current-password" value="admin" placeholder="Пароль" required />
+          <button class="btn primary" type="submit">Войти</button>
+        </form>
+      </div>
+    </div>
+
+    <div id="app-shell" class="hidden">
+      <aside class="sidebar">
+        <div class="brand">RAG5060</div>
+        <button class="nav-btn active" data-tab="chat">Чат</button>
+        <button class="nav-btn" data-tab="dispatcher">Dashboard</button>
+        <button class="nav-btn" data-tab="system">System</button>
+        <button class="nav-btn" data-tab="documents">Документы</button>
+        <button class="nav-btn" data-tab="storage">Хранилище</button>
+        <button class="nav-btn" data-tab="quality">Качество</button>
+        <button class="nav-btn" data-tab="models">Модели</button>
+        <button class="nav-btn" data-tab="settings">Настройки</button>
+        <div class="sidebar-foot">
+          <div class="muted" id="user-label">admin</div>
+          <div class="pill offline-pill" title="Без CDN и внешних запросов UI">offline</div>
+          <button class="btn ghost" id="btn-logout">Выйти</button>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="topbar">
+          <h2 id="page-title">Чат</h2>
+          <button class="btn" id="btn-refresh">Обновить</button>
+        </div>
+
+        <section id="panel-chat" class="panel chat-layout">
+          <aside class="chat-sessions card">
+            <div class="chat-sessions-head">
+              <strong>Чаты</strong>
+              <div style="display:flex;gap:0.4rem;flex-wrap:wrap">
+                <button class="btn ghost" type="button" id="btn-purge-chats" title="Удалить все чаты">Очистить чаты</button>
+                <button class="btn danger" type="button" id="btn-reset-rag-chat" title="Чаты + индекс + scratch + Qdrant; навыки/умения/ошибки сохраняются">Очистить хранилище</button>
+                <button class="btn primary" type="button" id="btn-new-chat">+ Новый</button>
+              </div>
+            </div>
+            <div id="chat-session-list" class="chat-session-list"></div>
+          </aside>
+          <div class="chat-main card">
+            <div id="chat-log" class="chat-log"></div>
+            <form id="chat-form" class="chat-compose">
+              <textarea id="chat-q" rows="3" placeholder="Вопрос по документам…" required></textarea>
+              <button class="btn primary" type="submit">Спросить</button>
+            </form>
+          </div>
+        </section>
+
+        <section id="panel-dispatcher" class="panel hidden">
+          <div class="muted" id="dispatcher-stamp">—</div>
+          <div class="grid metrics" id="dispatcher-metrics"></div>
+          <h3 class="section-title">Сервисы</h3>
+          <div class="grid svc" id="dispatcher-services"></div>
+          <div class="grid two" style="margin-top:1rem">
+            <div class="card">
+              <strong>Очереди / слоты</strong>
+              <pre class="sys" id="dispatcher-queues">{}</pre>
+            </div>
+            <div class="card">
+              <strong>Корпус</strong>
+              <pre class="sys" id="dispatcher-corpus">{}</pre>
+            </div>
+          </div>
+          <h3 class="section-title">Ingestion jobs</h3>
+          <div class="card" id="dispatcher-jobs"></div>
+          <h3 class="section-title">Model jobs / folder import</h3>
+          <div class="grid two">
+            <div class="card" id="dispatcher-model-jobs"></div>
+            <div class="card"><pre class="sys" id="dispatcher-folder">{}</pre></div>
+          </div>
+        </section>
+
+        <section id="panel-documents" class="panel hidden">
+          <div class="grid two">
+            <div class="card">
+              <form id="upload-form">
+                <div class="form-row">
+                  <label class="label">Один файл PDF / DOCX / TXT</label>
+                  <input id="doc-file" type="file" accept=".pdf,.docx,.txt,application/pdf" required />
+                </div>
+                <button class="btn primary" type="submit">Загрузить</button>
+              </form>
+            </div>
+            <div class="card">
+              <p class="muted" id="inbox-hint">Папка импорта: D:/RAG5060/inbox</p>
+              <div class="form-row">
+                <label class="label">Подпапка</label>
+                <input id="inbox-subdir" type="text" placeholder="classic_ru или wildlife_ru" />
+              </div>
+              <p class="muted" style="margin:0.25rem 0 0.5rem">
+                Сначала «Подготовить импорт» — система предложит категорию. Выберите существующий префикс или создайте новый, затем нажмите «Загрузить в хранилище».
+              </p>
+              <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:0.5rem">
+                <button class="btn" type="button" id="btn-inbox-refresh">Показать файлы</button>
+                <button class="btn primary" type="button" id="btn-inbox-preview">Подготовить импорт</button>
+                <button class="btn" type="button" id="btn-corpus-packs">Список категорий</button>
+              </div>
+              <div id="inbox-files" class="muted" style="margin-top:0.75rem"></div>
+              <div id="import-pack-panel" class="card" style="margin-top:0.75rem;display:none">
+                <strong>Категория документов</strong>
+                <p class="muted" id="import-pack-suggest" style="margin:0.4rem 0"></p>
+                <div class="form-row">
+                  <label class="label"><input type="radio" name="pack-mode" id="pack-mode-existing" value="existing" checked /> Использовать существующую</label>
+                </div>
+                <div class="form-row">
+                  <label class="label" for="pack-existing-select">Префикс</label>
+                  <select id="pack-existing-select"></select>
+                </div>
+                <p class="muted" id="pack-existing-desc" style="margin:0.25rem 0 0.75rem"></p>
+                <div class="form-row">
+                  <label class="label"><input type="radio" name="pack-mode" id="pack-mode-new" value="new" /> Создать новую категорию</label>
+                </div>
+                <div class="form-row">
+                  <label class="label" for="pack-new-id">Идентификатор (→ префикс <span id="pack-new-prefix-hint">…_</span>)</label>
+                  <input id="pack-new-id" type="text" placeholder="wildlife" />
+                </div>
+                <div class="form-row">
+                  <label class="label" for="pack-new-label">Описание</label>
+                  <input id="pack-new-label" type="text" placeholder="Дикая природа России" />
+                </div>
+                <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:0.75rem">
+                  <button class="btn primary" type="button" id="btn-inbox-import-confirm">Загрузить в хранилище</button>
+                  <button class="btn ghost" type="button" id="btn-inbox-preview-cancel">Отмена</button>
+                </div>
+              </div>
+              <div id="inbox-import-status" class="muted" style="margin-top:0.5rem"></div>
+              <pre class="sys" id="corpus-packs-view" style="margin-top:0.5rem;display:none"></pre>
+            </div>
+          </div>
+          <div class="card" style="margin-top: 1rem">
+            <div class="grid metrics" id="docs-corpus-metrics" style="margin-bottom:0.75rem"></div>
+            <div style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center;margin-bottom:0.75rem">
+              <input id="doc-search" type="search" placeholder="Поиск по имени или тексту…" style="flex:1;min-width:12rem" />
+              <button class="btn" type="button" id="btn-doc-search">Найти</button>
+            </div>
+            <div id="doc-table"></div>
+          </div>
+        </section>
+
+        <section id="panel-quality" class="panel hidden">
+          <div class="grid metrics" id="quality-metrics"></div>
+          <div class="grid two" style="margin-top:1rem">
+            <div class="card">
+              <strong>Управление (offline)</strong>
+              <p class="muted">Оценка и усиление только локально: без интернета и без Cursor.</p>
+              <label class="label" style="display:flex;gap:0.5rem;align-items:center;margin:0.75rem 0">
+                <input type="checkbox" id="quality-auto" checked /> Автоусиление при импорте/дозагрузке
+              </label>
+              <div style="display:flex;gap:0.5rem;flex-wrap:wrap">
+                <button class="btn primary" type="button" id="btn-quality-run">Пересчитать качество</button>
+                <button class="btn" type="button" id="btn-quality-synth">Синтез вопросов из корпуса</button>
+                <button class="btn ghost" type="button" id="btn-quality-refresh">Обновить</button>
+              </div>
+              <div id="quality-run-status" class="muted" style="margin-top:0.75rem"></div>
+            </div>
+            <div class="card">
+              <strong>Импорт eval set (JSON)</strong>
+              <p class="muted">Массив объектов: question, gold_answers[]. Локальный файл.</p>
+              <textarea id="quality-eval-json" rows="6" placeholder='[{"question":"...","gold_answers":["..."]}]'></textarea>
+              <button class="btn" type="button" id="btn-quality-import" style="margin-top:0.5rem">Импортировать</button>
+            </div>
+          </div>
+          <h3 class="section-title">История прогонов</h3>
+          <div class="card" id="quality-runs"></div>
+        </section>
+
+        <section id="panel-system" class="panel hidden">
+          <div class="grid metrics" id="system-metrics"></div>
+          <div class="grid two" style="margin-top:1rem">
+            <div class="card">
+              <strong>Launcher / Compose</strong>
+              <pre class="sys" id="system-hints">{}</pre>
+            </div>
+            <div class="card">
+              <strong>Dependency errors</strong>
+              <pre class="sys" id="system-deps">{}</pre>
+            </div>
+          </div>
+          <h3 class="section-title">Safe log tail</h3>
+          <div class="card"><pre class="sys" id="system-logs">[]</pre></div>
+        </section>
+
+        <section id="panel-storage" class="panel hidden">
+          <div class="grid metrics" id="storage-summary"></div>
+          <div class="card" style="margin-top: 1rem">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.75rem;gap:0.5rem;flex-wrap:wrap">
+              <strong>Файлы</strong>
+              <div style="display:flex;gap:0.5rem;flex-wrap:wrap">
+                <button class="btn" id="btn-cleanup">Cleanup scratch</button>
+                <button class="btn" id="btn-cleanup-tomb">Cleanup tombstones</button>
+                <button class="btn" id="btn-purge-chats-storage" title="Удалить все чаты">Очистить чаты</button>
+                <button class="btn danger" id="btn-reset-rag" title="Чаты + документы + scratch + Qdrant; docs/SKILLS|ERRORS|ABILITIES не трогаются">Очистить всё хранилище и чаты</button>
+              </div>
+            </div>
+            <div id="storage-files"></div>
+          </div>
+        </section>
+
+        <section id="panel-models" class="panel hidden">
+          <div class="card" style="margin-bottom: 1rem">
+            <div class="label">Активная модель</div>
+            <div class="value" id="active-model">—</div>
+          </div>
+          <div class="grid two">
+            <div class="card">
+              <form id="pull-form">
+                <div class="form-row"><label class="label">Ollama tag</label><input id="pull-name" placeholder="qwen3:8b" required /></div>
+                <button class="btn primary" type="submit">Pull (нужен registry/offline pack)</button>
+              </form>
+              <hr class="sep" />
+              <form id="gguf-form">
+                <div class="form-row"><label class="label">Имя модели</label><input id="gguf-name" placeholder="my-gguf" required /></div>
+                <div class="form-row"><label class="label">GGUF файл</label><input id="gguf-file" type="file" accept=".gguf" required /></div>
+                <button class="btn primary" type="submit">Import GGUF</button>
+              </form>
+              <hr class="sep" />
+              <form id="url-form">
+                <div class="form-row"><label class="label">Имя</label><input id="url-name" required /></div>
+                <div class="form-row"><label class="label">URL (только если есть сеть)</label><input id="url-link" type="url" placeholder="https://…" required /></div>
+                <div class="form-row"><label class="label">SHA256 (опционально)</label><input id="url-sha" class="mono" placeholder="64 hex" maxlength="64" /></div>
+                <button class="btn primary" type="submit">Download & import</button>
+              </form>
+              <div id="model-job-status" class="muted" style="margin-top:0.75rem"></div>
+            </div>
+            <div class="card" id="model-list"></div>
+          </div>
+        </section>
+
+        <section id="panel-settings" class="panel hidden">
+          <div class="card" style="max-width:420px">
+            <h3 style="margin-top:0">Смена пароля</h3>
+            <p class="muted">Логин по умолчанию: admin / admin. После смены хранится только локально в PostgreSQL.</p>
+            <form id="password-form">
+              <div class="form-row"><label class="label">Текущий пароль</label><input id="pw-current" type="password" required /></div>
+              <div class="form-row"><label class="label">Новый пароль</label><input id="pw-new" type="password" minlength="4" required /></div>
+              <div class="form-row"><label class="label">Повтор</label><input id="pw-new2" type="password" minlength="4" required /></div>
+              <button class="btn primary" type="submit">Сохранить пароль</button>
+            </form>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

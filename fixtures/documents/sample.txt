@@ -1,0 +1,9 @@
+Invoice sample INV-001
+Total amount: 12500.00 RUB
+VAT rate: 20%
+Account code for office rent: 26.01
+Payment due: 2026-11-15
+
+Training lesson-01
+Objective: teach local RAG operators how to upload documents and ask questions with citations.
+Safety rules section: never send private documents to cloud APIs.

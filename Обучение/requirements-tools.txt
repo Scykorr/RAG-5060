@@ -1,0 +1,2 @@
+# Offline tools for Обучение harness (sample prep / parquet).
+pyarrow>=17.0.0,<20

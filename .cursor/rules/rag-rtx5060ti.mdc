@@ -1,0 +1,18 @@
+---
+description: Local RAG RTX5060Ti project constraints
+alwaysApply: true
+---
+
+# Local RAG (RTX 5060 Ti)
+
+- Source of truth: `ROADMAP_local_RAG_RTX5060Ti_16GB.md` + `CODEX_CURSOR_PROMPT_RTX5060Ti_16GB.md`.
+- Quality context (read/update like the system): `docs/SKILLS.md`, `docs/ERRORS.md`, `docs/ABILITIES.md` (also `Обучение/docs/*`).
+- Runtime: WSL2 Ubuntu-24.04 + Docker Engine (not Docker Desktop). VHDX/data on **D:**; keep **C: ≥ 50 GB** free.
+- MVP: one LLM generation, one ingestion job; Ollama on GPU; embeddings/Docling CPU-only.
+- Never trust client tenant/ACL fields; PostgreSQL is source of truth.
+- Do not claim GPU/WSL checks passed without artifacts under `artifacts/<run-id>/`.
+- No cloud document transmission; `OLLAMA_NO_CLOUD=1`.
+- Corpus switch: UI «Очистить всё хранилище» / `reset-rag` + filename prefix; skills/errors/abilities в `docs/` сохраняются.
+- Multi-topic: separate prefixes (`classic_`, `wildlife_`) or comma list; never mix without prefix policy.
+- Offline Python: `vendor/python-wheels` via `scripts/vendor-python-wheels.sh` (no PyPI on each start).
+- Multi-chat: before work `git status` + `git log -5` + `docs/progress.md`; after a finished slice commit (no secrets); do not clobber unexplained dirty trees.

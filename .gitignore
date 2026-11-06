@@ -1,0 +1,56 @@
+# Secrets / local env
+.env
+.env.local
+*.pem
+*.key
+
+# Python
+*.pyc
+__pycache__/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+coverage/
+*.egg-info/
+
+# Node / web build
+node_modules/
+apps/web/dist/
+playwright-report/
+test-results/
+
+# Build / launcher binaries
+dist/
+build/
+
+# Heavy / local runtime data (keep on D: outside git)
+models/
+data/
+*.vhdx
+*.gguf
+.wslconfig.local
+
+# Offline wheel caches (regenerate: scripts/vendor-python-wheels.sh)
+vendor/python-wheels/
+vendor/python-wheels-tools/
+
+# Smoke / eval dumps (summaries live in docs/progress.md)
+artifacts/
+Обучение/artifacts/
+!artifacts/.gitkeep
+
+# Large local datasets (keep paths; do not version blobs)
+*.zip
+*.parquet
+Обучение/Тест */
+# Runtime logs
+logs/
+*.log
+
+# OS / IDE noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
