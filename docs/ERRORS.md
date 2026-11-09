@@ -61,3 +61,9 @@
 - root_cause: один extractive/general путь без intent
 - fix: query_intent (catalog/overview/summarize) + filename author catalog
 - status: fixed (Chekhov catalog smoke 77 titles)
+
+## 2026-11-09 — Graph / zero embeddings
+- symptom: Qdrant points имеют нулевые векторы; cosine ANN бессмысленен
+- root_cause: `ingestion._maybe_qdrant_upsert` пишет `[0.0]*dim`
+- fix (graph): lexical `token_jaccard_v1` + статус `DEGRADED_NO_VECTOR_SEARCH`; не фейковать embedding cosine
+- status: mitigated for graph MVP; N1 dense embeddings still backlog

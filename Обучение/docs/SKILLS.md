@@ -38,3 +38,5 @@
 | S32 | `POST /documents/import-folder/preview` до загрузки; import только с `pack_mode`/`pack_id` | Не писать в индекс без выбора | documents.py |
 | S33 | Разбор intent запроса: catalog / author_overview / summarize / extractive / cloze | Произвольные RU вопросы | query_intent.py |
 | S34 | Catalog «сколько/названия Чехова» — из имён файлов, без LLM | Точный счётчик корпуса | chat catalog |
+| S35 | Граф связей: только PostgreSQL edges + Cytoscape vendor; ACL = tenant как у documents | Вкладка «Граф связей» | `/api/graph`, `docs/graph/` |
+| S36 | Пока Qdrant vectors нулевые — `token_jaccard_v1` + флаг `DEGRADED_NO_VECTOR_SEARCH`; не выдавать cosine | Честная доказательность | graph detectors |

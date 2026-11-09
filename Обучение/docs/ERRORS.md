@@ -292,3 +292,9 @@
 - symptom: произвольные вопросы не разбирались
 - fix: query_intent + catalog/overview/summarize
 - status: fixed
+
+## 2026-11-09 — Graph / zero embeddings
+- symptom: Qdrant vectors нулевые; cosine ANN бессмысленен
+- root_cause: ingestion upsert `[0.0]*dim`
+- fix: graph uses `token_jaccard_v1` + `DEGRADED_NO_VECTOR_SEARCH`
+- status: mitigated (graph MVP); dense N1 backlog

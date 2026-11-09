@@ -17,6 +17,7 @@
 | A10 | Авто-категория/префикс при импорте папки | yes | corpus_packs | preview + выбор пользователя |
 | A11 | UI: existing dropdown / new pack + «Загрузить» | yes | documents UI | без автозаписи до confirm |
 | A12 | Анализ произвольного RU-запроса (каталог/обзор/изложение) | yes | query_intent + chat | intent в ответе API; см. AGENTS.md |
+| A13 | Graph Explorer: локальный/глобальный граф документов + evidence | yes | `/api/graph` + UI tab | Cytoscape offline; lexical similarity пока нет real embeddings |
 
 ## Контекст для смены документов
 

@@ -382,6 +382,18 @@ Offline автоусиление ответов на корпусе (не fine-t
 
 **Приёмка:** импорт и дозагрузка поднимают/обновляют уровень качества offline; поиск и счётчик документов в админке.
 
+### Блок F15. Document Graph Explorer — MVP (P0)
+
+Локальный граф связности **документов** (не GraphRAG retrieval). PostgreSQL edges + Cytoscape.js (MIT, vendor). См. `CURSOR_PROMPT_RAG_DOCUMENT_GRAPH_OFFLINE.md` и `docs/graph/`.
+
+- [x] F15.1. Аудит репозитория + ADR; вкладка «Граф связей» в существующем SPA (`/?tab=graph`).
+- [x] F15.2. Таблицы `graph_edges` / `graph_evidence` / `graph_build_jobs` / `graph_review_events` + `/api/graph/*` с tenant ACL.
+- [x] F15.3. Детекторы SAME_FAMILY / EXPLICIT_REFERENCE / lexical SEMANTIC_SIMILAR; idempotent jobs; soft-hide on delete.
+- [x] F15.4. Evidence drawer, review (admin), offline Cytoscape vendor, docs/graph + skills.
+- [ ] F15.5. P1/P2: real embedding ANN после N1; LLM relation detector OFF by default; entity graph.
+
+**Приёмка:** реальные рёбра из корпуса, ACL, offline UI, без CDN; chat/ingestion не сломаны.
+
 ## Порядок реализации и контрольные результаты
 
 Функциональные блоки F01–F14 описывают состав системы; этапы S0–S7 определяют зависимый порядок разработки. Не пытаться завершить целиком один блок до первого сквозного запуска. Оценка и безопасность начинаются до настройки поиска.

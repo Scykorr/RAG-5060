@@ -17,7 +17,8 @@
 | Celery | pin + redis extra | BSD-3-Clause | | transport only |
 | Docling | pin | MIT (+ model licenses) | https://github.com/docling-project/docling | CPU |
 | sentence-transformers | pin | Apache-2.0 | | CPU torch index |
-| React / Vite / MUI Core | pin | MIT / Apache-2.0 | | no MUI X Pro |
+| React / Vite / MUI Core | pin | MIT / Apache-2.0 | | **not used in current SPA** (vanilla `apps/web`) |
+| Cytoscape.js | 3.30.4 | MIT | vendored `apps/web/vendor/cytoscape.min.js` | Graph Explorer |
 | nginx | pin | BSD-2-Clause | | reverse proxy |
 | pytest / Ruff / Playwright / Vitest | pin | MIT / Apache-2.0 | | |
 

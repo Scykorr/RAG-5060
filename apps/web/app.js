@@ -24,11 +24,17 @@ const TITLES = {
   dispatcher: "Dashboard",
   system: "System",
   documents: "Документы",
+  graph: "Граф связей",
   storage: "Хранилище",
   quality: "Качество",
   models: "Модели",
   settings: "Настройки",
 };
+
+// Expose for Graph Explorer module (lazy — functions defined below)
+window.api = (...args) => api(...args);
+window.toast = (...args) => toast(...args);
+Object.defineProperty(window, "state", { get: () => state });
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => [...document.querySelectorAll(sel)];
@@ -96,6 +102,7 @@ function showLogin(show) {
 }
 
 function setTab(name) {
+  const prev = state.tab;
   state.tab = name;
   $$(".nav-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
   $$(".panel").forEach((p) => p.classList.toggle("hidden", p.id !== `panel-${name}`));
@@ -105,6 +112,7 @@ function setTab(name) {
     clearInterval(state.dispatcherTimer);
     state.dispatcherTimer = null;
   }
+  if (prev === "graph" && name !== "graph" && window.GraphUI) window.GraphUI.onHide();
   refreshTab();
 }
 
@@ -141,6 +149,9 @@ async function refreshTab() {
     if (state.tab === "documents") {
       await loadDocs();
       refreshInbox().catch(() => {});
+    }
+    if (state.tab === "graph" && window.GraphUI) {
+      window.GraphUI.onShow();
     }
   } catch (e) {
     if (e.status === 401) showLogin(true);
@@ -545,13 +556,25 @@ async function pollImportStatus() {
   }
 }
 
+function initialTabFromUrl() {
+  try {
+    const u = new URL(window.location.href);
+    if (u.hash === "#graph") return "graph";
+    const t = u.searchParams.get("tab");
+    if (t && TITLES[t]) return t;
+  } catch (_) {
+    /* ignore */
+  }
+  return "chat";
+}
+
 async function trySession() {
   try {
     const me = await api("/api/auth/me");
     state.user = me;
     $("#user-label").textContent = me.login || "admin";
     showLogin(false);
-    setTab("chat");
+    setTab(initialTabFromUrl());
   } catch {
     showLogin(true);
   }

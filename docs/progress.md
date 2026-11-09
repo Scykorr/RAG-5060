@@ -1,5 +1,12 @@
 # Progress
 
+## 2026-11-09 — Document Graph Explorer (P0 MVP)
+
+- Branch `feature/document-graph`: audit/ADR in `docs/graph/`, Alembic `20261109_0003`, `/api/graph/*`, Cytoscape vendor, SPA tab «Граф связей» (`/?tab=graph`)
+- Detectors: SAME_FAMILY / EXPLICIT_REFERENCE / lexical SEMANTIC_SIMILAR (`token_jaccard_v1`); LLM OFF
+- Smoke: sample.txt↔sample-b.txt edge+evidence; double rebuild idempotent (`edges_stored=1`); chat OK; pytest `tests/graph` 7 passed
+- Gap: Qdrant still zero-vectors → `DEGRADED_NO_VECTOR_SEARCH`; no access_groups tables (tenant ACL as documents)
+
 ## 2026-11-06 — plan gap-fill (Admin UI Launcher)
 
 Closed remaining items from `.cursor/plans/admin_ui_launcher_1e36b3e7.plan.md`:
