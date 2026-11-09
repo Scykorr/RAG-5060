@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from apps.api.bootstrap import init_db
-from apps.api.routers import admin, auth, chat, documents, models, quality
+from apps.api.routers import admin, auth, chat, documents, graph, models, quality
 from apps.api.settings import get_settings
 
 log = structlog.get_logger()
@@ -41,6 +41,7 @@ app.include_router(models.router)
 app.include_router(quality.router)
 app.include_router(documents.router)
 app.include_router(chat.router)
+app.include_router(graph.router)
 
 
 @app.get("/api/health")

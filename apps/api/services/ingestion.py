@@ -189,6 +189,12 @@ def process_job(db: Session, job_id: uuid.UUID) -> None:
         after_ingestion_ready(job.tenant_id)
     except Exception:  # noqa: BLE001
         pass
+    try:
+        from apps.api.services.graph.jobs import schedule_after_ingestion
+
+        schedule_after_ingestion(job.tenant_id, job.document_id, version.id)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def create_upload(

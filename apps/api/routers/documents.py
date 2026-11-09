@@ -252,6 +252,12 @@ def delete_document(
     doc.deleted_at = datetime.now(timezone.utc)
     doc.status = "deleted"
     doc.active_version_id = None
+    try:
+        from apps.api.services.graph.repository import soft_hide_document_edges
+
+        soft_hide_document_edges(db, tenant_id=user.tenant_id, document_id=doc.id)
+    except Exception:  # noqa: BLE001
+        pass
     db.commit()
     return {"ok": True, "status": "tombstoned"}
 
