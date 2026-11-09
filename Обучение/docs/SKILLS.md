@@ -40,3 +40,12 @@
 | S34 | Catalog «сколько/названия Чехова» — из имён файлов, без LLM | Точный счётчик корпуса | chat catalog |
 | S35 | Граф связей: только PostgreSQL edges + Cytoscape vendor; ACL = tenant как у documents | Вкладка «Граф связей» | `/api/graph`, `docs/graph/` |
 | S36 | Пока Qdrant vectors нулевые — `token_jaccard_v1` + флаг `DEGRADED_NO_VECTOR_SEARCH`; не выдавать cosine | Честная доказательность | graph detectors |
+| S37 | UI адрес: `http://127.0.0.1:18080` (`RAG_UI_PORT`); не путать со старым `:8080` | Логин / лаунчер | compose + launcher |
+| S38 | Кнопка «Войти» никогда не `disabled` — иначе клик без события; статус API + toast обязателен | Вход не «молчит» | `apps/web/app.js` |
+| S39 | Лаунчер: 3 подряд JSON `{"status":"ok"}` до открытия браузера; API не ждать Ollama healthy | Быстрый/стабильный старт | `apps/launcher`, compose |
+| S40 | Не rehash bcrypt admin на каждом рестарте API (только drift / first boot / смена в UI) | Ускорение bootstrap | `bootstrap.py` |
+| S41 | В classic script не делать `window.api = (...a) => api(...a)` — это рекурсия; экспортировать `ragApi` / прямую ссылку | Логин и любой `api()` | `apps/web/app.js` |
+| S42 | UI port publish без `127.0.0.1:` в WSL2 (иначе Windows browser не видит порт после flap) | Доступ с хоста | `docker-compose.yml` |
+| S43 | Лаунчер: никогда `--force-recreate` на каждый start | Не ронять порт mid-login | `apps/launcher` |
+| S44 | WSL2: `networkingMode=mirrored` в `.wslconfig`; при «сайт есть / API нет» — stale localhost relay | Windows↔Docker ports | `.wslconfig`, `fix-wsl-localhost.ps1` |
+| S45 | Pill «локально» ≠ связь с API; смотреть индикатор «API ок/нет» | Диагностика UI | `index.html` / `app.js` |

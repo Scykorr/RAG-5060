@@ -111,7 +111,7 @@ def system(
             "start": "RAG5060 start   # or: docker compose --profile core up -d",
             "stop": "RAG5060 stop    # compose down; volumes kept",
             "status": "RAG5060 status",
-            "ui": "http://127.0.0.1:8080",
+            "ui": "http://127.0.0.1:18080",
             "data_root_env": "DATA_ROOT / RAG_DATA_ROOT (host) → mounted as /var/lib/rag",
         },
     }

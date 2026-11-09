@@ -13,11 +13,23 @@
       <div class="login-card">
         <div class="brand">RAG5060</div>
         <h1>Локальный RAG</h1>
-        <p class="muted">Работает offline на этом ПК. По умолчанию: admin / admin</p>
+        <p class="muted">Работает offline на этом ПК. Адрес UI: http://127.0.0.1:18080 · логин admin / admin</p>
+        <div class="login-ready" id="login-ready-box">
+          <div class="login-ready-row">
+            <span class="login-ready-label">Готовность сервера</span>
+            <span class="login-ready-time" id="login-wait-time">0 с</span>
+          </div>
+          <div class="login-progress" aria-hidden="true"><div class="login-progress-bar" id="login-progress-bar"></div></div>
+          <p class="muted" id="login-api-status">Проверка API…</p>
+          <p class="muted" id="login-api-hint">Кнопка «Войти» включится, когда статус станет зелёным «API готов».</p>
+        </div>
         <form id="login-form">
           <input id="login-user" autocomplete="username" value="admin" placeholder="Логин" required />
-          <input id="login-pass" type="password" autocomplete="current-password" value="admin" placeholder="Пароль" required />
-          <button class="btn primary" type="submit">Войти</button>
+          <div class="password-field">
+            <input id="login-pass" type="password" autocomplete="current-password" value="admin" placeholder="Пароль" required />
+            <button type="button" class="btn ghost password-toggle" data-target="login-pass" aria-pressed="false" title="Показать пароль">Показать</button>
+          </div>
+          <button class="btn primary" id="btn-login" type="submit" aria-disabled="true">Войти</button>
         </form>
       </div>
     </div>
@@ -36,7 +48,8 @@
         <button class="nav-btn" data-tab="settings">Настройки</button>
         <div class="sidebar-foot">
           <div class="muted" id="user-label">admin</div>
-          <div class="pill offline-pill" title="Без CDN и внешних запросов UI">offline</div>
+          <div class="pill local-pill" title="UI без CDN — всё на этом ПК">локально</div>
+          <div class="pill api-pill is-unknown" id="api-link-pill" title="Связь браузера с API">API…</div>
           <button class="btn ghost" id="btn-logout">Выйти</button>
         </div>
       </aside>
@@ -328,9 +341,27 @@
             <h3 style="margin-top:0">Смена пароля</h3>
             <p class="muted">Логин по умолчанию: admin / admin. После смены хранится только локально в PostgreSQL.</p>
             <form id="password-form">
-              <div class="form-row"><label class="label">Текущий пароль</label><input id="pw-current" type="password" required /></div>
-              <div class="form-row"><label class="label">Новый пароль</label><input id="pw-new" type="password" minlength="4" required /></div>
-              <div class="form-row"><label class="label">Повтор</label><input id="pw-new2" type="password" minlength="4" required /></div>
+              <div class="form-row">
+                <label class="label">Текущий пароль</label>
+                <div class="password-field">
+                  <input id="pw-current" type="password" required />
+                  <button type="button" class="btn ghost password-toggle" data-target="pw-current" aria-pressed="false" title="Показать пароль">Показать</button>
+                </div>
+              </div>
+              <div class="form-row">
+                <label class="label">Новый пароль</label>
+                <div class="password-field">
+                  <input id="pw-new" type="password" minlength="4" required />
+                  <button type="button" class="btn ghost password-toggle" data-target="pw-new" aria-pressed="false" title="Показать пароль">Показать</button>
+                </div>
+              </div>
+              <div class="form-row">
+                <label class="label">Повтор</label>
+                <div class="password-field">
+                  <input id="pw-new2" type="password" minlength="4" required />
+                  <button type="button" class="btn ghost password-toggle" data-target="pw-new2" aria-pressed="false" title="Показать пароль">Показать</button>
+                </div>
+              </div>
               <button class="btn primary" type="submit">Сохранить пароль</button>
             </form>
           </div>
@@ -338,8 +369,9 @@
       </main>
     </div>
 
-    <script src="/vendor/cytoscape.min.js"></script>
-    <script src="/graph.js"></script>
+    <!-- app.js first: login must work even if graph assets fail -->
     <script src="/app.js"></script>
+    <script src="/vendor/cytoscape.min.js" defer></script>
+    <script src="/graph.js" defer></script>
   </body>
 </html>

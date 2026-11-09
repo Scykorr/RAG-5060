@@ -1,5 +1,23 @@
 # Progress
 
+## 2026-11-09 — Site up / API unreachable (stale wslrelay)
+
+- Symptom: graph UI visible, toast «нет связи с API»; green «offline» pill was misleading (CDN-free, not link status)
+- Fix: WSL `networkingMode=mirrored`; revive script; launcher WSL-IP fallback; UI `API ок/нет` pill + clearer error text
+
+## 2026-11-09 — Login root-cause fix (stack overflow + WSL port)
+
+- Root: Graph `window.api = () => api()` recursion killed every browser login (`Maximum call stack size exceeded`)
+- Also: WSL publish `127.0.0.1:18080` unreachable from Windows after flap; launcher `--force-recreate nginx`; API/DB race
+- Fix: `ragApi` export; open port bind; no force-recreate; `_wait_for_db`; login retries; browser verified (chat UI after Войти)
+- Skills S41–S43, abilities A14–A15, ERRORS entry
+
+## 2026-11-09 — Login reliability + UI port 18080
+
+- Host UI: `http://127.0.0.1:18080` (`RAG_UI_PORT`); launcher strict 3× JSON health; login never silent (`aria-disabled`, toasts, health poll)
+- Faster API boot: ollama `service_started` only; skip bcrypt rehash every restart
+- Verify: `scripts/verify-login-e2e.sh` → LOGIN_E2E_OK; skills S37–S40, abilities A14, ERRORS login/port entries; ROADMAP F12.5–F12.7
+
 ## 2026-11-09 — Document Graph Explorer (P0 MVP)
 
 - Branch `feature/document-graph`: audit/ADR in `docs/graph/`, Alembic `20261109_0003`, `/api/graph/*`, Cytoscape vendor, SPA tab «Граф связей» (`/?tab=graph`)

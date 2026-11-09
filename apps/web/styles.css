@@ -65,6 +65,47 @@ body {
 }
 .login-card h1 { margin: 0.4rem 0 0.2rem; font-size: 1.4rem; }
 .login-card form { display: grid; gap: 0.75rem; margin-top: 1.25rem; }
+.login-ready {
+  margin-top: 0.85rem;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--bg0) 70%, transparent);
+}
+.login-ready-row {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 0.75rem;
+  margin-bottom: 0.45rem;
+}
+.login-ready-label { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+.login-ready-time { font-family: var(--mono); font-size: 0.85rem; color: var(--text); }
+.login-progress {
+  height: 6px; border-radius: 999px; background: var(--bg2); overflow: hidden; margin-bottom: 0.55rem;
+}
+.login-progress-bar {
+  height: 100%; width: 8%;
+  background: linear-gradient(90deg, var(--accent), var(--accent2));
+  border-radius: 999px;
+  transition: width 0.35s ease;
+}
+.login-ready.is-ready .login-progress-bar { width: 100%; background: var(--ok); }
+.login-ready #login-api-status { margin: 0; font-weight: 600; }
+.login-ready #login-api-hint { margin: 0.35rem 0 0; font-size: 0.85rem; }
+.password-field {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.4rem;
+  align-items: stretch;
+}
+.password-field input { width: 100%; }
+.password-toggle {
+  white-space: nowrap;
+  padding: 0.65rem 0.75rem;
+  min-width: 5.5rem;
+}
+.password-toggle[aria-pressed="true"] {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  color: var(--accent);
+}
 input, button, textarea, select {
   font: inherit; color: var(--text);
 }
@@ -96,6 +137,9 @@ input:focus, textarea:focus { outline: 2px solid color-mix(in srgb, var(--accent
   color: #ffe8eb;
 }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn[aria-disabled="true"] { opacity: 0.72; }
+.login-ready.is-busy { border-color: color-mix(in srgb, var(--warn) 50%, var(--line)); }
+.login-ready.is-ready { border-color: color-mix(in srgb, var(--ok) 55%, var(--line)); }
 
 #app-shell { min-height: 100vh; display: grid; grid-template-columns: 240px 1fr; }
 .sidebar {
@@ -180,7 +224,11 @@ pre.sys {
   .grid.metrics, .grid.two { grid-template-columns: 1fr; }
 }
 
-.offline-pill { justify-self: start; border-color: color-mix(in srgb, var(--ok) 50%, var(--line)); color: var(--ok); }
+.local-pill { justify-self: start; border-color: color-mix(in srgb, var(--ok) 50%, var(--line)); color: var(--ok); }
+.api-pill { justify-self: start; font-family: var(--mono); font-size: 0.75rem; }
+.api-pill.is-unknown { color: var(--muted); }
+.api-pill.is-up { border-color: color-mix(in srgb, var(--ok) 55%, var(--line)); color: var(--ok); }
+.api-pill.is-down { border-color: color-mix(in srgb, var(--bad) 55%, var(--line)); color: var(--bad); }
 .section-title { margin: 1.25rem 0 0.75rem; font-size: 1rem; }
 .sep { border: none; border-top: 1px solid var(--line); margin: 1rem 0; }
 

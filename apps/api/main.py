@@ -29,7 +29,12 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="RAG5060 API", version="0.2.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:8080", "http://localhost:8080"],
+    allow_origins=[
+        "http://127.0.0.1:18080",
+        "http://localhost:18080",
+        "http://127.0.0.1:8080",
+        "http://localhost:8080",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

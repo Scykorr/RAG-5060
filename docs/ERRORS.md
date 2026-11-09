@@ -67,3 +67,32 @@
 - root_cause: `ingestion._maybe_qdrant_upsert` пишет `[0.0]*dim`
 - fix (graph): lexical `token_jaccard_v1` + статус `DEGRADED_NO_VECTOR_SEARCH`; не фейковать embedding cosine
 - status: mitigated for graph MVP; N1 dense embeddings still backlog
+
+## 2026-11-09 — Login silent / «нет ответа» при «готово» в exe
+- symptom: «Войти» ничего не делает; или health «не готов» при сообщении лаунчера «API готов»; F5 → connection refused на :8080
+- root_cause: (1) `disabled` на кнопке глотает click; (2) один flaky health 200 через WSL/proxy; (3) nginx отдаёт HTML при 502, API перезапускается; (4) конфликт/флап порта 8080
+- fix: кнопка всегда кликабельна + toast; poll health на login; лаунчер — 3× JSON `status=ok`; UI порт **18080**; API `depends_on` ollama=`service_started`; skip bcrypt rehash; `scripts/verify-login-e2e.sh`
+- status: fixed (E2E LOGIN_E2E_OK на :18080)
+
+## 2026-11-09 — Launcher окно сразу закрывается
+- symptom: после exe терминал мигает; браузер открыт на неготовый API
+- root_cause: process exit без pause; openBrowser до стабильного health; `sudo docker` мог ломаться
+- fix: pause Enter; strict health; prefer `docker` без sudo; лог `logs/launcher.log`
+- status: fixed
+
+## 2026-11-09 — Войти → stack overflow / Windows localhost dead
+- symptom: «Войти» не входит (или тихо); WSL `curl :18080` ок, Windows/browser — connection refused; в Console `RangeError: Maximum call stack size exceeded`
+- root_cause:
+  1) Graph expose `window.api = (...a) => api(...a)` в classic script: `api` ≡ `window.api` → бесконечная рекурсия на каждый login/API вызов
+  2) publish `127.0.0.1:18080` в WSL2 часто не форвардится в Windows после WSL/dockerd flap
+  3) launcher `--force-recreate nginx` на каждый start ронял порт mid-login
+  4) API bootstrap без retry при Postgres «starting up»; WSL unclean restart (`WaitForBootProcess` / journal corrupt)
+- fix: `ragApi` + `window.api = ragApi` (без self-wrapper); порт `${RAG_UI_PORT:-18080}:8080`; убран force-recreate; `_wait_for_db`; login retry до 8×; nginx `depends_on` api healthy
+- status: fixed (browser: gate hidden, toast «Вход выполнен», чаты видны)
+
+## 2026-11-09 — Сайт открыт, API «нет связи» / зелёный offline
+- symptom: SPA/граф на экране, toast «Сервер недоступен»; pill `offline` зелёный; WSL curl health ок
+- root_cause: HTML уже в памяти браузера, а Windows `wslrelay` на `:18080` stale (Listen, но Connection refused); relative `/api/*` бьёт в мёртвый localhost. Pill `offline` = «без CDN», не статус API.
+- fix: `.wslconfig` `networkingMode=mirrored`; `scripts/fix-wsl-localhost.ps1`; launcher fallback на WSL eth0 IP; UI pill «локально» + «API ок/нет»; heartbeat
+- note: MantaRay VPN (split «кроме РФ») *может* ломать loopback/WSL, но в этом инциденте починилось **без** отключения VPN → первопричина была stale wslrelay/mirrored, не VPN
+- status: fixed (127.0.0.1:18080 health 200 после mirrored restart)

@@ -353,10 +353,14 @@ Haystack Apache-2.0 допустим как последующая библио�
 
 ### Блок F12. Launcher 1A и переносимость — MVP (P0)
 
-- [x] F12.1. Один лаунчер (`apps/launcher`): preflight Docker/GPU/disk/port → `compose up` → открыть `http://127.0.0.1:8080`; stop сохраняет volumes.
+- [x] F12.1. Один лаунчер (`apps/launcher`): preflight Docker/GPU/disk/port → `compose up` → открыть UI; stop сохраняет volumes.
 - [x] F12.2. Артефакты Windows `.exe` и Linux binary/AppImage; пользователь не обязан вручную вызывать compose.
 - [x] F12.3. Portable bundle: лаунчер + compose + configs + `.env.example` + опциональный offline image pack; `RAG_DATA_ROOT` настраивается.
 - [x] F12.4. Платформы v1: Windows + Linux (NVIDIA). macOS вне scope. На Windows Engine может быть в WSL Ubuntu; Docker Desktop не обязателен.
+- [x] F12.5. UI host port **`127.0.0.1:18080`** (`RAG_UI_PORT`; внутри nginx:8080) — меньше clash/flap, чем общий `:8080`.
+- [x] F12.6. Стабильный вход: 3× подряд JSON health `status=ok` до openBrowser; login UI с индикатором «API готов»; кнопка Войти всегда с feedback; e2e `scripts/verify-login-e2e.sh`.
+- [x] F12.7. Быстрый старт API: не ждать Ollama `healthy` для login; не rehash bcrypt admin на каждом рестарте.
+- [x] F12.8. Login hard-fix: убрать self-wrapper `window.api` (stack overflow); publish UI-порта без `127.0.0.1`-only в WSL2; без `--force-recreate nginx` на каждый start; API `_wait_for_db`.
 
 **Приёмка:** двойной клик / `./RAG5060` поднимает UI на Win и Linux с Docker+NVIDIA.
 
@@ -580,7 +584,7 @@ SHA256 — признак одинаковых байтов, не идентиф
 | R7 Очистка RAG необратима | Случайный сброс индекса | confirm в UI; позже audit (N7); не удалять inbox на D: |
 | R8 Публичные корпуса (lib.ru / GitHub) — шум OCR/разметка | Мусор в чанках | Фильтр кириллицы при сборке; ERRORS при странных ответах |
 | R9 C: disk pressure | WSL/Docker на C: | Держать VHDX/data на D:; мониторить free ≥50 ГБ на C: |
-| R10 Docker/WSL daemon flap | Стек Up ~20s, 502 на :8080, прерванный eval/import | Не крутить parallel `compose up/build`; после flap — wait healthy; не считать fail без повторного smoke |
+| R10 Docker/WSL daemon flap | Стек Up ~20s, 502 / connection reset на UI-порту, прерванный eval/import | UI на `:18080`; 3× health; не крутить parallel `compose up/build`; после flap — `scripts/up-18080.sh` / wait healthy; не считать fail без повторного smoke |
 | R11 Служебные файлы в inbox (`_manifest`) | Мусор в retrieval | N6 deny-list; tombstone; prefix `classic_` |
 
 ### Операционный чеклист смены корпуса

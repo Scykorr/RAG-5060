@@ -18,6 +18,8 @@
 | A11 | UI: existing dropdown / new pack + «Загрузить» | yes | documents UI | без автозаписи до confirm |
 | A12 | Анализ произвольного RU-запроса (каталог/обзор/изложение) | yes | query_intent + chat | intent в ответе API; см. AGENTS.md |
 | A13 | Graph Explorer: локальный/глобальный граф документов + evidence | yes | `/api/graph` + UI tab | Cytoscape offline; lexical similarity пока нет real embeddings |
+| A14 | Стабильный локальный вход через лаунчер | yes | `:18080` + cookie session | индикатор «API готов», e2e; без api-self-wrapper recursion |
+| A15 | Вход устойчив к короткому WSL/Docker flap (retry login) | yes | UI doLogin 8× | плюс API `_wait_for_db` |
 
 ## Контекст для смены документов
 

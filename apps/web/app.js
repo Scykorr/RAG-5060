@@ -31,27 +31,45 @@ const TITLES = {
   settings: "Настройки",
 };
 
-// Expose for Graph Explorer module (lazy — functions defined below)
-window.api = (...args) => api(...args);
-window.toast = (...args) => toast(...args);
-Object.defineProperty(window, "state", { get: () => state });
-
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => [...document.querySelectorAll(sel)];
 
-async function api(path, opts = {}) {
-  const res = await fetch(path, {
-    credentials: "include",
-    headers: {
-      ...(opts.body && !(opts.body instanceof FormData) ? { "Content-Type": "application/json" } : {}),
-      ...opts.headers,
-    },
-    ...opts,
-    body:
-      opts.body && !(opts.body instanceof FormData) && typeof opts.body !== "string"
-        ? JSON.stringify(opts.body)
-        : opts.body,
-  });
+function formatApiError(err, data, status) {
+  if (err && (err.name === "TypeError" || /Failed to fetch|NetworkError|Load failed/i.test(String(err.message)))) {
+    return "Нет связи с API (страница HTML ещё может открываться). Подождите 20–40 с, пока Docker/WSL поднимет API, затем F5. Адрес: http://127.0.0.1:18080/";
+  }
+  if (status === 502 || status === 503) {
+    return "API ещё запускается (502/503). Подождите 15–60 сек и нажмите Войти снова.";
+  }
+  const detail = data && data.detail;
+  if (typeof detail === "string") return detail;
+  if (detail && typeof detail === "object" && detail.message) return detail.message;
+  if (data && data.message) return data.message;
+  return (err && err.message) || "Ошибка запроса";
+}
+
+// Named differently from window.api: in classic scripts `function api` === window.api,
+// so `window.api = (...a) => api(...a)` recurses forever and «Войти» dies with stack overflow.
+async function ragApi(path, opts = {}) {
+  let res;
+  try {
+    res = await fetch(path, {
+      credentials: "include",
+      headers: {
+        ...(opts.body && !(opts.body instanceof FormData) ? { "Content-Type": "application/json" } : {}),
+        ...opts.headers,
+      },
+      ...opts,
+      body:
+        opts.body && !(opts.body instanceof FormData) && typeof opts.body !== "string"
+          ? JSON.stringify(opts.body)
+          : opts.body,
+    });
+  } catch (err) {
+    const e = new Error(formatApiError(err));
+    e.status = 0;
+    throw e;
+  }
   const text = await res.text();
   let data = null;
   try {
@@ -60,7 +78,7 @@ async function api(path, opts = {}) {
     data = { raw: text };
   }
   if (!res.ok) {
-    const err = new Error((data && (data.detail || data.message)) || res.statusText);
+    const err = new Error(formatApiError(null, data, res.status) || res.statusText);
     err.status = res.status;
     err.data = data;
     throw err;
@@ -68,12 +86,187 @@ async function api(path, opts = {}) {
   return data;
 }
 
+// Local alias + explicit globals (do NOT wrap as window.api = () => api()).
+const api = ragApi;
+window.api = ragApi;
 function toast(msg, kind = "info") {
   const el = document.createElement("div");
   el.className = `toast ${kind}`;
   el.textContent = msg;
   $("#toasts").appendChild(el);
   setTimeout(() => el.remove(), 4200);
+}
+window.toast = toast;
+Object.defineProperty(window, "state", { get: () => state });
+
+const loginWait = {
+  startedAt: Date.now(),
+  tries: 0,
+  ready: false,
+  pollTimer: null,
+  loggingIn: false,
+};
+
+function updateLoginWaitUi(phaseText, { ready = false, httpStatus = null } = {}) {
+  const box = $("#login-ready-box");
+  const el = $("#login-api-status");
+  const hint = $("#login-api-hint");
+  const timeEl = $("#login-wait-time");
+  const bar = $("#login-progress-bar");
+  const btn = $("#btn-login");
+  const sec = Math.max(0, Math.floor((Date.now() - loginWait.startedAt) / 1000));
+  if (timeEl) timeEl.textContent = `${sec} с`;
+  const pct = ready ? 100 : Math.min(92, 8 + sec * 1.4 + loginWait.tries * 1.2);
+  if (bar) bar.style.width = `${pct}%`;
+  if (box) {
+    box.classList.toggle("is-ready", !!ready);
+    box.classList.toggle("is-busy", !ready);
+  }
+  if (el) {
+    el.textContent = phaseText;
+    el.style.color = ready ? "var(--ok)" : "var(--warn)";
+  }
+  if (hint) {
+    if (ready) {
+      hint.textContent = "Сервер отвечает — нажмите «Войти».";
+    } else if (httpStatus === 502 || httpStatus === 503) {
+      hint.textContent = "Nginx уже отвечает, API ещё стартует. Подождите зелёный статус, затем «Войти».";
+    } else if (httpStatus === 0) {
+      hint.textContent =
+        "Нет связи с сервером. Дождитесь «готово» в окне RAG5060.exe, затем обновите страницу (F5).";
+    } else {
+      hint.textContent = "Ожидание готовности API… Можно нажать «Войти» — будет понятная ошибка, не тишина.";
+    }
+  }
+  // Never use disabled=true: it swallows clicks with zero feedback.
+  if (btn) {
+    btn.setAttribute("aria-disabled", ready ? "false" : "true");
+    btn.removeAttribute("disabled");
+  }
+}
+
+async function probeApiReady() {
+  try {
+    const res = await fetch(`/api/health?_=${Date.now()}`, {
+      credentials: "omit",
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      loginWait.ready = false;
+      updateLoginWaitUi(`API ещё запускается (HTTP ${res.status})…`, { httpStatus: res.status });
+      return false;
+    }
+    const data = await res.json();
+    if (data && data.status === "ok") {
+      loginWait.ready = true;
+      updateLoginWaitUi("API готов", { ready: true });
+      return true;
+    }
+    loginWait.ready = false;
+    updateLoginWaitUi("API ответил, но ещё не готов…", { httpStatus: res.status });
+    return false;
+  } catch {
+    loginWait.ready = false;
+    updateLoginWaitUi("Нет ответа от сервера…", { httpStatus: 0 });
+    return false;
+  }
+}
+
+function stopLoginHealthPoll() {
+  if (loginWait.pollTimer) {
+    clearTimeout(loginWait.pollTimer);
+    loginWait.pollTimer = null;
+  }
+}
+
+function startLoginHealthPoll() {
+  stopLoginHealthPoll();
+  loginWait.startedAt = Date.now();
+  loginWait.tries = 0;
+  loginWait.ready = false;
+  loginWait.pollGen = (loginWait.pollGen || 0) + 1;
+  const gen = loginWait.pollGen;
+  updateLoginWaitUi("Проверка API…");
+  const tick = async () => {
+    // Drop overlapping polls after re-start (trySession/showLogin race).
+    if (gen !== loginWait.pollGen) return;
+    if ($("#login-gate")?.classList.contains("hidden")) return;
+    await probeApiReady();
+    if (gen !== loginWait.pollGen) return;
+    loginWait.tries += 1;
+    // Keep polling forever on login screen — API may come up later.
+    loginWait.pollTimer = setTimeout(tick, loginWait.ready ? 5000 : 1200);
+  };
+  tick();
+}
+
+async function enterApp(me) {
+  state.user = me;
+  $("#user-label").textContent = me.login || "admin";
+  showLogin(false);
+  setTab(initialTabFromUrl());
+}
+
+async function doLogin() {
+  if (loginWait.loggingIn) {
+    toast("Вход уже выполняется…", "info");
+    return;
+  }
+  loginWait.loggingIn = true;
+  const btn = $("#btn-login");
+  const prevLabel = btn ? btn.textContent : "";
+  if (btn) btn.textContent = "Входим…";
+  const body = {
+    login: $("#login-user").value.trim(),
+    password: $("#login-pass").value,
+  };
+  try {
+    // Retry across short Docker/WSL flaps — user should not need to spam «Войти».
+    let loginRes = null;
+    let lastErr = null;
+    for (let attempt = 1; attempt <= 8; attempt++) {
+      try {
+        if (btn) btn.textContent = attempt === 1 ? "Входим…" : `Входим… (${attempt}/8)`;
+        loginRes = await api("/api/auth/login", { method: "POST", body });
+        lastErr = null;
+        break;
+      } catch (err) {
+        lastErr = err;
+        const retryable = !err.status || err.status === 0 || err.status === 502 || err.status === 503;
+        if (!retryable || attempt === 8) break;
+        toast(`Сервер перезапускается — повтор ${attempt}/8…`, "info");
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+    }
+    if (!loginRes) throw lastErr || new Error("Ошибка входа");
+    stopLoginHealthPoll();
+    try {
+      const me = await api("/api/auth/me");
+      await enterApp(me);
+    } catch (meErr) {
+      // Cookie should already be set; enter with login payload rather than bouncing to gate.
+      await enterApp({
+        login: loginRes.login || body.login,
+        role: loginRes.role || "admin",
+        tenant_id: loginRes.tenant_id || null,
+      });
+      toast(meErr.message || "Сессия принята с предупреждением", "info");
+    }
+    toast("Вход выполнен", "ok");
+  } catch (err) {
+    const msg = err.message || "Ошибка входа";
+    const hint =
+      err.status === 0
+        ? `${msg} Откройте http://127.0.0.1:18080/ (не :8080). Если стек только поднялся — подождите 20–40 с.`
+        : err.status === 401
+          ? "Неверный логин или пароль (по умолчанию admin / значение ADMIN_PASSWORD из .env)."
+          : msg;
+    toast(hint, "bad");
+    await probeApiReady();
+  } finally {
+    loginWait.loggingIn = false;
+    if (btn) btn.textContent = prevLabel || "Войти";
+  }
 }
 
 function esc(s) {
@@ -92,12 +285,77 @@ function fmtBytes(n) {
   return `${(n / 1073741824).toFixed(2)} GB`;
 }
 
+const apiLink = { timer: null, down: false, failStreak: 0 };
+
+function setApiLinkPill(up, detail) {
+  const el = $("#api-link-pill");
+  if (!el) return;
+  el.classList.remove("is-unknown", "is-up", "is-down");
+  if (up === true) {
+    el.classList.add("is-up");
+    el.textContent = "API ок";
+    el.title = detail || "Связь с API есть";
+  } else if (up === false) {
+    el.classList.add("is-down");
+    el.textContent = "API нет";
+    el.title = detail || "Нет связи с API — стек перезапускается, подождите 20–40 с и нажмите Обновить";
+  } else {
+    el.classList.add("is-unknown");
+    el.textContent = "API…";
+  }
+}
+
+function stopApiLinkWatch() {
+  if (apiLink.timer) {
+    clearTimeout(apiLink.timer);
+    apiLink.timer = null;
+  }
+}
+
+function startApiLinkWatch() {
+  stopApiLinkWatch();
+  const tick = async () => {
+    if ($("#login-gate") && !$("#login-gate").classList.contains("hidden")) return;
+    try {
+      const res = await fetch(`/api/health?_=${Date.now()}`, { credentials: "omit", cache: "no-store" });
+      const ok = res.ok && (await res.json().catch(() => ({}))).status === "ok";
+      if (ok) {
+        if (apiLink.down) toast("API снова доступен — можно работать", "ok");
+        apiLink.down = false;
+        apiLink.failStreak = 0;
+        setApiLinkPill(true);
+      } else {
+        apiLink.failStreak += 1;
+        apiLink.down = true;
+        setApiLinkPill(false, `HTTP ${res.status}`);
+      }
+    } catch {
+      apiLink.failStreak += 1;
+      apiLink.down = true;
+      setApiLinkPill(false);
+      if (apiLink.failStreak === 2) {
+        toast("Нет связи с API. Страница может остаться на экране, но данные не загрузятся — подождите 20–40 с и нажмите F5.", "bad");
+      }
+    }
+    apiLink.timer = setTimeout(tick, apiLink.down ? 2000 : 8000);
+  };
+  setApiLinkPill(null);
+  tick();
+}
+
 function showLogin(show) {
   $("#login-gate").classList.toggle("hidden", !show);
   $("#app-shell").classList.toggle("hidden", show);
   if (show && state.dispatcherTimer) {
     clearInterval(state.dispatcherTimer);
     state.dispatcherTimer = null;
+  }
+  if (show) {
+    stopApiLinkWatch();
+    startLoginHealthPoll();
+  } else {
+    stopLoginHealthPoll();
+    startApiLinkWatch();
   }
 }
 
@@ -571,30 +829,45 @@ function initialTabFromUrl() {
 async function trySession() {
   try {
     const me = await api("/api/auth/me");
-    state.user = me;
-    $("#user-label").textContent = me.login || "admin";
-    showLogin(false);
-    setTab(initialTabFromUrl());
-  } catch {
-    showLogin(true);
+    await enterApp(me);
+  } catch (err) {
+    // Only send user to login on auth/network failure — never after a successful login path.
+    if (!state.user) showLogin(true);
+    else if (err && err.status === 401) {
+      state.user = null;
+      showLogin(true);
+    }
   }
+}
+
+function wirePasswordToggles() {
+  $$(".password-toggle").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-target");
+      const input = id ? document.getElementById(id) : null;
+      if (!input) return;
+      const show = input.type === "password";
+      input.type = show ? "text" : "password";
+      btn.setAttribute("aria-pressed", show ? "true" : "false");
+      btn.title = show ? "Скрыть пароль" : "Показать пароль";
+      btn.textContent = show ? "Скрыть" : "Показать";
+    });
+  });
 }
 
 function wire() {
   $$(".nav-btn").forEach((b) => b.addEventListener("click", () => setTab(b.dataset.tab)));
+  // Graph module may load deferred; wire when present
+  try {
+    window.GraphUI?.wire?.();
+  } catch (_) {
+    /* graph optional at boot */
+  }
+  wirePasswordToggles();
 
   $("#login-form").addEventListener("submit", async (e) => {
     e.preventDefault();
-    try {
-      await api("/api/auth/login", {
-        method: "POST",
-        body: { login: $("#login-user").value.trim(), password: $("#login-pass").value },
-      });
-      toast("Вход выполнен", "ok");
-      await trySession();
-    } catch (err) {
-      toast(err.message || "Ошибка входа", "bad");
-    }
+    await doLogin();
   });
 
   $("#btn-logout").addEventListener("click", async () => {
@@ -1050,4 +1323,5 @@ function wire() {
 }
 
 wire();
+// Single poll owner: trySession shows login (starts poll) or enters app.
 trySession();

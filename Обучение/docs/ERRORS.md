@@ -298,3 +298,21 @@
 - root_cause: ingestion upsert `[0.0]*dim`
 - fix: graph uses `token_jaccard_v1` + `DEGRADED_NO_VECTOR_SEARCH`
 - status: mitigated (graph MVP); dense N1 backlog
+
+## 2026-11-09 — Login silent / port flap
+- symptom: «Войти» молчит; exe «готово», браузер «нет ответа»; :8080 refused
+- root_cause: disabled button; flaky single health; 8080 flap; API waited on Ollama
+- fix: UI :18080; 3× health; toast login; ollama service_started; verify-login-e2e.sh
+- status: fixed
+
+## 2026-11-09 — Войти → stack overflow / Windows localhost dead
+- symptom: «Войти» noop / «нет ответа»; WSL curl ок, Windows refused
+- root_cause: `window.api=()=>api()` recursion; `127.0.0.1` publish; force-recreate nginx; API/DB race; WSL flap
+- fix: ragApi export; open port bind; no force-recreate; DB wait; login retries
+- status: fixed
+
+## 2026-11-09 — Сайт открыт, API «нет связи»
+- symptom: SPA жив, `/api` Failed to fetch; зелёный offline ≠ статус API
+- root_cause: stale wslrelay на :18080
+- fix: WSL networkingMode=mirrored; fix-wsl-localhost.ps1; pill API ок/нет
+- status: fixed

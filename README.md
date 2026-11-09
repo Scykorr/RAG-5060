@@ -16,7 +16,7 @@ dist\RAG5060.exe start          # Windows
 ./dist/RAG5060-linux-amd64 start  # Linux
 ```
 
-UI: http://127.0.0.1:8080  
+UI: http://127.0.0.1:18080  (порт задаётся `RAG_UI_PORT`, по умолчанию 18080; старый 8080 не используйте)  
 Остановка: `RAG5060 stop` (volumes сохраняются).
 
 ## Диски (текущий ПК)
