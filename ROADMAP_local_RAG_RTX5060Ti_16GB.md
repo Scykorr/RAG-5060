@@ -33,7 +33,7 @@ Ollama работает только в Compose. Вся рабочая WSL-ди�
 
 ### Начальные лимиты (гипотезы для замера)
 
-WSL2: `memory=20GB`, `swap=4GB` в `%UserProfile%\.wslconfig`. Лимит общий для WSL-дистрибутивов и Docker; оставить около 12 ГБ физической RAM Windows, браузеру и Cursor. Swap — аварийный запас, не способ увеличить рабочий корпус. Его файл также разместить на HDD через `swapfile` в `.wslconfig`, используя реальный абсолютный Windows-путь; букву диска сначала определить. Подкачка на HDD особенно медленная: постоянный swap означает необходимость уменьшить нагрузку, а не нормальный режим. Перед `wsl --shutdown` сохранить работу и предупредить о завершении всех WSL-сессий. Число `processors` выбрать после определения CPU, не задавать выдуманные 16 ядер.
+WSL2: `memory=12GB`, `swap=4GB`, `networkingMode=mirrored`, `vmIdleTimeout=-1` в `%UserProfile%\.wslconfig` (было 20GB — Windows force-kill VM mid-chat). Лимит общий для WSL/Docker; оставить запас RAM Windows/Cursor/VPN. Swap — аварийный запас, не способ увеличить рабочий корпус. Его файл также разместить на HDD через `swapfile` в `.wslconfig`, используя реальный абсолютный Windows-путь; букву диска сначала определить. Подкачка на HDD особенно медленная: постоянный swap означает необходимость уменьшить нагрузку, а не нормальный режим. Перед `wsl --shutdown` сохранить работу и предупредить о завершении всех WSL-сессий. Число `processors` выбрать после определения CPU, не задавать выдуманные 16 ядер.
 
 | Сервис/группа | Начальный предел RAM | Режим |
 | --- | --- | --- |
@@ -269,7 +269,7 @@ Haystack Apache-2.0 допустим как последующая библио�
 - [ ] F04.15. P1: active learning — направлять на проверку ошибки поиска, расхождения методов и сложные случаи; сохранять случайную проверку остальных результатов.
 - [ ] F04.16. P1: синтетические вопросы через Ragas с локальными адаптерами; проверить отсутствие внешних API. Отдельно маркировать synthetic, вручную проверять источники/ответы.
 - [ ] F04.17. P1: LLM-as-judge только как вспомогательная оценка; калибровать по экспертной выборке, не оценивать качество исключительно той же моделью, которая генерировала ответы.
-- [ ] F04.18. P2: сущности/связи и граф знаний только после доказанной пользы; provenance каждого ребра, разрешение одноимённых сущностей и обновление версий.
+- [x] F04.18. P2 (slice 1): offline connectivity index by active chunks (filename/refers/shared_entity/lex/co_cited) + `/api/graph/index/*` + report; no Qdrant; thresholds TBD from report.
 - [ ] F04.19. Запускать Label Studio и массовую авторазметку отдельным профилем/сеансом; измерить дополнительную RAM. Не добавлять их поверх уже выделенных 20 ГБ WSL без пересчёта бюджета. LLM-разметка использует общую очередь GPU и уступает chat.
 
 **Приёмка:** имеется схема и инструкция, проверенная выборка, версионный экспорт/импорт, прослеживаемость исправлений; автоматически предложенные метки отличимы от проверенных. Бесплатные инструменты не заменяют предметные правила и экспертную ответственность.
@@ -361,6 +361,8 @@ Haystack Apache-2.0 допустим как последующая библио�
 - [x] F12.6. Стабильный вход: 3× подряд JSON health `status=ok` до openBrowser; login UI с индикатором «API готов»; кнопка Войти всегда с feedback; e2e `scripts/verify-login-e2e.sh`.
 - [x] F12.7. Быстрый старт API: не ждать Ollama `healthy` для login; не rehash bcrypt admin на каждом рестарте.
 - [x] F12.8. Login hard-fix: убрать self-wrapper `window.api` (stack overflow); publish UI-порта без `127.0.0.1`-only в WSL2; без `--force-recreate nginx` на каждый start; API `_wait_for_db`.
+- [x] F12.9. Offline runtime явный: чат/API только localhost Compose + `OLLAMA_NO_CLOUD=1`; Failed to fetch при stop ≠ «нужен интернет».
+- [ ] F12.10. Стабильность WSL VM: memory=12GB + no idle kill применены (`wsl --shutdown` один раз); smoke «start → login → chat send» без reboot 10+ мин.
 
 **Приёмка:** двойной клик / `./RAG5060` поднимает UI на Win и Linux с Docker+NVIDIA.
 
@@ -394,7 +396,9 @@ Offline автоусиление ответов на корпусе (не fine-t
 - [x] F15.2. Таблицы `graph_edges` / `graph_evidence` / `graph_build_jobs` / `graph_review_events` + `/api/graph/*` с tenant ACL.
 - [x] F15.3. Детекторы SAME_FAMILY / EXPLICIT_REFERENCE / lexical SEMANTIC_SIMILAR; idempotent jobs; soft-hide on delete.
 - [x] F15.4. Evidence drawer, review (admin), offline Cytoscape vendor, docs/graph + skills.
-- [ ] F15.5. P1/P2: real embedding ANN после N1; LLM relation detector OFF by default; entity graph.
+- [x] F15.5. Graph visual polish: animated layout/fit, hover highlight, pulse select, ambient canvas (no CDN).
+- [x] F15.6. Obsidian-like UX on Cytoscape (no D3): degree size, prefix colors, hide orphans, BFS chain depth, click→local, sparse-edge CTA.
+- [ ] F15.7. P1/P2: real embedding ANN после N1; LLM relation detector OFF by default; entity graph.
 
 **Приёмка:** реальные рёбра из корпуса, ACL, offline UI, без CDN; chat/ingestion не сломаны.
 
@@ -528,7 +532,7 @@ SHA256 — признак одинаковых байтов, не идентиф
 
 ### Сделано
 
-- Обучение: Тест 1/2/3 PASS (extractive + RuCoS cloze@0.95); навыки/ошибки/умения ведутся в `docs/` и `Обучение/docs/`.
+- Обучение: Тест 1/2/3 PASS (extractive + RuCoS cloze@0.95); навыки/ошибки/умения ведутся в `docs/` и `Обучение/docs/` (контракт S51: apply + replay; без replay умение/`fixed` не засчитывать).
 - Admin: `POST /api/admin/data/purge-chats`, `POST /api/admin/data/reset-rag`; UI кнопки «Очистить чаты» / «Сбросить RAG-данные».
 - Корпус: `D:\RAG5060\inbox\classic_ru` — ~700 TXT русской классики (RusLit + Russian-Ebooks + главы/фрагменты), импорт 666, prefix `classic_`.
 - Classic QA unique-needle: live contain **0.75** (attempt19, thr=0.55); offline oracle 18/20.
@@ -585,14 +589,15 @@ SHA256 — признак одинаковых байтов, не идентиф
 | R8 Публичные корпуса (lib.ru / GitHub) — шум OCR/разметка | Мусор в чанках | Фильтр кириллицы при сборке; ERRORS при странных ответах |
 | R9 C: disk pressure | WSL/Docker на C: | Держать VHDX/data на D:; мониторить free ≥50 ГБ на C: |
 | R10 Docker/WSL daemon flap | Стек Up ~20s, 502 / connection reset на UI-порту, прерванный eval/import | UI на `:18080`; 3× health; не крутить parallel `compose up/build`; после flap — `scripts/up-18080.sh` / wait healthy; не считать fail без повторного smoke |
+| R11 WSL2 VM kill mid-session | SPA жива, «Отправить» → Failed to fetch; dockerd uptime ~1 мин | `.wslconfig` memory≤12GB, `vmIdleTimeout=-1`; не путать с «нужен интернет»; после stop — только `RAG5060 start` |
 | R11 Служебные файлы в inbox (`_manifest`) | Мусор в retrieval | N6 deny-list; tombstone; prefix `classic_` |
 
 ### Операционный чеклист смены корпуса
 
-1. Прочитать `docs/SKILLS.md` + `docs/ERRORS.md` + `docs/ABILITIES.md`.
+1. Прочитать `docs/SKILLS.md` + `docs/ERRORS.md` + `docs/ABILITIES.md` (колонки apply/replay; при симптоме — сначала ERRORS.replay).
 2. UI/API: сбросить RAG-данные и чаты.
 3. Положить корпус в `inbox/<pack>`, импорт, prefix.
-4. Собрать sample.json, прогнать offline/live contain, обновить abilities/errors/results.
+4. Собрать sample.json, прогнать offline/live contain; обновить abilities (с Replay) / errors (с replay+prevent) / results; синхронизировать `Обучение/docs/`.
 5. Зафиксировать риски R1–R11 при любом «улучшении» retrieval/prompt.
 
 ## Методы подготовки и измерения: практический профиль

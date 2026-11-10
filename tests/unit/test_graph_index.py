@@ -31,6 +31,15 @@ def test_wildlife_theme():
     assert meta.theme == "wildlife_"
 
 
+def test_author_skips_ch_prefix_token():
+    meta = gi.parse_doc_meta(
+        document_id="d4",
+        filename="classic_0633_ch_Tolstoy_Анна_Каренина__фрагмент_97_e8180dc4ad.txt",
+    )
+    assert meta.author_key == "Tolstoy"
+    assert meta.author_ru == "толстой"
+
+
 def test_layer_a_in_theme_and_wrote():
     docs = [
         gi.parse_doc_meta(document_id="a", filename="classic_0001_Pushkin_Пир_abcdef12.txt"),

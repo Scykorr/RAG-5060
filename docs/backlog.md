@@ -24,7 +24,7 @@ Statuses: `planned` → `ready` → `in_progress` → `review` → `verified` | 
 | T-GRAPH-IDX-01 | F04.18 | S3c | text_entities extract from chat (no behaviour change) | verified | step1 connectivity index |
 | T-GRAPH-IDX-02 | F04.18 | S3c | graph_index layers A/B + unit tests | verified | with C/D/E pure fns |
 | T-GRAPH-IDX-03 | F04.18 | S3c | graph_index layers C/D + unit tests | verified | same module |
-| T-GRAPH-IDX-04 | F04.18 | S3c | cache wire-up, API /index/*, report script | in_progress | |
+| T-GRAPH-IDX-04 | F04.18 | S3c | cache wire-up, API /index/*, report script | verified | report artifacts/20261110-120700-graph-index |
 
 ## Ready next
 

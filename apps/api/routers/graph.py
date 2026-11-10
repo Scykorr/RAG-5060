@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from apps.api.auth import AuthUser, get_current_user, require_admin
 from apps.api.db import get_db
-from apps.api.models import GraphBuildJob
+from apps.api.models import Document, GraphBuildJob
 from apps.api.services.graph import acl
 from apps.api.services.graph.jobs import enqueue_analyze, process_job
 from apps.api.services.graph.service import GraphService
@@ -321,3 +321,63 @@ def export_graph(
         "truncated": nodes.get("truncated") or edges.get("truncated"),
         "note": "Только видимые текущему пользователю узлы/рёбра",
     }
+
+
+# --- Connectivity index (lexical/filename; no Qdrant; separate from Graph Explorer edges) ---
+
+
+@router.post("/index/rebuild")
+def rebuild_connectivity_index(
+    user: Annotated[AuthUser, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """Rebuild tenant connectivity index from active chunks (cached by corpus fingerprint)."""
+    from apps.api.services import graph_index as gidx
+
+    payload = gidx.build_index_for_tenant(db, user.tenant_id, force=True)
+    return {
+        "status": "ok",
+        "fingerprint": payload.get("fingerprint"),
+        "built_ms": payload.get("built_ms"),
+        "stats": payload.get("stats") or {},
+    }
+
+
+@router.get("/index/stats")
+def connectivity_index_stats(
+    user: Annotated[AuthUser, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    from apps.api.services import graph_index as gidx
+
+    cached = gidx.load_cached_index(db, user.tenant_id)
+    if not cached:
+        return {"status": "missing"}
+    return {
+        "status": "ok",
+        "fingerprint": cached.get("fingerprint"),
+        "built_at": cached.get("built_at"),
+        "built_ms": cached.get("built_ms"),
+        "stats": cached.get("stats") or {},
+    }
+
+
+@router.get("/index/document/{document_id}")
+def connectivity_index_document(
+    document_id: uuid.UUID,
+    user: Annotated[AuthUser, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+    limit: int = Query(default=20, ge=1, le=100),
+):
+    from apps.api.services import graph_index as gidx
+
+    doc = db.get(Document, document_id)
+    if not doc or doc.tenant_id != user.tenant_id or doc.deleted_at is not None or doc.status == "deleted":
+        _err("GRAPH_NODE_NOT_FOUND_OR_FORBIDDEN", "Документ недоступен")
+
+    cached = gidx.load_cached_index(db, user.tenant_id)
+    if not cached:
+        return {"status": "missing", "document_id": str(document_id)}
+    out = gidx.neighbors_for_document(cached, str(document_id), limit=limit)
+    out["status"] = "ok"
+    return out

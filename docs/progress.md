@@ -1,5 +1,13 @@
 # Progress
 
+## 2026-11-10 — Graph connectivity index (slice 1) step 4
+
+- task_id: T-GRAPH-IDX-04
+- API: `POST/GET /api/graph/index/*` on existing graph router (tenant from session)
+- `scripts/graph_index_report.py` → `artifacts/20261110-120700-graph-index/graph_index_report.md`
+- Real corpus: 702 docs / 12041 chunks / ~21.6k edges; refers_to noisy (short titles); lex_similar≈1 (raise recall next)
+- Unit tests: 18 passed
+
 ## 2026-11-10 — Graph connectivity index (slice 1) steps 2–3
 
 - task_id: T-GRAPH-IDX-02 / T-GRAPH-IDX-03

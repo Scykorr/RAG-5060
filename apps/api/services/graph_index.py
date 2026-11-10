@@ -44,7 +44,7 @@ DEFAULT_SHARED_MIN = 2
 DEFAULT_SHARED_TOP_K = 8
 DEFAULT_LEX_TOP_M = 40
 DEFAULT_LEX_TOP_K = 5
-DEFAULT_LEX_MIN_SCORE = 0.12
+DEFAULT_LEX_MIN_SCORE = 0.04
 DEFAULT_REFERS_PROVENANCE_CHUNKS = 3
 
 
@@ -123,31 +123,49 @@ def theme_from_filename(name: str) -> str:
     return f"{prefix}_"
 
 
+_AUTHOR_SKIP_TOKENS = {
+    "ch",
+    "eb",
+    "ru",
+    "en",
+    "fragment",
+    "фрагмент",
+    "russian",
+    "tom",
+    "vol",
+}
+
+
 def author_from_filename(name: str) -> tuple[str | None, str | None]:
     """Return (author_key Latin, author_ru) from classic_NNNN_Author_Title…"""
     base = Path(name or "").name.rsplit(".", 1)[0]
     base = re.sub(r"_[0-9a-f]{8,}$", "", base, flags=re.I)
+    base = re.sub(r"__фрагмент_\d+.*$", "", base, flags=re.I)
     parts = base.split("_")
-    key: str | None = None
+    candidates: list[str] = []
     if len(parts) >= 3 and parts[0].lower().startswith("classic") and re.fullmatch(r"\d{3,}", parts[1] or ""):
-        key = parts[2]
-    elif len(parts) >= 3 and re.fullmatch(r"[A-Za-z][A-Za-z\-]+", parts[1] or ""):
-        # prefix_Author_Title
-        key = parts[1]
-    elif len(parts) >= 4 and re.fullmatch(r"[A-Za-z][A-Za-z\-]+", parts[2] or ""):
-        key = parts[2]
-    if not key or len(key) < 2:
+        candidates = parts[2:]
+    elif len(parts) >= 3:
+        candidates = parts[1:]
+
+    key: str | None = None
+    for tok in candidates:
+        if not tok or tok.lower() in _AUTHOR_SKIP_TOKENS:
+            continue
+        if len(tok) <= 2:
+            continue
+        # Known catalog author
+        if tok in _AUTHOR_RU_BY_KEY or tok.capitalize() in _AUTHOR_RU_BY_KEY:
+            key = tok if tok in _AUTHOR_RU_BY_KEY else tok.capitalize()
+            break
+        # Capitalized Latin surname
+        if re.fullmatch(r"[A-Z][A-Za-z\-]+", tok) and len(tok) >= 4:
+            key = tok
+            break
+    if not key:
         return None, None
-    if key[0].islower() and key.lower() in ("фрагмент", "fragment"):
-        return None, None
-    # Prefer known catalog authors
     ru = _AUTHOR_RU_BY_KEY.get(key) or _AUTHOR_RU_BY_KEY.get(key.capitalize())
-    if ru:
-        return key if key[0].isupper() else key.capitalize(), ru
-    # Latin-looking token only
-    if re.fullmatch(r"[A-Za-z][A-Za-z\-]+", key):
-        return key[0].upper() + key[1:], None
-    return None, None
+    return key, ru
 
 
 def parse_doc_meta(
@@ -207,12 +225,34 @@ def layer_a_edges(docs: list[DocMeta]) -> list[Edge]:
 # Layer B — refers_to (pure)
 # ---------------------------------------------------------------------------
 
+# Generic single-token title fragments that create noisy refers_to edges.
+_REFERS_WEAK_TOKENS = {
+    "глубине",
+    "дорогие",
+    "земных",
+    "письмах",
+    "движение",
+    "русский",
+    "русская",
+    "человек",
+    "история",
+    "записки",
+    "письмо",
+    "роман",
+    "повесть",
+    "рассказ",
+    "стихотворения",
+    "собрание",
+    "сочинения",
+}
+
+
 def _short_title_forms(title: str) -> list[str]:
-    """Significant single tokens from title (e.g. Онегин)."""
+    """Significant single tokens from title (e.g. Онегин). Min length 7."""
     forms: list[str] = []
-    for tok in re.findall(r"[A-Za-zА-Яа-яЁё]{6,}", title or "", flags=re.UNICODE):
+    for tok in re.findall(r"[A-Za-zА-Яа-яЁё]{7,}", title or "", flags=re.UNICODE):
         n = norm_ru(tok)
-        if n in STOP or n in ENTITY_DENY or n in REFERS_STOP_PHRASES:
+        if n in STOP or n in ENTITY_DENY or n in REFERS_STOP_PHRASES or n in _REFERS_WEAK_TOKENS:
             continue
         forms.append(tok)
     return forms
@@ -355,11 +395,30 @@ def layer_c_shared_entity(
     df: Counter[str] = Counter()
     norm_sets: dict[str, set[str]] = {}
     surface_of: dict[str, str] = {}
+    _graph_entity_deny = ENTITY_DENY | {
+        "произведение",
+        "файл",
+        "название",
+        "вот",
+        "только",
+        "так",
+        "все",
+        "каждый",
+        "russian",
+        "dostoevsky",
+        "tolstoy",
+        "chekhov",
+        "pushkin",
+        "gorky",
+        "herzen",
+        "bryusov",
+        "blok",
+    }
     for doc_id, ents in doc_entities.items():
         ns: set[str] = set()
         for e in ents[: params.entity_top_n]:
             n = norm_ru(e)
-            if len(n) < 3 or n in STOP or n in ENTITY_DENY:
+            if len(n) < 3 or n in STOP or n in _graph_entity_deny:
                 continue
             ns.add(n)
             surface_of.setdefault(n, e)
