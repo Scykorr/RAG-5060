@@ -1,5 +1,46 @@
 # Progress
 
+## 2026-11-10 — Graph connectivity index (slice 1) step 1
+
+- task_id: T-GRAPH-IDX-01
+- Extracted `_norm_ru` / `_STOP` / `_ENTITY_DENY` / entity extractors → `apps/api/services/text_entities.py`
+- `chat.py` imports shared helpers (behaviour unchanged); `tokenize()` for lexical layer
+- Tests: `tests/unit/test_text_entities.py` + health — 6 passed
+
+## 2026-11-10 — Graph Obsidian-like UX (Cytoscape, no D3)
+
+- Verdict: keep Cytoscape; D3 rewrite not needed
+- UX: degree-sized nodes, prefix colors, hide orphans, BFS chain highlight (depth 1–3), click→local focus, CTA «Анализ» when sparse edges
+- Files: `apps/web/graph.js`, `index.html`, `styles.css`; skill S53
+
+## 2026-11-10 — F5 refused: Windows proxy on :18080
+
+- Root: F5 не ломает сайт; Windows↔WSL publish на :18080 сам мигает (WSL curl ок)
+- Fix: nginx publish `:28080`; `RAG5060.exe` reverse-proxy слушает нативный `:18080` → WSL:28080
+- Verify: 12× health 200 через proxy; UI открыт `http://127.0.0.1:18080/` — окно exe не закрывать
+- ERRORS E-20261110-f5-wslrelay-flap; compose `RAG_DOCKER_UI_PORT`
+
+## 2026-11-10 — Knowledge contract: apply + replay
+
+- Усилен смысл `docs/{SKILLS,ERRORS,ABILITIES}` (+ зеркала `Обучение/docs/`): у каждой записи алгоритм применения/повтора
+- SKILLS: колонка «Как применить» + S51 + индекс по темам
+- ABILITIES: «Как применить» + Replay + Skills; запрет yes/pass без replay
+- ERRORS: id / reproduce / replay / prevent / links; `fixed` только с replay
+- AGENTS.md: секция «Контракт знаний (S51)»
+
+## 2026-11-10 — Chat send harden + graph visual polish
+
+- Live smoke: chat=200, graph nodes/status=200 (`SMOKE_CHAT_GRAPH_OK`) while stack healthy
+- Chat UX: preflight health + one retry + «Думаю…»; message clarifies local API (no internet)
+- Graph: animated cose/breadthfirst, hover neighborhood dim, select pulse, canvas ambient gradient
+- Skills S49–S50, ability A17
+
+## 2026-11-10 — Docs sync + offline chat clarification
+
+- User: offline-only; error only on chat «Отправить»; server was stopped
+- Clarified in SKILLS S46–S48, ABILITIES A16, ERRORS 2026-11-10, ROADMAP F12.9–F12.10 + R11: Failed to fetch ≠ internet; need running local stack; WSL memory 12GB
+- Ritual reminder: always read/update both `docs/` and `Обучение/docs/` + roadmap/progress
+
 ## 2026-11-09 — Site up / API unreachable (stale wslrelay)
 
 - Symptom: graph UI visible, toast «нет связи с API»; green «offline» pill was misleading (CDN-free, not link status)

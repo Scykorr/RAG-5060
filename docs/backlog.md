@@ -21,6 +21,11 @@ Statuses: `planned` → `ready` → `in_progress` → `review` → `verified` | 
 | T-S4-01 | F04/F07 | S4 | Pilot 100–500 docs + eval set | planned | |
 | T-S3b-01 | F14 | S3b | Corpus quality loop + doc search + incremental reload | verified | artifacts/…-quality + …-quality-fix |
 
+| T-GRAPH-IDX-01 | F04.18 | S3c | text_entities extract from chat (no behaviour change) | verified | step1 connectivity index |
+| T-GRAPH-IDX-02 | F04.18 | S3c | graph_index layers A/B + unit tests | in_progress | |
+| T-GRAPH-IDX-03 | F04.18 | S3c | graph_index layers C/D + unit tests | planned | |
+| T-GRAPH-IDX-04 | F04.18 | S3c | layer E, JSON cache, API /index/*, report script | planned | |
+
 ## Ready next
 
-F14 smoke (import A → quality → import B → stale → rerun on A∪B); then S4 pilot corpus + eval set (F04/F07).
+T-GRAPH-IDX-02..04 connectivity index (no UI); then F14 smoke / S4 pilot.

@@ -14,6 +14,14 @@ from apps.api.db import get_db
 from apps.api.models import AppSetting, ChatMessage, ChatSession, Chunk, Document, DocumentVersion
 from apps.api.services import ollama as ollama_svc
 from apps.api.services import query_intent as qi
+from apps.api.services.text_entities import (
+    ENTITY_DENY as _ENTITY_DENY,
+    STOP as _STOP,
+    extract_entity_candidates as _extract_entity_candidates,
+    norm_ru as _norm_ru,
+    passage_only as _passage_only,
+    split_passage_highlights as _split_passage_highlights,
+)
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -30,145 +38,6 @@ def _eval_cfg(db: Session) -> dict[str, Any]:
         "scan": int(_setting(db, "retrieve_scan", "600")),
         "prefix": _setting(db, "retrieval_filename_prefix", ""),
     }
-
-
-_ENTITY_DENY = {
-    "документ",
-    "документы",
-    "вопрос",
-    "вопросы",
-    "пропуск",
-    "источник",
-    "источники",
-    "автор",
-    "фрагмент",
-    "ответ",
-    "текст",
-    "новости",
-    "highlight",
-    "cloze",
-    "id",
-    "агентство",
-    "сообщает",
-    "потом",
-    "она",
-    "он",
-    "они",
-    "это",
-    "также",
-    "президент",
-    "президента",
-    "международной",
-    "верховной",
-    "рады",
-    "однако",
-    "профессор",
-    "дискуссии",
-    "взрыв",
-    "географ",
-    "кубок",
-    "известия",
-    "новое",
-    "также",
-    "согласно",
-    "после",
-    "потом",
-    "кроме",
-    "кроме",
-    "между",
-    "фрагменты",
-    "зеленые",
-    "фильм",
-    "коми",
-    "риа",
-    "хдс",
-    "тасс",
-    "sputnik",
-    "reuters",
-    "afp",
-    "dpa",
-    "туризм",
-    "партия",
-    "партию",
-    "кубка",
-    "конфедераций",
-    "москве",
-    "берлине",
-    "президент",
-    "президента",
-    "полузащитник",
-    "переехавшего",
-    "клуб",
-    "судья",
-    "эксперты",
-    "банки",
-    "рядом",
-    "теперь",
-    "адвокат",
-    "дело",
-    "российские",
-    "клиентам",
-    "новости",
-    "ленты",
-    "объявлен",
-    "вторичное",
-}
-
-
-def _split_passage_highlights(text: str) -> tuple[str, str]:
-    """Split body vs @highlight lines; drop cloze meta tails."""
-    t = text or ""
-    for marker in (
-        "\ncloze:",
-        "\nвопросы с пропуском",
-        "\nВопросы с пропуском",
-        "\nсвязанный вопрос",
-    ):
-        idx = _norm_ru(t).find(_norm_ru(marker.strip()))
-        if idx > 40:
-            t = t[:idx]
-            break
-    highs = re.findall(r"(?mi)^@highlight\s*\n?(.*)$", t)
-    body = re.sub(r"(?mi)^@highlight\s*\n?.*$", "", t)
-    body = re.sub(r"@highlight\s*", " ", body)
-    return body.strip(), "\n".join(h.strip() for h in highs if h.strip())
-
-
-def _passage_only(text: str) -> str:
-    """Drop training meta; keep body + downweighted highlights via join for NER."""
-    body, highs = _split_passage_highlights(text)
-    return body if not highs else f"{body}\n{highs}"
-
-
-def _extract_entity_candidates(texts: list[str], limit: int = 40) -> list[str]:
-    """Surface forms likely to fill a RuCoS-style blank."""
-    found: list[str] = []
-    seen: set[str] = set()
-    # Avoid \\b — it does not treat Cyrillic as word chars in Python re.
-    pat = re.compile(
-        r"(?<![0-9A-Za-zА-Яа-яЁё])(?:"
-        r"[A-Z]{2,6}|"  # Latin acronyms USA-like
-        r"[А-ЯЁ]{2,6}|"  # Cyrillic acronyms США/ФСБ
-        r"[A-Z][A-Za-z0-9\-\.]{1,40}|"
-        r"[А-ЯЁ][а-яёА-ЯЁ\-]{2,40}(?:\s+[А-ЯЁ][а-яёА-ЯЁ\-]{2,40}){0,1}"
-        r")(?![0-9A-Za-zА-Яа-яЁё])"
-    )
-    for text in texts:
-        body = _passage_only(text)
-        for m in pat.findall(body):
-            s = m.strip(" .,:;\"'«»")
-            key = _norm_ru(s)
-            if len(key) < 3 or key in seen:
-                continue
-            if key in _STOP or key in _ENTITY_DENY:
-                continue
-            if key.startswith("http"):
-                continue
-            seen.add(key)
-            found.append(s)
-            if len(found) >= limit:
-                return found
-    return found
 
 
 def _looks_like_person(cand: str) -> bool:
@@ -543,70 +412,6 @@ class ChatIn(BaseModel):
 
 class SessionCreateIn(BaseModel):
     title: str = Field(default="Новый чат", min_length=1, max_length=200)
-
-
-_STOP = {
-    "the",
-    "and",
-    "for",
-    "with",
-    "what",
-    "when",
-    "where",
-    "which",
-    "that",
-    "this",
-    "from",
-    "have",
-    "has",
-    "are",
-    "was",
-    "were",
-    "how",
-    "why",
-    "who",
-    "into",
-    "about",
-    "your",
-    "our",
-    "их",
-    "это",
-    "как",
-    "что",
-    "или",
-    "для",
-    "ответь",
-    "ответьте",
-    "одним",
-    "именем",
-    "короткой",
-    "фразой",
-    "текста",
-    "тексте",
-    "автор",
-    "автора",
-    "подсказка",
-    "слов",
-    "рядом",
-    "заполни",
-    "пропуск",
-    "пропуска",
-    "русской",
-    "русская",
-    "классике",
-    "классики",
-    "классика",
-    "документах",
-    "источниках",
-    "вопрос",
-    "вопросы",
-    "место",
-    "неизвестен",
-}
-
-
-def _norm_ru(s: str) -> str:
-    return s.lower().replace("ё", "е")
 
 
 def _retrieve_focus_text(question: str) -> str:
