@@ -30,6 +30,7 @@ from apps.api.services.quality_state import corpus_fingerprint
 from apps.api.services.storage import data_root
 from apps.api.services.graph_text_clean import clean_chunk_for_graph
 from apps.api.services import graph_refers as grefer
+from apps.api.services import graph_authors as gauth
 from apps.api.services.text_entities import (
     EDITION_STOP,
     ENTITY_DENY,
@@ -45,7 +46,7 @@ from apps.api.services.text_entities import (
 
 log = structlog.get_logger()
 
-INDEX_VERSION = 6
+INDEX_VERSION = 7
 
 # Filename grammar tokens (source-site / language folder markers), not corpus content.
 SOURCE_TOKENS = frozenset({"ch", "eb"})
@@ -549,66 +550,11 @@ def _context_snip(text: str, idx: int, phrase_len: int, width: int = 120) -> str
 
 
 def find_author_mentions_in_text(raw: str) -> list[tuple[str, str, int, int]]:
-    """Return (author_key, surface, start, end) for capitalized / initialed mentions.
-
-    Lowercase adjective-like forms (горько, горький as mid-sentence lower) are skipped
-    unless initials or a known first name sits next to the surname.
-    """
-    if not raw:
-        return []
-    body = norm_ru(raw)
-    hits: list[tuple[str, str, int, int]] = []
-    forms = author_forms_by_key()
-    # Initials + surname: «М. Горький», «Л. Н. Толстой», «Ф.М.Достоевский»
-    init_pat = re.compile(
-        r"(?<![0-9A-Za-zА-Яа-яЁё])([A-ZА-ЯЁ]\.\s*){1,3}"
-        r"([A-ZА-ЯЁ][a-zа-яёA-ZА-ЯЁ\-]{2,40})"
-        r"(?![0-9A-Za-zА-Яа-яЁё])",
-        re.UNICODE,
-    )
-    for m in init_pat.finditer(raw):
-        surname = m.group(2)
-        sn = norm_ru(surname)
-        for key, surfaces in forms.items():
-            if sn in surfaces or any(sn.startswith(stem_ru(s)) and abs(len(sn) - len(s)) <= 2 for s in surfaces):
-                hits.append((key, m.group(0), m.start(), m.end()))
-                break
-
-    for key, surfaces in forms.items():
-        for surface in surfaces:
-            start = 0
-            while True:
-                idx = body.find(surface, start)
-                if idx < 0:
-                    break
-                end = idx + len(surface)
-                left_ok = idx == 0 or not body[idx - 1].isalnum()
-                right_ok = end >= len(body) or not body[end].isalnum()
-                start = idx + 1
-                if not (left_ok and right_ok):
-                    continue
-                # Map to raw index (norm_ru only lowercases / ё→е; lengths match for Cyrillic)
-                raw_ch = raw[idx] if idx < len(raw) else ""
-                win = norm_ru(_window(raw, idx, len(surface), 24))
-                has_first = any(fn in win for fn in _AUTHOR_FIRST_NAMES)
-                has_initials = bool(
-                    re.search(
-                        r"[A-ZА-ЯЁ]\.\s*" + re.escape(surface[:1]),
-                        raw[max(0, idx - 8) : end + 1],
-                    )
-                )
-                if raw_ch.isupper() or has_first or has_initials:
-                    hits.append((key, raw[idx:end], idx, end))
-    # Dedup overlapping (keep longer surface)
-    hits.sort(key=lambda h: (h[2], -(h[3] - h[2])))
-    out: list[tuple[str, str, int, int]] = []
-    last_end = -1
-    for h in hits:
-        if h[2] < last_end:
-            continue
-        out.append(h)
-        last_end = h[3]
-    return out
+    """Back-compat wrapper → (author_key, surface, start, end)."""
+    return [
+        (h["author_key"], h["surface"], h["start"], h["end"])
+        for h in gauth.find_author_mentions(raw)
+    ]
 
 
 def layer_mentions_author(
@@ -616,42 +562,83 @@ def layer_mentions_author(
     docs: list[DocMeta],
     chunk_iter: Iterable[tuple[str, str, str]],
 ) -> list[Edge]:
-    """document → author:<key> when clean text mentions another author."""
+    """document → author:<key> with confidence + zone weighting."""
     by_id = {d.document_id: d for d in docs}
-    # doc -> author_key -> {chunks, snips}
     hits: dict[str, dict[str, dict[str, Any]]] = defaultdict(
-        lambda: defaultdict(lambda: {"chunks": [], "snips": []})
+        lambda: defaultdict(
+            lambda: {
+                "chunks": [],
+                "snips": [],
+                "weight_sum": 0.0,
+                "confidence": "medium",
+                "zone": "body",
+            }
+        )
     )
     for doc_id, chunk_id, text in chunk_iter:
         raw = text or ""
         src = by_id.get(doc_id)
-        for key, surface, idx, end in find_author_mentions_in_text(raw):
+        for h in gauth.find_author_mentions(raw):
+            key = h["author_key"]
             if src and src.author_key and key == src.author_key:
-                continue  # self-mention
+                continue
+            zone = grefer.detect_zone(raw, h["start"])
+            conf = h.get("confidence") or "medium"
+            w = 1.0
+            if conf == "medium":
+                w *= 0.7
+            if zone == "commentary":
+                w *= 0.3
             bucket = hits[doc_id][key]
             if chunk_id not in bucket["chunks"]:
                 bucket["chunks"].append(chunk_id)
+                bucket["weight_sum"] += w
+            if conf == "high":
+                bucket["confidence"] = "high"
+            if zone == "commentary" and bucket["zone"] != "body":
+                bucket["zone"] = "commentary"
+            elif zone == "commentary" and not bucket["snips"]:
+                bucket["zone"] = "commentary"
+            # prefer body label unless all commentary
+            if zone == "commentary":
+                bucket.setdefault("zones", []).append("commentary")
+            else:
+                bucket.setdefault("zones", []).append("body")
             if len(bucket["snips"]) < 3:
-                bucket["snips"].append(_context_snip(raw, idx, end - idx))
+                bucket["snips"].append(_context_snip(raw, h["start"], h["end"] - h["start"]))
 
     edges: list[Edge] = []
     for doc_id, by_auth in hits.items():
         for key, info in by_auth.items():
+            zones = info.get("zones") or ["body"]
+            zone = "commentary" if zones and all(z == "commentary" for z in zones) else (
+                "commentary" if zones.count("commentary") > zones.count("body") else "body"
+            )
+            # if any commentary, expose it; mixed → body unless only commentary
+            if "commentary" in zones and "body" not in zones:
+                zone = "commentary"
+            elif "commentary" in zones:
+                zone = "mixed"
+            else:
+                zone = "body"
             edges.append(
                 Edge(
                     source=doc_id,
                     target=f"author:{key}",
                     type="mentions_author",
-                    weight=float(len(info["chunks"])),
+                    weight=round(float(info["weight_sum"]), 4),
                     provenance={
                         "author_key": key,
                         "chunk_ids": info["chunks"][:5],
                         "context": (info["snips"][0] if info["snips"] else "")[:160],
                         "contexts": info["snips"][:3],
+                        "confidence": info.get("confidence") or "medium",
+                        "zone": zone,
                     },
                 )
             )
     return edges
+
 
 
 def build_refers_phrase_index(docs: list[DocMeta]) -> list[tuple[str, str, str, bool]]:
@@ -1767,6 +1754,16 @@ def _build_doc_artifact(
     chash = gcache.content_hash(
         version_id=version_id, filename=meta.filename, chunk_texts=raw_texts
     )
+    # A5: author from first-chunk text header (before clean), if still unknown
+    if not meta.author_key and raw_chunks:
+        first_raw = sorted(raw_chunks, key=lambda x: x[1])[0][2]
+        ak = gauth.detect_author_from_text_header(first_raw or "")
+        if ak:
+            meta.author_key = ak
+            meta.author_ru = _AUTHOR_RU_BY_KEY.get(ak)
+            meta.author_source = "text_header"
+            meta.work_key = work_key_for(pack=meta.pack, author_key=meta.author_key, title=meta.title)
+
     for chunk_id, ord_n, text in raw_chunks:
         clean, hdr = clean_chunk_for_graph(
             text,

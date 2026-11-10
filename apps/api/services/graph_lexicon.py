@@ -38,3 +38,8 @@ def frozenset_field(key: str) -> frozenset[str]:
 def tuple_field(key: str) -> tuple[str, ...]:
     raw = load_graph_lexicon().get(key) or []
     return tuple(str(x) for x in raw)
+
+
+def dict_field(key: str) -> dict[str, Any]:
+    raw = load_graph_lexicon().get(key) or {}
+    return raw if isinstance(raw, dict) else {}

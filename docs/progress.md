@@ -1,5 +1,14 @@
 # Progress
 
+## 2026-11-10 — Graph connectivity 1d A4–A5 (authors + text_header)
+
+- task_id: T-GRAPH-IDX-1D-A — in progress (A1–A5 done)
+- `graph_authors.py`: capitalized-only mentions; reject hyphen compounds / wrong given names / wrong initials; confidence high|medium; commentary zone ×0.3
+- text_header: FIO in first ~10 lines → author_source=text_header (Herzen case)
+- author_name_table surnames/initials in `configs/graph_lexicon.json`; INDEX_VERSION=7
+- Tests: 43 passed
+- Next: A6 duplicates + A7 report
+
 ## 2026-11-10 — Graph connectivity 1d A2–A3 (lex names + entity strength)
 
 - task_id: T-GRAPH-IDX-1D-A — in progress (A1–A3 done)
