@@ -1,5 +1,15 @@
 # Progress
 
+## 2026-11-10 — Graph connectivity index slice 1b (cleanup)
+
+- task_id: T-GRAPH-IDX-1B
+- Filename parse: source tokens `ch`/`eb`, strip `Russian`/author from title, `fragment_no`, `work_key`, `part_of`
+- refers_to: multiword/rare-proper only, weight≥2 or multiword, hub filter, no same-work
+- shared_entity: edition stop, case bias, stem fold, work-level df cap
+- lex_similar: fixed RU (stem+cosine+work df); prior bug = tiny TF-IDF product threshold on fragment df
+- co_cited: live vs `*-smoke`/`ping` eval sessions; quality_loop does not persist messages
+- Tests: 17 passed; report script expanded
+
 ## 2026-11-10 — Graph connectivity index (slice 1) step 4
 
 - task_id: T-GRAPH-IDX-04

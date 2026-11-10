@@ -1,7 +1,6 @@
 """Lexical document connectivity index (no Qdrant, no embeddings, no UI).
 
-Builds a JSON index under data_root()/graph/ from active document chunks:
-layers A (filename scaffold), B (refers_to), C (shared_entity), D (lex_similar), E (co_cited).
+Slice 1b: work_key / part_of, strict refers_to, cleaned entities, fixed RU lex_similar.
 """
 
 from __future__ import annotations
@@ -20,32 +19,41 @@ from uuid import UUID
 import structlog
 from sqlalchemy.orm import Session
 
-from apps.api.models import ChatMessage, Chunk, Document, DocumentVersion
+from apps.api.models import ChatMessage, ChatSession, Chunk, Document, DocumentVersion
 from apps.api.services import query_intent as qi
 from apps.api.services.quality_state import corpus_fingerprint
 from apps.api.services.storage import data_root
 from apps.api.services.text_entities import (
+    EDITION_STOP,
     ENTITY_DENY,
     REFERS_STOP_PHRASES,
+    RU_FUNCTION_WORDS,
     STOP,
+    clean_entity_surface,
     extract_entity_candidates,
     norm_ru,
-    tokenize,
+    stem_ru,
+    tokenize_lex,
 )
 
 log = structlog.get_logger()
 
-INDEX_VERSION = 1
+INDEX_VERSION = 2
 
-# Defaults tuned on fixtures; adjustable via GraphIndexParams.
+# Source-site tokens observed in classic_* filenames (probe 2026-11-10).
+SOURCE_TOKENS = frozenset({"ch", "eb"})
+LANGUAGE_MARKERS = frozenset({"russian", "english", "deutsch", "french"})
+
 DEFAULT_CHUNK_BATCH = 200
 DEFAULT_ENTITY_TOP_N = 20
 DEFAULT_SHARED_MIN = 2
 DEFAULT_SHARED_TOP_K = 8
-DEFAULT_LEX_TOP_M = 40
+DEFAULT_LEX_TOP_M = 50
 DEFAULT_LEX_TOP_K = 5
-DEFAULT_LEX_MIN_SCORE = 0.04
-DEFAULT_REFERS_PROVENANCE_CHUNKS = 3
+DEFAULT_LEX_MIN_SCORE = 0.08
+DEFAULT_REFERS_TOP_K = 10
+DEFAULT_REFERS_HUB_FRAC = 0.10
+DEFAULT_ENTITY_MAX_WORK_FRAC = 0.15
 
 
 @dataclass
@@ -57,7 +65,10 @@ class GraphIndexParams:
     lex_top_m: int = DEFAULT_LEX_TOP_M
     lex_top_k: int = DEFAULT_LEX_TOP_K
     lex_min_score: float = DEFAULT_LEX_MIN_SCORE
-    refers_provenance_chunks: int = DEFAULT_REFERS_PROVENANCE_CHUNKS
+    refers_top_k: int = DEFAULT_REFERS_TOP_K
+    refers_hub_frac: float = DEFAULT_REFERS_HUB_FRAC
+    entity_max_work_frac: float = DEFAULT_ENTITY_MAX_WORK_FRAC
+    include_eval_cocited: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -68,7 +79,11 @@ class GraphIndexParams:
             "lex_top_m": self.lex_top_m,
             "lex_top_k": self.lex_top_k,
             "lex_min_score": self.lex_min_score,
-            "refers_provenance_chunks": self.refers_provenance_chunks,
+            "refers_top_k": self.refers_top_k,
+            "refers_hub_frac": self.refers_hub_frac,
+            "entity_max_work_frac": self.entity_max_work_frac,
+            "include_eval_cocited": self.include_eval_cocited,
+            "index_version": INDEX_VERSION,
         }
 
 
@@ -77,9 +92,13 @@ class DocMeta:
     document_id: str
     filename: str
     theme: str
+    pack: str
+    source: str | None
     author_key: str | None
     author_ru: str | None
     title: str
+    fragment_no: int | None = None
+    work_key: str = ""
     chunk_count: int = 0
     created_at: str | None = None
 
@@ -102,17 +121,12 @@ class Edge:
         }
 
 
-# ---------------------------------------------------------------------------
-# Layer A — filename scaffold (pure)
-# ---------------------------------------------------------------------------
-
 _AUTHOR_RU_BY_KEY: dict[str, str] = {}
 for _ru, _key in qi.AUTHOR_ALIASES.items():
     _AUTHOR_RU_BY_KEY.setdefault(_key, _ru)
 
 
 def theme_from_filename(name: str) -> str:
-    """classic_0001_… → classic_; unknown → Прочее."""
     base = Path(name or "").name
     m = re.match(r"^([A-Za-z][A-Za-z0-9]*)_", base)
     if not m:
@@ -123,49 +137,86 @@ def theme_from_filename(name: str) -> str:
     return f"{prefix}_"
 
 
-_AUTHOR_SKIP_TOKENS = {
-    "ch",
-    "eb",
-    "ru",
-    "en",
-    "fragment",
-    "фрагмент",
-    "russian",
-    "tom",
-    "vol",
-}
-
-
-def author_from_filename(name: str) -> tuple[str | None, str | None]:
-    """Return (author_key Latin, author_ru) from classic_NNNN_Author_Title…"""
-    base = Path(name or "").name.rsplit(".", 1)[0]
+def _strip_hash_and_fragment(base: str) -> tuple[str, int | None]:
+    frag: int | None = None
+    m = re.search(r"__фрагмент_(\d+)", base, flags=re.I)
+    if m:
+        frag = int(m.group(1))
+        base = re.sub(r"__фрагмент_\d+", "", base, flags=re.I)
     base = re.sub(r"_[0-9a-f]{8,}$", "", base, flags=re.I)
-    base = re.sub(r"__фрагмент_\d+.*$", "", base, flags=re.I)
-    parts = base.split("_")
-    candidates: list[str] = []
-    if len(parts) >= 3 and parts[0].lower().startswith("classic") and re.fullmatch(r"\d{3,}", parts[1] or ""):
-        candidates = parts[2:]
-    elif len(parts) >= 3:
-        candidates = parts[1:]
+    return base, frag
 
-    key: str | None = None
-    for tok in candidates:
-        if not tok or tok.lower() in _AUTHOR_SKIP_TOKENS:
+
+def parse_filename_parts(name: str) -> dict[str, Any]:
+    """Parse pack/src/author/title/fragment from corpus filenames."""
+    raw = Path(name or "").name
+    stem = raw.rsplit(".", 1)[0]
+    stem, frag = _strip_hash_and_fragment(stem)
+    parts = [p for p in stem.split("_") if p != ""]
+    pack = parts[0].lower() if parts else ""
+    theme = theme_from_filename(raw)
+    source: str | None = None
+    author_key: str | None = None
+    title_parts: list[str] = []
+
+    if len(parts) >= 3 and pack.startswith("classic") and re.fullmatch(r"\d{3,}", parts[1] or ""):
+        i = 2
+        if parts[i].lower() in SOURCE_TOKENS:
+            source = parts[i].lower()
+            i += 1
+        # author?
+        if i < len(parts):
+            tok = parts[i]
+            if tok.lower() in LANGUAGE_MARKERS:
+                # no author — language marker, skip from title
+                i += 1
+            elif tok in _AUTHOR_RU_BY_KEY or tok.capitalize() in _AUTHOR_RU_BY_KEY:
+                author_key = tok if tok in _AUTHOR_RU_BY_KEY else tok.capitalize()
+                i += 1
+            elif re.fullmatch(r"[A-Z][A-Za-z\-]{3,}", tok):
+                author_key = tok
+                i += 1
+        title_parts = parts[i:]
+    elif len(parts) >= 2:
+        title_parts = parts[1:]
+    else:
+        title_parts = parts
+
+    # Drop leftover language/source/author tokens from title
+    cleaned: list[str] = []
+    for t in title_parts:
+        tl = t.lower()
+        if tl in SOURCE_TOKENS or tl in LANGUAGE_MARKERS:
             continue
-        if len(tok) <= 2:
+        if author_key and (t == author_key or t.lower() == author_key.lower()):
             continue
-        # Known catalog author
-        if tok in _AUTHOR_RU_BY_KEY or tok.capitalize() in _AUTHOR_RU_BY_KEY:
-            key = tok if tok in _AUTHOR_RU_BY_KEY else tok.capitalize()
-            break
-        # Capitalized Latin surname
-        if re.fullmatch(r"[A-Z][A-Za-z\-]+", tok) and len(tok) >= 4:
-            key = tok
-            break
-    if not key:
-        return None, None
-    ru = _AUTHOR_RU_BY_KEY.get(key) or _AUTHOR_RU_BY_KEY.get(key.capitalize())
-    return key, ru
+        if t in _AUTHOR_RU_BY_KEY or t.capitalize() in _AUTHOR_RU_BY_KEY:
+            # stray author token in title
+            if not author_key:
+                author_key = t if t in _AUTHOR_RU_BY_KEY else t.capitalize()
+            continue
+        cleaned.append(t)
+    title = " ".join(cleaned).replace("  ", " ").strip(" _") or stem.replace("_", " ")
+    author_ru = None
+    if author_key:
+        author_ru = _AUTHOR_RU_BY_KEY.get(author_key) or _AUTHOR_RU_BY_KEY.get(author_key.capitalize())
+    return {
+        "pack": pack or "other",
+        "theme": theme,
+        "source": source,
+        "author_key": author_key,
+        "author_ru": author_ru,
+        "title": title,
+        "fragment_no": frag,
+    }
+
+
+def work_key_for(*, pack: str, author_key: str | None, title: str) -> str:
+    a = (author_key or "").strip() or "_"
+    t = re.sub(r"\s+", " ", norm_ru(title)).strip()
+    t = re.sub(r"[^0-9a-zа-я ]+", "", t)
+    t = re.sub(r"\s+", "_", t)[:80] or "untitled"
+    return f"{pack}|{a}|{t}"
 
 
 def parse_doc_meta(
@@ -175,26 +226,51 @@ def parse_doc_meta(
     chunk_count: int = 0,
     created_at: str | None = None,
 ) -> DocMeta:
-    theme = theme_from_filename(filename)
-    author_key, author_ru = author_from_filename(filename)
-    title = qi.parse_title_from_filename(filename) or Path(filename).stem
-    if not title.strip():
-        title = Path(filename).stem or document_id
+    parsed = parse_filename_parts(filename)
+    wk = work_key_for(pack=parsed["pack"], author_key=parsed["author_key"], title=parsed["title"])
     return DocMeta(
         document_id=str(document_id),
         filename=filename,
-        theme=theme,
-        author_key=author_key,
-        author_ru=author_ru,
-        title=title,
+        theme=parsed["theme"],
+        pack=parsed["pack"],
+        source=parsed["source"],
+        author_key=parsed["author_key"],
+        author_ru=parsed["author_ru"],
+        title=parsed["title"],
+        fragment_no=parsed["fragment_no"],
+        work_key=wk,
         chunk_count=chunk_count,
         created_at=created_at,
     )
 
 
+def resolve_work_keys(docs: list[DocMeta]) -> None:
+    """Merge authorless unique titles into authored work_key when unique in corpus."""
+    by_title: dict[str, list[DocMeta]] = defaultdict(list)
+    for d in docs:
+        by_title[norm_ru(d.title)].append(d)
+    authored_title: dict[str, str] = {}
+    for title_n, group in by_title.items():
+        authors = {d.author_key for d in group if d.author_key}
+        if len(authors) == 1:
+            authored_title[title_n] = next(iter(authors))  # type: ignore[arg-type]
+    for d in docs:
+        if d.author_key:
+            continue
+        ak = authored_title.get(norm_ru(d.title))
+        if not ak:
+            continue
+        # only if that title maps to exactly one author across corpus
+        d.author_key = ak
+        d.author_ru = _AUTHOR_RU_BY_KEY.get(ak)
+        d.work_key = work_key_for(pack=d.pack, author_key=d.author_key, title=d.title)
+
+
 def layer_a_edges(docs: list[DocMeta]) -> list[Edge]:
     edges: list[Edge] = []
+    work_docs: dict[str, list[DocMeta]] = defaultdict(list)
     for d in docs:
+        work_docs[d.work_key].append(d)
         edges.append(
             Edge(
                 source=f"theme:{d.theme}",
@@ -218,254 +294,371 @@ def layer_a_edges(docs: list[DocMeta]) -> list[Edge]:
                     },
                 )
             )
+        edges.append(
+            Edge(
+                source=d.document_id,
+                target=f"work:{d.work_key}",
+                type="part_of",
+                weight=1.0,
+                provenance={
+                    "work_key": d.work_key,
+                    "fragment_no": d.fragment_no,
+                    "title": d.title,
+                },
+            )
+        )
+    # work meta edges: self-describing via provenance on a synthetic note stored as edge weight=fragment_count
+    for wk, group in work_docs.items():
+        edges.append(
+            Edge(
+                source=f"work:{wk}",
+                target=f"work:{wk}",
+                type="work_meta",
+                weight=float(len(group)),
+                provenance={
+                    "work_key": wk,
+                    "fragment_count": len(group),
+                    "title": group[0].title,
+                    "author_key": group[0].author_key,
+                    "document_ids": [g.document_id for g in group[:20]],
+                },
+            )
+        )
     return edges
 
 
+def same_work(a: DocMeta | None, b: DocMeta | None) -> bool:
+    if not a or not b:
+        return False
+    return bool(a.work_key) and a.work_key == b.work_key
+
+
 # ---------------------------------------------------------------------------
-# Layer B — refers_to (pure)
+# Layer B — refers_to
 # ---------------------------------------------------------------------------
 
-# Generic single-token title fragments that create noisy refers_to edges.
-_REFERS_WEAK_TOKENS = {
-    "глубине",
-    "дорогие",
-    "земных",
-    "письмах",
-    "движение",
-    "русский",
-    "русская",
-    "человек",
-    "история",
-    "записки",
-    "письмо",
-    "роман",
-    "повесть",
-    "рассказ",
-    "стихотворения",
-    "собрание",
-    "сочинения",
-}
-
-
-def _short_title_forms(title: str) -> list[str]:
-    """Significant single tokens from title (e.g. Онегин). Min length 7."""
-    forms: list[str] = []
-    for tok in re.findall(r"[A-Za-zА-Яа-яЁё]{7,}", title or "", flags=re.UNICODE):
-        n = norm_ru(tok)
-        if n in STOP or n in ENTITY_DENY or n in REFERS_STOP_PHRASES or n in _REFERS_WEAK_TOKENS:
+def _significant_words(title: str) -> list[str]:
+    words = []
+    for w in re.findall(r"[A-Za-zА-Яа-яЁё]{3,}", title or "", flags=re.UNICODE):
+        n = norm_ru(w)
+        if n in STOP or n in ENTITY_DENY or n in REFERS_STOP_PHRASES or n in RU_FUNCTION_WORDS:
             continue
-        forms.append(tok)
-    return forms
+        words.append(w)
+    return words
 
 
-def build_refers_phrase_index(docs: list[DocMeta]) -> list[tuple[str, str, str]]:
-    """List of (norm_phrase, document_id, surface) sorted longest-first."""
-    items: list[tuple[str, str, str]] = []
-    seen_pair: set[tuple[str, str]] = set()
+def _is_rare_proper_title_word(word: str, *, doc_df: dict[str, int], n_docs: int) -> bool:
+    if not word or not word[0].isupper():
+        return False
+    n = norm_ru(word)
+    if len(n) < 6:
+        return False
+    if n in REFERS_STOP_PHRASES or n in STOP or n in RU_FUNCTION_WORDS or n in EDITION_STOP:
+        return False
+    df = doc_df.get(n, 0)
+    if n_docs > 0 and df > max(1, int(0.01 * n_docs)):
+        return False
+    return True
 
-    def add(surface: str, doc_id: str) -> None:
+
+def build_refers_phrase_index(
+    docs: list[DocMeta],
+    *,
+    title_token_df: dict[str, int] | None = None,
+) -> list[tuple[str, str, str, bool]]:
+    """(norm_phrase, document_id, surface, is_multiword) longest-first."""
+    title_token_df = title_token_df or {}
+    n_docs = max(1, len(docs))
+    items: list[tuple[str, str, str, bool]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(surface: str, doc_id: str, *, multi: bool) -> None:
         s = (surface or "").strip(" .,:;«»\"'")
         if not s:
             return
         n = norm_ru(s)
-        if len(n) < 2:
+        if len(n) < 3:
             return
-        # title ≥2 words OR ≥6 chars
-        words = n.split()
-        if len(words) < 2 and len(n) < 6:
-            return
-        if n in REFERS_STOP_PHRASES or n in STOP or n in ENTITY_DENY:
+        if n in REFERS_STOP_PHRASES or n in STOP or n in EDITION_STOP:
             return
         key = (n, doc_id)
-        if key in seen_pair:
+        if key in seen:
             return
-        seen_pair.add(key)
-        items.append((n, doc_id, s))
+        seen.add(key)
+        items.append((n, doc_id, s, multi))
 
+    # author RU full forms (not Latin filename tokens)
     for d in docs:
-        add(d.title, d.document_id)
-        for form in _short_title_forms(d.title):
-            add(form, d.document_id)
-        if d.author_key:
-            add(d.author_key, d.document_id)
+        words = _significant_words(d.title)
+        if len(words) >= 2:
+            add(" ".join(words), d.document_id, multi=True)
+            add(d.title, d.document_id, multi=True)
+        elif len(words) == 1:
+            w = words[0]
+            if _is_rare_proper_title_word(w, doc_df=title_token_df, n_docs=n_docs):
+                add(w, d.document_id, multi=False)
         if d.author_ru:
-            add(d.author_ru, d.document_id)
-            # aliases pointing to same key
             for ru, key in qi.AUTHOR_ALIASES.items():
                 if key == d.author_key:
-                    add(ru, d.document_id)
-        elif d.author_key:
-            for ru, key in qi.AUTHOR_ALIASES.items():
-                if key == d.author_key:
-                    add(ru, d.document_id)
+                    add(ru, d.document_id, multi=False)
 
     items.sort(key=lambda x: (-len(x[0]), x[0], x[1]))
     return items
+
+
+def _word_boundary_find(body: str, phrase: str) -> list[int]:
+    """Find phrase starts with alnum boundaries; allow last-word stem for multiword."""
+    hits: list[int] = []
+    if not phrase:
+        return hits
+    # exact
+    start = 0
+    while True:
+        idx = body.find(phrase, start)
+        if idx < 0:
+            break
+        end = idx + len(phrase)
+        left_ok = idx == 0 or not body[idx - 1].isalnum()
+        right_ok = end >= len(body) or not body[end].isalnum()
+        if left_ok and right_ok:
+            hits.append(idx)
+        start = idx + 1
+    if hits:
+        return hits
+    # multiword: stem first + last tokens (handles «Героя нашего времени»)
+    parts = phrase.split()
+    if len(parts) < 2:
+        return hits
+    mid = parts[1:-1]
+    first_stem = stem_ru(parts[0])
+    last_stem = stem_ru(parts[-1])
+    if len(first_stem) < 4 or len(last_stem) < 4:
+        return hits
+    mid_re = r"\s+".join(re.escape(m) for m in mid) if mid else ""
+    if mid_re:
+        mid_re = r"\s+" + mid_re + r"\s+"
+    else:
+        mid_re = r"\s+"
+    pat = re.compile(
+        rf"(?<![0-9a-zа-я]){re.escape(first_stem)}[a-zа-я]{{0,4}}{mid_re}{re.escape(last_stem)}[a-zа-я]{{0,4}}(?![0-9a-zа-я])",
+        re.UNICODE,
+    )
+    for m in pat.finditer(body):
+        hits.append(m.start())
+    return hits
+
+
+def _context_snip(text: str, idx: int, phrase_len: int, width: int = 120) -> str:
+    a = max(0, idx - width // 3)
+    b = min(len(text), idx + phrase_len + width // 2)
+    return re.sub(r"\s+", " ", text[a:b]).strip()
 
 
 def layer_b_refers_to(
     *,
     docs: list[DocMeta],
     chunk_iter: Iterable[tuple[str, str, str]],
-    # (document_id, chunk_id, text)
     params: GraphIndexParams | None = None,
 ) -> list[Edge]:
-    """A→B when chunks of A mention a phrase of B. No self-links."""
     params = params or GraphIndexParams()
-    phrases = build_refers_phrase_index(docs)
+    by_id = {d.document_id: d for d in docs}
+    # title token df across documents (for rare proper filter)
+    title_df: Counter[str] = Counter()
+    for d in docs:
+        for w in _significant_words(d.title):
+            title_df[norm_ru(w)] += 1
+    phrases = build_refers_phrase_index(docs, title_token_df=dict(title_df))
     if not phrases:
         return []
 
-    # doc_id → phrase_norm → {chunk_ids, surface}
-    hits: dict[str, dict[str, dict[str, Any]]] = defaultdict(lambda: defaultdict(lambda: {"chunks": [], "surface": "", "target": ""}))
+    # src -> target -> {chunks, phrase, multi, snips}
+    hits: dict[str, dict[str, dict[str, Any]]] = defaultdict(
+        lambda: defaultdict(lambda: {"chunks": [], "phrase": "", "multi": False, "snips": []})
+    )
+
+    edition_pat = re.compile(
+        r"(полное\s+собрание|действующие\s+лица|оглавление|содержание|примечания)",
+        re.I,
+    )
 
     for doc_id, chunk_id, text in chunk_iter:
-        body = norm_ru(text or "")
-        if not body:
-            continue
-        matched_spans: list[tuple[int, int]] = []
-        for phrase_n, target_id, surface in phrases:
+        raw = text or ""
+        body = norm_ru(raw)
+        if not body or edition_pat.search(body[:400]):
+            # still search but skip if chunk looks like TOC-only short header
+            if len(body) < 80 and edition_pat.search(body):
+                continue
+        src_meta = by_id.get(doc_id)
+        for phrase_n, target_id, surface, multi in phrases:
             if target_id == doc_id:
                 continue
-            # skip if overlaps already matched longer phrase
-            start = 0
-            while True:
-                idx = body.find(phrase_n, start)
-                if idx < 0:
-                    break
-                end = idx + len(phrase_n)
-                # word-ish boundary: not alnum on sides
-                left_ok = idx == 0 or not body[idx - 1].isalnum()
-                right_ok = end >= len(body) or not body[end].isalnum()
-                if left_ok and right_ok:
-                    overlap = any(not (end <= a or idx >= b) for a, b in matched_spans)
-                    if not overlap:
-                        matched_spans.append((idx, end))
-                        bucket = hits[doc_id][f"{target_id}::{phrase_n}"]
-                        bucket["target"] = target_id
-                        bucket["surface"] = surface
-                        if chunk_id not in bucket["chunks"]:
-                            bucket["chunks"].append(chunk_id)
-                        break
-                start = idx + 1
+            tgt_meta = by_id.get(target_id)
+            if same_work(src_meta, tgt_meta):
+                continue
+            found = _word_boundary_find(body, phrase_n)
+            if not found:
+                continue
+            bucket = hits[doc_id][target_id]
+            if chunk_id not in bucket["chunks"]:
+                bucket["chunks"].append(chunk_id)
+            if not bucket["phrase"] or (multi and not bucket["multi"]):
+                bucket["phrase"] = surface
+                bucket["multi"] = multi
+            if len(bucket["snips"]) < 2:
+                # map approx index on original via norm (best-effort)
+                bucket["snips"].append(_context_snip(raw, min(found[0], max(0, len(raw) - 1)), len(surface)))
 
-    edges: list[Edge] = []
-    for src, by_phrase in hits.items():
-        # aggregate by target
-        by_target: dict[str, dict[str, Any]] = {}
-        for _k, info in by_phrase.items():
-            tid = info["target"]
-            agg = by_target.setdefault(tid, {"chunks": [], "phrases": []})
-            for cid in info["chunks"]:
-                if cid not in agg["chunks"]:
-                    agg["chunks"].append(cid)
-            if info["surface"] not in agg["phrases"]:
-                agg["phrases"].append(info["surface"])
-        for tid, agg in by_target.items():
-            edges.append(
+    # build edges with filters
+    raw_edges: list[Edge] = []
+    for src, by_tgt in hits.items():
+        for tgt, info in by_tgt.items():
+            w = float(len(info["chunks"]))
+            multi = bool(info["multi"])
+            if w < 2 and not multi:
+                continue
+            raw_edges.append(
                 Edge(
                     source=src,
-                    target=tid,
+                    target=tgt,
                     type="refers_to",
-                    weight=float(len(agg["chunks"])),
+                    weight=w,
                     provenance={
-                        "chunk_ids": agg["chunks"][: params.refers_provenance_chunks],
-                        "phrase": agg["phrases"][0] if agg["phrases"] else "",
-                        "phrases": agg["phrases"][:5],
+                        "chunk_ids": info["chunks"][:3],
+                        "phrase": info["phrase"],
+                        "context": (info["snips"][0] if info["snips"] else "")[:160],
+                        "multiword": multi,
                     },
                 )
             )
-    return edges
+
+    # hub filter: one-word phrase pointing to target from >X% sources
+    n_docs = max(1, len(docs))
+    inbound: dict[str, list[Edge]] = defaultdict(list)
+    for e in raw_edges:
+        inbound[e.target].append(e)
+    drop_targets: set[str] = set()
+    for tgt, lst in inbound.items():
+        one_word = [e for e in lst if not (e.provenance or {}).get("multiword")]
+        if len(one_word) > params.refers_hub_frac * n_docs:
+            drop_targets.add(tgt)
+    filtered = [e for e in raw_edges if not (e.target in drop_targets and not (e.provenance or {}).get("multiword"))]
+
+    # per-source top-k
+    by_src: dict[str, list[Edge]] = defaultdict(list)
+    for e in filtered:
+        by_src[e.source].append(e)
+    out: list[Edge] = []
+    for src, lst in by_src.items():
+        lst.sort(key=lambda e: (-e.weight, e.target))
+        out.extend(lst[: params.refers_top_k])
+    return out
 
 
 # ---------------------------------------------------------------------------
-# Layer C — shared_entity (pure)
+# Layer C — shared_entity
 # ---------------------------------------------------------------------------
+
+def _entity_key(surface: str) -> str:
+    parts = norm_ru(surface).split()
+    if not parts:
+        return ""
+    parts = [stem_ru(p) for p in parts]
+    return " ".join(parts)
+
 
 def layer_c_shared_entity(
     *,
+    docs: list[DocMeta],
     doc_entities: dict[str, list[str]],
     doc_entity_chunks: dict[str, dict[str, list[str]]] | None = None,
+    case_stats: dict[str, dict[str, int]] | None = None,
     params: GraphIndexParams | None = None,
 ) -> list[Edge]:
-    """Edges when ≥ shared_min common entities; top-k neighbours per doc."""
+    """case_stats: token_norm -> {upper: n, lower: n} from corpus scan."""
     params = params or GraphIndexParams()
     doc_entity_chunks = doc_entity_chunks or {}
-    # df
-    df: Counter[str] = Counter()
-    norm_sets: dict[str, set[str]] = {}
-    surface_of: dict[str, str] = {}
-    _graph_entity_deny = ENTITY_DENY | {
-        "произведение",
-        "файл",
-        "название",
-        "вот",
-        "только",
-        "так",
-        "все",
-        "каждый",
-        "russian",
-        "dostoevsky",
-        "tolstoy",
-        "chekhov",
-        "pushkin",
-        "gorky",
-        "herzen",
-        "bryusov",
-        "blok",
-    }
+    case_stats = case_stats or {}
+    by_id = {d.document_id: d for d in docs}
+    n_works = max(1, len({d.work_key for d in docs}))
+
+    # map entity_key -> display, and work-level df
+    work_entities: dict[str, set[str]] = defaultdict(set)
+    doc_keys: dict[str, set[str]] = {}
+    display: dict[str, str] = {}
+    display_count: dict[str, Counter[str]] = defaultdict(Counter)
+
     for doc_id, ents in doc_entities.items():
-        ns: set[str] = set()
-        for e in ents[: params.entity_top_n]:
-            n = norm_ru(e)
-            if len(n) < 3 or n in STOP or n in _graph_entity_deny:
+        keys: set[str] = set()
+        meta = by_id.get(doc_id)
+        for e in ents[: params.entity_top_n * 2]:
+            cleaned = clean_entity_surface(e)
+            if not cleaned:
                 continue
-            ns.add(n)
-            surface_of.setdefault(n, e)
-        for n in ns:
-            df[n] += 1
-        norm_sets[doc_id] = ns
+            # sentence-initial bias: if mostly lowercase in corpus, drop
+            first = cleaned.split()[0]
+            st = case_stats.get(norm_ru(first))
+            if st:
+                low, up = st.get("lower", 0), st.get("upper", 0)
+                if low > up * 3 and low + up >= 8:
+                    continue
+            k = _entity_key(cleaned)
+            if len(k) < 3 or k in EDITION_STOP:
+                continue
+            keys.add(k)
+            display_count[k][cleaned] += 1
+        doc_keys[doc_id] = keys
+        if meta:
+            work_entities[meta.work_key] |= keys
 
-    # keep entities with df≥2
-    valid = {e for e, c in df.items() if c >= 2}
-    for doc_id in list(norm_sets.keys()):
-        norm_sets[doc_id] = {e for e in norm_sets[doc_id] if e in valid}
+    for k, ctr in display_count.items():
+        display[k] = ctr.most_common(1)[0][0]
 
-    doc_ids = list(norm_sets.keys())
-    # candidate pairs via inverted index
+    work_df: Counter[str] = Counter()
+    for ents in work_entities.values():
+        for e in ents:
+            work_df[e] += 1
+
+    max_df = max(2, int(params.entity_max_work_frac * n_works))
+    valid = {e for e, c in work_df.items() if 2 <= c <= max_df}
+
+    for doc_id in list(doc_keys.keys()):
+        doc_keys[doc_id] = {e for e in doc_keys[doc_id] if e in valid}
+
     inv: dict[str, list[str]] = defaultdict(list)
-    for doc_id, ents in norm_sets.items():
+    for doc_id, ents in doc_keys.items():
         for e in ents:
             inv[e].append(doc_id)
 
     pair_common: dict[tuple[str, str], set[str]] = defaultdict(set)
     for e, members in inv.items():
-        if len(members) < 2:
-            continue
         mem = sorted(set(members))
         for i in range(len(mem)):
             for j in range(i + 1, len(mem)):
                 a, b = mem[i], mem[j]
+                if same_work(by_id.get(a), by_id.get(b)):
+                    continue
                 pair_common[(a, b)].add(e)
 
-    # per-doc top-k
+    def idf(ent: str) -> float:
+        return math.log((n_works + 1) / (work_df[ent] + 1)) + 1.0
+
     neigh: dict[str, list[tuple[float, str, set[str]]]] = defaultdict(list)
     for (a, b), common in pair_common.items():
         if len(common) < params.shared_min_entities:
             continue
-        w = float(len(common))
+        w = sum(idf(e) for e in common)
         neigh[a].append((w, b, common))
         neigh[b].append((w, a, common))
 
     edges: list[Edge] = []
-    seen_undirected: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str]] = set()
     for src, lst in neigh.items():
         lst.sort(key=lambda x: (-x[0], x[1]))
         for w, tgt, common in lst[: params.shared_top_k]:
             key = tuple(sorted((src, tgt)))
-            if key in seen_undirected:
+            if key in seen:
                 continue
-            seen_undirected.add(key)
+            seen.add(key)
             chunk_ids: list[str] = []
             for ent in sorted(common)[:5]:
                 for did in (src, tgt):
@@ -477,9 +670,9 @@ def layer_c_shared_entity(
                     source=key[0],
                     target=key[1],
                     type="shared_entity",
-                    weight=w,
+                    weight=round(float(w), 4),
                     provenance={
-                        "entities": [surface_of.get(e, e) for e in sorted(common)[:10]],
+                        "entities": [display.get(e, e) for e in sorted(common)[:10]],
                         "chunk_ids": chunk_ids[:3],
                     },
                 )
@@ -488,129 +681,158 @@ def layer_c_shared_entity(
 
 
 # ---------------------------------------------------------------------------
-# Layer D — lex_similar TF-IDF (pure)
+# Layer D — lex_similar (fixed for Russian)
 # ---------------------------------------------------------------------------
 
 class LexCandidateCounter:
-    """Test hook: counts candidate pair evaluations (must stay ≪ N²)."""
-
     def __init__(self) -> None:
         self.comparisons = 0
 
 
 def layer_d_lex_similar(
     *,
+    docs: list[DocMeta],
     doc_term_counts: dict[str, Counter[str]],
     params: GraphIndexParams | None = None,
     counter: LexCandidateCounter | None = None,
-) -> list[Edge]:
+) -> tuple[list[Edge], dict[str, Any]]:
+    """Return edges + debug stats (score histogram).
+
+    Bug cause (slice 1): scored pairs via product of tiny per-term TF-IDF weights
+    with a high absolute threshold, while also filtering terms with df up to 35–60%
+    of *documents* (fragments). Rare literary stems rarely co-occurred under that
+    product threshold; only tiny English sample files survived. Fix: stem+RU stops,
+    document-level vectors with cosine, df bounds on *works*, lower cosine threshold.
+    """
     params = params or GraphIndexParams()
+    by_id = {d.document_id: d for d in docs}
     n_docs = len(doc_term_counts)
     if n_docs < 2:
-        return []
+        return [], {"scores": [], "bugfix": "n_docs<2"}
 
-    df: Counter[str] = Counter()
-    for counts in doc_term_counts.values():
-        for t in counts:
-            df[t] += 1
+    # work-level df for term rarity
+    work_terms: dict[str, set[str]] = defaultdict(set)
+    for doc_id, counts in doc_term_counts.items():
+        meta = by_id.get(doc_id)
+        wk = meta.work_key if meta else doc_id
+        work_terms[wk] |= set(counts.keys())
+    n_works = max(1, len(work_terms))
+    df_work: Counter[str] = Counter()
+    for terms in work_terms.values():
+        for t in terms:
+            df_work[t] += 1
 
-    # characteristic terms per doc (TF-IDF)
-    char_terms: dict[str, dict[str, float]] = {}
+    max_df = max(2, int(0.30 * n_works))
+    # characteristic vectors per document
+    vectors: dict[str, dict[str, float]] = {}
     inv: dict[str, list[str]] = defaultdict(list)
     for doc_id, counts in doc_term_counts.items():
         total = sum(counts.values()) or 1
-        scores: list[tuple[float, str]] = []
+        scored: list[tuple[float, str]] = []
         for t, c in counts.items():
-            # skip ultra-common
-            if df[t] >= max(2, int(0.6 * n_docs)):
+            dw = df_work.get(t, 0)
+            if dw <= 1 or dw > max_df:
                 continue
             tf = c / total
-            idf = math.log((n_docs + 1) / (df[t] + 1)) + 1.0
-            scores.append((tf * idf, t))
-        scores.sort(reverse=True)
-        top = scores[: params.lex_top_m]
-        char_terms[doc_id] = {t: s for s, t in top}
-        for _s, t in top:
+            idf = math.log((n_works + 1) / (dw + 1)) + 1.0
+            scored.append((tf * idf, t))
+        scored.sort(reverse=True)
+        top = scored[: params.lex_top_m]
+        vec = {t: s for s, t in top}
+        if not vec:
+            continue
+        # L2 normalize for cosine
+        norm = math.sqrt(sum(v * v for v in vec.values())) or 1.0
+        vectors[doc_id] = {t: v / norm for t, v in vec.items()}
+        for t in vectors[doc_id]:
             inv[t].append(doc_id)
 
-    # candidates sharing rare terms
-    pair_scores: dict[tuple[str, str], float] = defaultdict(float)
-    pair_terms: dict[tuple[str, str], list[str]] = defaultdict(list)
+    pair_best: dict[tuple[str, str], tuple[float, list[str]]] = {}
     for t, members in inv.items():
-        if len(members) < 2:
-            continue
-        # rare-ish
-        if df[t] > max(3, int(0.35 * n_docs)):
+        # rare-ish terms drive candidates
+        if df_work.get(t, 0) > max(3, int(0.20 * n_works)):
             continue
         mem = sorted(set(members))
         for i in range(len(mem)):
             for j in range(i + 1, len(mem)):
                 a, b = mem[i], mem[j]
+                if same_work(by_id.get(a), by_id.get(b)):
+                    continue
                 if counter is not None:
                     counter.comparisons += 1
-                sa = char_terms[a].get(t, 0.0)
-                sb = char_terms[b].get(t, 0.0)
-                contrib = sa * sb
-                if contrib <= 0:
+                va, vb = vectors.get(a), vectors.get(b)
+                if not va or not vb:
                     continue
-                key = (a, b)
-                pair_scores[key] += contrib
-                if t not in pair_terms[key]:
-                    pair_terms[key].append(t)
+                shared = set(va) & set(vb)
+                if len(shared) < 2:
+                    continue
+                score = sum(va[x] * vb[x] for x in shared)
+                # soft complete cosine over union already L2-normed partial
+                key = (a, b) if a < b else (b, a)
+                prev = pair_best.get(key)
+                if not prev or score > prev[0]:
+                    pair_best[key] = (score, sorted(shared)[:5])
 
-    neigh: dict[str, list[tuple[float, str]]] = defaultdict(list)
-    for (a, b), score in pair_scores.items():
+    scores = [s for s, _ in pair_best.values()]
+    neigh: dict[str, list[tuple[float, str, list[str]]]] = defaultdict(list)
+    for (a, b), (score, terms) in pair_best.items():
         if score < params.lex_min_score:
             continue
-        neigh[a].append((score, b))
-        neigh[b].append((score, a))
+        neigh[a].append((score, b, terms))
+        neigh[b].append((score, a, terms))
 
     edges: list[Edge] = []
     seen: set[tuple[str, str]] = set()
     for src, lst in neigh.items():
         lst.sort(key=lambda x: (-x[0], x[1]))
-        for score, tgt in lst[: params.lex_top_k]:
+        for score, tgt, terms in lst[: params.lex_top_k]:
             key = tuple(sorted((src, tgt)))
             if key in seen:
                 continue
             seen.add(key)
-            terms = pair_terms.get((key[0], key[1])) or pair_terms.get((key[1], key[0])) or []
             edges.append(
                 Edge(
                     source=key[0],
                     target=key[1],
                     type="lex_similar",
                     weight=round(float(score), 6),
-                    provenance={"terms": terms[:5]},
+                    provenance={"terms": terms},
                 )
             )
-    return edges
+
+    # histogram
+    hist = Counter()
+    for s in scores:
+        bucket = round(s, 2)
+        hist[bucket] += 1
+    debug = {
+        "bugfix": (
+            "Previously used product-of-tiny-TFIDF with document-fragment df caps; "
+            "RU terms never cleared the absolute threshold except tiny English samples."
+        ),
+        "score_count": len(scores),
+        "score_min": min(scores) if scores else None,
+        "score_max": max(scores) if scores else None,
+        "score_hist": dict(sorted(hist.items())[:40]),
+        "edges": len(edges),
+        "threshold": params.lex_min_score,
+        "comparisons": counter.comparisons if counter else None,
+    }
+    return edges, debug
 
 
 # ---------------------------------------------------------------------------
-# Layer E — co_cited (pure)
+# Layer E — co_cited
 # ---------------------------------------------------------------------------
 
-def layer_e_co_cited(
-    citation_lists: Iterable[list[str]],
-) -> list[Edge]:
-    """Undirected edges when two doc ids co-occur in one assistant citation list."""
-    pair_w: Counter[tuple[str, str]] = Counter()
-    for cites in citation_lists:
-        ids = sorted({str(x) for x in cites if x})
-        for i in range(len(ids)):
-            for j in range(i + 1, len(ids)):
-                pair_w[(ids[i], ids[j])] += 1
-    return [
-        Edge(
-            source=a,
-            target=b,
-            type="co_cited",
-            weight=float(w),
-            provenance={"co_citation_answers": w},
-        )
-        for (a, b), w in pair_w.items()
-    ]
+_SMOKE_TITLE_RE = re.compile(r"(^ping$|smoke$|^eval\b|quality)", re.I)
+
+
+def is_eval_chat_session(title: str | None) -> bool:
+    t = (title or "").strip()
+    if not t:
+        return False
+    return bool(_SMOKE_TITLE_RE.search(t))
 
 
 def extract_doc_ids_from_citations(citations: Any) -> list[str]:
@@ -629,8 +851,87 @@ def extract_doc_ids_from_citations(citations: Any) -> list[str]:
     return out
 
 
+def layer_e_co_cited(
+    citation_lists: Iterable[tuple[list[str], bool]],
+    *,
+    include_eval: bool = False,
+) -> list[Edge]:
+    """citation_lists: (doc_ids, is_eval)."""
+    live: Counter[tuple[str, str]] = Counter()
+    ev: Counter[tuple[str, str]] = Counter()
+    for cites, is_eval in citation_lists:
+        ids = sorted({str(x) for x in cites if x})
+        bucket = ev if is_eval else live
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                bucket[(ids[i], ids[j])] += 1
+    edges: list[Edge] = []
+    for (a, b), w in live.items():
+        edges.append(
+            Edge(
+                source=a,
+                target=b,
+                type="co_cited",
+                weight=float(w),
+                provenance={"co_citation_answers": w, "channel": "live"},
+            )
+        )
+    if include_eval:
+        for (a, b), w in ev.items():
+            edges.append(
+                Edge(
+                    source=a,
+                    target=b,
+                    type="co_cited_eval",
+                    weight=float(w) * 0.5,
+                    provenance={"co_citation_answers": w, "channel": "eval"},
+                )
+            )
+    return edges
+
+
+def aggregate_work_edges(docs: list[DocMeta], edges: list[Edge]) -> list[Edge]:
+    """Collapse doc↔doc textual edges into work↔work for reporting/future UI."""
+    by_id = {d.document_id: d for d in docs}
+    textual = {"refers_to", "shared_entity", "lex_similar", "co_cited", "co_cited_eval"}
+    acc: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for e in edges:
+        if e.type not in textual:
+            continue
+        sa, sb = by_id.get(e.source), by_id.get(e.target)
+        if not sa or not sb or same_work(sa, sb):
+            continue
+        wa, wb = f"work:{sa.work_key}", f"work:{sb.work_key}"
+        if wa > wb:
+            wa, wb = wb, wa
+        key = (wa, wb, e.type)
+        slot = acc.setdefault(key, {"weight": 0.0, "examples": []})
+        slot["weight"] += float(e.weight)
+        if len(slot["examples"]) < 5:
+            slot["examples"].append(
+                {
+                    "doc_a": e.source,
+                    "doc_b": e.target,
+                    "weight": e.weight,
+                    "provenance": e.provenance,
+                }
+            )
+    out: list[Edge] = []
+    for (wa, wb, typ), slot in acc.items():
+        out.append(
+            Edge(
+                source=wa,
+                target=wb,
+                type=f"work_{typ}",
+                weight=round(float(slot["weight"]), 4),
+                provenance={"examples": slot["examples"], "from_docs": True},
+            )
+        )
+    return out
+
+
 # ---------------------------------------------------------------------------
-# Assemble + cache
+# Assemble + cache + build
 # ---------------------------------------------------------------------------
 
 def assemble_index(
@@ -641,25 +942,57 @@ def assemble_index(
     edges: list[Edge],
     params: GraphIndexParams,
     built_ms: int,
+    extra_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     edge_counts: Counter[str] = Counter(e.type for e in edges)
-    linked_docs = {e.source for e in edges if not e.source.startswith(("theme:", "author:"))}
-    linked_docs |= {e.target for e in edges if not e.target.startswith(("theme:", "author:"))}
-    # Also count theme/wrote as linking the document endpoint
-    for e in edges:
-        if e.type in ("in_theme", "wrote"):
-            linked_docs.add(e.target)
-    isolated = [d.document_id for d in docs if d.document_id not in linked_docs]
-    # For connectivity stats, "isolated" = no B/C/D/E edges
     content_linked: set[str] = set()
     for e in edges:
-        if e.type in ("refers_to", "shared_entity", "lex_similar", "co_cited"):
+        if e.type in ("refers_to", "shared_entity", "lex_similar", "co_cited", "co_cited_eval"):
             content_linked.add(e.source)
             content_linked.add(e.target)
-    isolated_content = [d.document_id for d in docs if d.document_id not in content_linked]
+    isolated_docs = [d.document_id for d in docs if d.document_id not in content_linked]
+    works = {d.work_key: d for d in docs}
+    work_linked: set[str] = set()
+    for e in edges:
+        if e.type.startswith("work_") and e.type != "work_meta":
+            work_linked.add(e.source.removeprefix("work:"))
+            work_linked.add(e.target.removeprefix("work:"))
+        if e.type in ("refers_to", "shared_entity", "lex_similar", "co_cited", "co_cited_eval"):
+            sa = next((d for d in docs if d.document_id == e.source), None)
+            sb = next((d for d in docs if d.document_id == e.target), None)
+            if sa:
+                work_linked.add(sa.work_key)
+            if sb:
+                work_linked.add(sb.work_key)
+    isolated_works = [wk for wk in works if wk not in work_linked]
+    no_author = [d.document_id for d in docs if not d.author_key]
+    frag_docs = [d.document_id for d in docs if d.fragment_no is not None]
+    work_frag: Counter[str] = Counter(d.work_key for d in docs)
 
     themes = sorted({d.theme for d in docs})
     authors = sorted({d.author_key for d in docs if d.author_key})
+    stats = {
+        "documents": len(docs),
+        "works": len(works),
+        "themes": len(themes),
+        "authors": len(authors),
+        "theme_list": themes,
+        "author_list": authors,
+        "edge_counts_by_type": dict(edge_counts),
+        "isolated_documents": len(isolated_docs),
+        "isolated_document_ids_sample": isolated_docs[:20],
+        "isolated_works": len(isolated_works),
+        "isolated_work_share": round(len(isolated_works) / max(1, len(works)), 4),
+        "fragment_documents": len(frag_docs),
+        "documents_without_author": len(no_author),
+        "documents_without_author_sample": no_author[:20],
+        "top_works_by_fragments": [
+            {"work_key": wk, "fragment_count": n, "title": works[wk].title, "author_key": works[wk].author_key}
+            for wk, n in work_frag.most_common(20)
+        ],
+    }
+    if extra_stats:
+        stats.update(extra_stats)
     return {
         "version": INDEX_VERSION,
         "tenant_id": tenant_id,
@@ -672,25 +1005,20 @@ def assemble_index(
                 "document_id": d.document_id,
                 "filename": d.filename,
                 "theme": d.theme,
+                "pack": d.pack,
+                "source": d.source,
                 "author_key": d.author_key,
                 "author_ru": d.author_ru,
                 "title": d.title,
+                "fragment_no": d.fragment_no,
+                "work_key": d.work_key,
                 "chunk_count": d.chunk_count,
                 "created_at": d.created_at,
             }
             for d in docs
         ],
         "edges": [e.to_dict() for e in edges],
-        "stats": {
-            "documents": len(docs),
-            "themes": len(themes),
-            "authors": len(authors),
-            "theme_list": themes,
-            "author_list": authors,
-            "edge_counts_by_type": dict(edge_counts),
-            "isolated_documents": len(isolated_content),
-            "isolated_document_ids_sample": isolated_content[:20],
-        },
+        "stats": stats,
     }
 
 
@@ -706,13 +1034,9 @@ def index_path(tenant_id: UUID | str, fingerprint: str) -> Path:
 
 def purge_old_indexes(tenant_id: UUID | str, keep_fingerprint: str) -> int:
     removed = 0
-    prefix = f"{tenant_id}_"
-    suffix = "_index.json"
     for p in graph_dir().glob(f"{tenant_id}_*_index.json"):
         name = p.name
-        if not name.startswith(prefix) or not name.endswith(suffix):
-            continue
-        mid = name[len(prefix) : -len(suffix)]
+        mid = name[len(f"{tenant_id}_") : -len("_index.json")]
         if mid != keep_fingerprint:
             try:
                 p.unlink()
@@ -744,7 +1068,7 @@ def load_cached_index(db: Session, tenant_id: UUID) -> dict[str, Any] | None:
 
 
 def _active_documents(db: Session, tenant_id: UUID) -> list[tuple[Document, DocumentVersion]]:
-    rows = (
+    return list(
         db.query(Document, DocumentVersion)
         .join(DocumentVersion, DocumentVersion.id == Document.active_version_id)
         .filter(
@@ -756,7 +1080,6 @@ def _active_documents(db: Session, tenant_id: UUID) -> list[tuple[Document, Docu
         .order_by(Document.created_at.asc())
         .all()
     )
-    return list(rows)
 
 
 def _iter_chunks_batched(
@@ -792,7 +1115,7 @@ def build_index_for_tenant(
     path = index_path(tenant_id, fp)
     if not force:
         cached = read_index(path)
-        if cached and cached.get("fingerprint") == fp:
+        if cached and cached.get("fingerprint") == fp and cached.get("version") == INDEX_VERSION:
             log.info("graph_index_cache_hit", tenant_id=str(tenant_id), fingerprint=fp)
             return cached
 
@@ -801,68 +1124,81 @@ def build_index_for_tenant(
     version_ids: list[UUID] = []
     for doc, ver in rows:
         created = doc.created_at.isoformat() if doc.created_at else None
-        meta = parse_doc_meta(
-            document_id=str(doc.id),
-            filename=ver.original_name,
-            chunk_count=int(ver.indexed_chunk_count or 0),
-            created_at=created,
+        docs.append(
+            parse_doc_meta(
+                document_id=str(doc.id),
+                filename=ver.original_name,
+                chunk_count=int(ver.indexed_chunk_count or 0),
+                created_at=created,
+            )
         )
-        docs.append(meta)
         version_ids.append(ver.id)
+    resolve_work_keys(docs)
 
     edges: list[Edge] = []
     edges.extend(layer_a_edges(docs))
 
-    # Stream chunks once: refers_to + entity/term accumulation
     doc_entities: dict[str, list[str]] = defaultdict(list)
     doc_entity_chunks: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
     doc_term_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    case_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"upper": 0, "lower": 0})
+    chunk_rows: list[tuple[str, str, str]] = []
     chunk_total = 0
 
-    # For refers_to we need another pass OR collect texts — collect per-doc texts lightly
-    # Use single pass: accumulate for C/D and run B with same iterator by materializing batches.
-    chunk_rows: list[tuple[str, str, str]] = []
-    for item in _iter_chunks_batched(db, tenant_id, version_ids, params.chunk_batch):
-        chunk_rows.append(item)
+    for doc_id, chunk_id, text in _iter_chunks_batched(db, tenant_id, version_ids, params.chunk_batch):
+        chunk_rows.append((doc_id, chunk_id, text))
         chunk_total += 1
-        doc_id, chunk_id, text = item
+        # case stats for first letters of tokens
+        for m in re.finditer(r"[A-Za-zА-Яа-яЁё]{3,}", text or "", flags=re.UNICODE):
+            w = m.group(0)
+            key = norm_ru(w)
+            if w[0].isupper():
+                case_stats[key]["upper"] += 1
+            else:
+                case_stats[key]["lower"] += 1
         ents = extract_entity_candidates([text], limit=params.entity_top_n)
         for e in ents:
-            n = norm_ru(e)
-            if e not in doc_entities[doc_id]:
-                doc_entities[doc_id].append(e)
-            if chunk_id not in doc_entity_chunks[doc_id][n]:
-                doc_entity_chunks[doc_id][n].append(chunk_id)
-        for tok in tokenize(text):
+            cleaned = clean_entity_surface(e) or e
+            k = _entity_key(cleaned)
+            if cleaned not in doc_entities[doc_id]:
+                doc_entities[doc_id].append(cleaned)
+            if chunk_id not in doc_entity_chunks[doc_id][k]:
+                doc_entity_chunks[doc_id][k].append(chunk_id)
+        for tok in tokenize_lex(text):
             doc_term_counts[doc_id][tok] += 1
 
-    # Update chunk_count from actual
-    counts_by_doc: Counter[str] = Counter(d for d, _, _ in chunk_rows)
+    counts_by_doc = Counter(d for d, _, _ in chunk_rows)
     for d in docs:
         d.chunk_count = int(counts_by_doc.get(d.document_id, d.chunk_count))
 
     edges.extend(layer_b_refers_to(docs=docs, chunk_iter=chunk_rows, params=params))
     edges.extend(
         layer_c_shared_entity(
+            docs=docs,
             doc_entities=dict(doc_entities),
             doc_entity_chunks={k: dict(v) for k, v in doc_entity_chunks.items()},
+            case_stats={k: dict(v) for k, v in case_stats.items()},
             params=params,
         )
     )
-    edges.extend(layer_d_lex_similar(doc_term_counts=dict(doc_term_counts), params=params))
+    lex_edges, lex_debug = layer_d_lex_similar(
+        docs=docs, doc_term_counts=dict(doc_term_counts), params=params, counter=LexCandidateCounter()
+    )
+    edges.extend(lex_edges)
 
-    # co_cited
-    cite_lists: list[list[str]] = []
+    cite_lists: list[tuple[list[str], bool]] = []
     msgs = (
-        db.query(ChatMessage.citations)
+        db.query(ChatMessage.citations, ChatSession.title)
+        .join(ChatSession, ChatSession.id == ChatMessage.session_id)
         .filter(ChatMessage.tenant_id == tenant_id, ChatMessage.role == "assistant")
         .all()
     )
-    for (citations,) in msgs:
+    for citations, title in msgs:
         ids = extract_doc_ids_from_citations(citations)
         if len(ids) >= 2:
-            cite_lists.append(ids)
-    edges.extend(layer_e_co_cited(cite_lists))
+            cite_lists.append((ids, is_eval_chat_session(title)))
+    edges.extend(layer_e_co_cited(cite_lists, include_eval=params.include_eval_cocited))
+    edges.extend(aggregate_work_edges(docs, edges))
 
     built_ms = int((time.perf_counter() - t0) * 1000)
     payload = assemble_index(
@@ -872,6 +1208,7 @@ def build_index_for_tenant(
         edges=edges,
         params=params,
         built_ms=built_ms,
+        extra_stats={"lex_debug": lex_debug, "source_tokens": sorted(SOURCE_TOKENS)},
     )
     write_index_atomic(path, payload)
     removed = purge_old_indexes(tenant_id, fp)
@@ -882,9 +1219,11 @@ def build_index_for_tenant(
         fingerprint=fp,
         built_ms=built_ms,
         documents=stats["documents"],
+        works=stats["works"],
         chunks=chunk_total,
         edge_counts=stats["edge_counts_by_type"],
-        isolated=stats["isolated_documents"],
+        isolated_docs=stats["isolated_documents"],
+        isolated_works=stats["isolated_works"],
         purged_old=removed,
     )
     return payload
@@ -914,7 +1253,6 @@ def neighbors_for_document(
                 "direction": "out" if src == doc_id else "in",
             }
         )
-    # sort each group by weight desc, truncate
     out: dict[str, list[dict[str, Any]]] = {}
     for typ, items in grouped.items():
         items.sort(key=lambda x: (-float(x.get("weight") or 0), str(x.get("neighbor_id"))))

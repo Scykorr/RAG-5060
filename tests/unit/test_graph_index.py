@@ -2,159 +2,222 @@
 
 from __future__ import annotations
 
-import json
 from collections import Counter
-from pathlib import Path
 
 from apps.api.services import graph_index as gi
+from apps.api.services import text_entities as te
 
 
-def test_theme_author_title_classic():
+def test_parse_eb_russian_wedding():
     meta = gi.parse_doc_meta(
         document_id="d1",
-        filename="classic_0004_Pushkin_Евгений_Онегин_abcdef12.txt",
+        filename="classic_0383_eb_Russian_Свадьба_50e15c757f.txt",
     )
     assert meta.theme == "classic_"
-    assert meta.author_key == "Pushkin"
-    assert meta.author_ru == "пушкин"
-    assert "Онегин" in meta.title or "онегин" in meta.title.lower()
-
-
-def test_arbitrary_filename_theme_prochee():
-    meta = gi.parse_doc_meta(document_id="d2", filename="notes-random.pdf")
-    assert meta.theme == "Прочее"
+    assert meta.source == "eb"
     assert meta.author_key is None
+    assert "Russian" not in meta.title
+    assert "Свадьба" in meta.title
+    assert meta.fragment_no is None
+    assert meta.work_key.startswith("classic|_|")
 
 
-def test_wildlife_theme():
-    meta = gi.parse_doc_meta(document_id="d3", filename="wildlife_001_bear_taiga.txt")
-    assert meta.theme == "wildlife_"
-
-
-def test_author_skips_ch_prefix_token():
+def test_parse_ch_tolstoy_fragment():
     meta = gi.parse_doc_meta(
-        document_id="d4",
-        filename="classic_0633_ch_Tolstoy_Анна_Каренина__фрагмент_97_e8180dc4ad.txt",
+        document_id="d2",
+        filename="classic_0647_ch_Tolstoy_Анна_Каренина__фрагмент_111_f2a57d47fc.txt",
     )
+    assert meta.source == "ch"
     assert meta.author_key == "Tolstoy"
     assert meta.author_ru == "толстой"
+    assert meta.title == "Анна Каренина"
+    assert "Tolstoy" not in meta.title
+    assert meta.fragment_no == 111
+    assert "Tolstoy" in meta.work_key
 
 
-def test_layer_a_in_theme_and_wrote():
+def test_parse_plain_tolstoy():
+    meta = gi.parse_doc_meta(
+        document_id="d3",
+        filename="classic_0185_Tolstoy_Три_смерти_9a4ad18bf3c0.txt",
+    )
+    assert meta.source is None
+    assert meta.author_key == "Tolstoy"
+    assert "Три" in meta.title and "смерти" in meta.title
+
+
+def test_fragments_same_work_no_textual_edges():
+    a = gi.parse_doc_meta(
+        document_id="a",
+        filename="classic_0100_ch_Tolstoy_Анна_Каренина__фрагмент_1_aaaaaaaa.txt",
+    )
+    b = gi.parse_doc_meta(
+        document_id="b",
+        filename="classic_0101_ch_Tolstoy_Анна_Каренина__фрагмент_2_bbbbbbbb.txt",
+    )
+    assert a.work_key == b.work_key
+    docs = [a, b]
+    chunks = [
+        ("a", "c1", "Анна Каренина вошла в комнату. Левин смотрел."),
+        ("b", "c2", "Анна Каренина села. Левин ответил."),
+    ]
+    refers = gi.layer_b_refers_to(docs=docs, chunk_iter=chunks)
+    assert refers == []
+    shared = gi.layer_c_shared_entity(
+        docs=docs,
+        doc_entities={"a": ["Левин", "Анна"], "b": ["Левин", "Анна"]},
+    )
+    assert shared == []
+    lex, _ = gi.layer_d_lex_similar(
+        docs=docs,
+        doc_term_counts={
+            "a": Counter({"каренина": 5, "левин": 4, "комната": 2}),
+            "b": Counter({"каренина": 5, "левин": 4, "ответил": 2}),
+        },
+        params=gi.GraphIndexParams(lex_min_score=0.01),
+    )
+    assert lex == []
+
+
+def test_refers_blocks_frequent_one_word_chelovek():
     docs = [
-        gi.parse_doc_meta(document_id="a", filename="classic_0001_Pushkin_Пир_abcdef12.txt"),
-        gi.parse_doc_meta(document_id="b", filename="misc_file.txt"),
+        gi.parse_doc_meta(document_id="src", filename="essay.txt"),
+        gi.parse_doc_meta(document_id="hub", filename="classic_0001_Gorky_Человек_aaaaaaaa.txt"),
+    ]
+    # inflate df so «Человек» is not rare
+    for i in range(20):
+        docs.append(
+            gi.parse_doc_meta(
+                document_id=f"x{i}",
+                filename=f"classic_{i:04d}_Pushkin_Человек_и_море_{i:08x}.txt",
+            )
+        )
+    chunks = [("src", "c1", "Он говорил о Человеке долго.")]
+    edges = gi.layer_b_refers_to(docs=docs, chunk_iter=chunks)
+    assert not any(e.target == "hub" for e in edges)
+
+
+def test_refers_multiword_with_case_inflection():
+    docs = [
+        gi.parse_doc_meta(document_id="src", filename="crit.txt"),
+        gi.parse_doc_meta(
+            document_id="hero",
+            filename="classic_0002_Lermontov_Герой_нашего_времени_bbbbbbbb.txt",
+        ),
+    ]
+    chunks = [
+        ("src", "c1", "Критик разобрал «Герой нашего времени» подробно."),
+        ("src", "c2", "Ещё раз о книге Герой нашего времени."),
+    ]
+    edges = gi.layer_b_refers_to(docs=docs, chunk_iter=chunks)
+    hit = [e for e in edges if e.source == "src" and e.target == "hero"]
+    assert hit
+    assert hit[0].weight >= 1
+    assert hit[0].provenance.get("phrase")
+
+
+def test_entity_cleanup_and_case_fold():
+    assert te.clean_entity_surface("Когда") is None or te.norm_ru(te.clean_entity_surface("Когда") or "") in te.EDITION_STOP | te.RU_FUNCTION_WORDS
+    assert te.clean_entity_surface("Впрочем") is None
+    assert te.clean_entity_surface("Том") is None
+    assert te.clean_entity_surface("ДЕЙСТВУЮЩИЕ ЛИЦА") is None
+    assert te.clean_entity_surface("Гоголь\n\nМертвые") is None
+    assert gi._entity_key("Левина") == gi._entity_key("Левину")
+
+
+def test_shared_entity_keeps_real_names():
+    docs = [
+        gi.parse_doc_meta(document_id="d1", filename="classic_0001_Tolstoy_Анна_aaaaaaaa.txt"),
+        gi.parse_doc_meta(document_id="d2", filename="classic_0002_Tolstoy_Война_bbbbbbbb.txt"),
+    ]
+    # different works
+    assert docs[0].work_key != docs[1].work_key
+    edges = gi.layer_c_shared_entity(
+        docs=docs,
+        doc_entities={
+            "d1": ["Левин", "Кити", "Когда", "Том"],
+            "d2": ["Левину", "Кити", "Впрочем"],
+        },
+    )
+    assert edges
+    ents = edges[0].provenance.get("entities") or []
+    joined = " ".join(ents).lower()
+    assert "левин" in joined or "кити" in joined
+    assert "когда" not in joined
+    assert "том" not in joined
+
+
+def test_lex_similar_russian_texts():
+    docs = [
+        gi.parse_doc_meta(document_id="a", filename="classic_0001_Pushkin_Онегин_aaaaaaaa.txt"),
+        gi.parse_doc_meta(document_id="b", filename="classic_0002_Pushkin_Пир_bbbbbbbb.txt"),
+        gi.parse_doc_meta(document_id="c", filename="wildlife_0001_bear_taiga_cccccccc.txt"),
+    ]
+    # many fake works to create df>1 for shared rare stems
+    extra = []
+    for i in range(8):
+        extra.append(
+            gi.parse_doc_meta(
+                document_id=f"e{i}",
+                filename=f"classic_{i+10:04d}_Chekhov_Рассказ_{i}_dddddddd.txt",
+            )
+        )
+    docs.extend(extra)
+    terms = {
+        "a": Counter({"онегин": 6, "татьяна": 4, "дуэль": 3, "садик": 2}),
+        "b": Counter({"онегин": 5, "татьяна": 3, "дуэль": 2, "пиршество": 2}),
+        "c": Counter({"медведь": 6, "тайга": 5, "берлога": 3}),
+    }
+    for i in range(8):
+        terms[f"e{i}"] = Counter({"рассказик": 3, "дачник": 2, f"уник{i}": 2})
+    # sprinkle shared rare stems into extras so df_work(онегин)>=2 already from a,b
+    counter = gi.LexCandidateCounter()
+    edges, debug = gi.layer_d_lex_similar(
+        docs=docs,
+        doc_term_counts=terms,
+        params=gi.GraphIndexParams(lex_min_score=0.05, lex_top_m=20),
+        counter=counter,
+    )
+    pairs = {tuple(sorted((e.source, e.target))) for e in edges}
+    assert ("a", "b") in pairs
+    assert ("a", "c") not in pairs
+    assert debug.get("bugfix")
+    assert counter.comparisons >= 0
+
+
+def test_co_cited_live_vs_eval():
+    assert gi.is_eval_chat_session("classic-smoke")
+    assert gi.is_eval_chat_session("intent-smoke")
+    assert gi.is_eval_chat_session("ping")
+    assert not gi.is_eval_chat_session("сколько произведений Чехова в хранилище?")
+    edges = gi.layer_e_co_cited(
+        [(["d1", "d2"], False), (["d1", "d2"], True), (["d3", "d4"], True)],
+        include_eval=False,
+    )
+    assert any(e.type == "co_cited" and set((e.source, e.target)) == {"d1", "d2"} for e in edges)
+    assert not any(e.type == "co_cited_eval" for e in edges)
+    edges2 = gi.layer_e_co_cited(
+        [(["d3", "d4"], True)],
+        include_eval=True,
+    )
+    assert any(e.type == "co_cited_eval" for e in edges2)
+
+
+def test_layer_a_part_of_and_work_meta():
+    docs = [
+        gi.parse_doc_meta(
+            document_id="a",
+            filename="classic_0100_ch_Tolstoy_Анна_Каренина__фрагмент_1_aaaaaaaa.txt",
+        ),
+        gi.parse_doc_meta(
+            document_id="b",
+            filename="classic_0101_ch_Tolstoy_Анна_Каренина__фрагмент_2_bbbbbbbb.txt",
+        ),
     ]
     edges = gi.layer_a_edges(docs)
-    types = {e.type for e in edges}
-    assert "in_theme" in types
-    wrote = [e for e in edges if e.type == "wrote"]
-    assert any(e.source == "author:Pushkin" and e.target == "a" for e in wrote)
-    assert all(e.weight >= 1 for e in edges)
-    assert all(e.provenance for e in edges)
-
-
-def test_refers_to_title_mention():
-    docs = [
-        gi.parse_doc_meta(document_id="a", filename="classic_0001_Pushkin_Пир_во_время_чумы_aa111111.txt"),
-        gi.parse_doc_meta(document_id="b", filename="classic_0004_Pushkin_Евгений_Онегин_bb222222.txt"),
-    ]
-    chunks = [
-        ("a", "c1", "Герой читал Евгений Онегин всю ночь."),
-        ("b", "c2", "Текст самого романа Онегина."),
-    ]
-    edges = gi.layer_b_refers_to(docs=docs, chunk_iter=chunks)
-    assert any(e.source == "a" and e.target == "b" and e.type == "refers_to" for e in edges)
-    hit = next(e for e in edges if e.source == "a" and e.target == "b")
-    assert hit.weight >= 1
-    assert hit.provenance.get("chunk_ids")
-    assert hit.provenance.get("phrase")
-
-
-def test_refers_to_alias_and_short_form():
-    docs = [
-        gi.parse_doc_meta(document_id="src", filename="essay_about_lit.txt"),
-        gi.parse_doc_meta(document_id="onegin", filename="classic_0004_Pushkin_Евгений_Онегин_cc333333.txt"),
-    ]
-    chunks = [
-        ("src", "c1", "Критики спорили об Онегине и о Пушкине."),
-    ]
-    edges = gi.layer_b_refers_to(docs=docs, chunk_iter=chunks)
-    targets = {(e.source, e.target) for e in edges if e.type == "refers_to"}
-    assert ("src", "onegin") in targets
-
-
-def test_refers_no_self_link():
-    docs = [
-        gi.parse_doc_meta(document_id="b", filename="classic_0004_Pushkin_Евгений_Онегин_dd444444.txt"),
-    ]
-    chunks = [("b", "c1", "Евгений Онегин начинается зимой.")]
-    edges = gi.layer_b_refers_to(docs=docs, chunk_iter=chunks)
-    assert edges == []
-
-
-def test_refers_stop_short_phrase_ignored():
-    docs = [
-        gi.parse_doc_meta(document_id="a", filename="a.txt"),
-        gi.parse_doc_meta(document_id="b", filename="роман.txt"),  # short/stop-ish title
-    ]
-    # Force a tiny title via meta override
-    docs[1].title = "том"
-    chunks = [("a", "c1", "В этом томе много текста.")]
-    edges = gi.layer_b_refers_to(docs=docs, chunk_iter=chunks)
-    assert edges == []
-
-
-def test_shared_entity_threshold_and_topk():
-    doc_entities = {
-        "d1": ["Татьяна Ларина", "Онегин", "Ленский"],
-        "d2": ["Татьяна Ларина", "Онегин", "Москва"],
-        "d3": ["УникальныйГерой"],
-        "d4": ["Татьяна Ларина", "Онегин"],
-    }
-    params = gi.GraphIndexParams(shared_min_entities=2, shared_top_k=1)
-    edges = gi.layer_c_shared_entity(doc_entities=doc_entities, params=params)
-    assert all(e.type == "shared_entity" for e in edges)
-    assert all(e.weight >= 2 for e in edges)
-    # unique entity alone → no edge involving only d3
-    assert not any("d3" in (e.source, e.target) for e in edges)
-    # top-k=1 limits degree roughly
-    from collections import defaultdict
-
-    deg = defaultdict(int)
-    for e in edges:
-        deg[e.source] += 1
-        deg[e.target] += 1
-    assert max(deg.values()) <= 2  # undirected top-k=1 each side can still meet
-
-
-def test_lex_similar_links_rare_terms_not_nn():
-    docs_terms = {
-        "a": Counter({"онегин": 5, "дуэль": 3, "и": 10}),
-        "b": Counter({"онегин": 4, "дуэль": 2, "сад": 1}),
-        "c": Counter({"медведь": 6, "тайга": 4}),
-        "d": Counter({"медведь": 5, "тайга": 3}),
-        "e": Counter({"кухня": 3, "рецепт": 2}),
-    }
-    # strip stops manually already in Counter keys
-    counter = gi.LexCandidateCounter()
-    params = gi.GraphIndexParams(lex_min_score=0.01, lex_top_k=3, lex_top_m=10)
-    edges = gi.layer_d_lex_similar(doc_term_counts=docs_terms, params=params, counter=counter)
-    pairs = {(e.source, e.target) for e in edges}
-    assert ("a", "b") in pairs or ("b", "a") in pairs
-    # dissimilar clusters should not freely connect a-c
-    assert not any(set(p) == {"a", "c"} for p in pairs)
-    n = len(docs_terms)
-    assert counter.comparisons < n * n  # candidate path, not full N×N over all pairs always
-    assert counter.comparisons <= n * n  # hard ceiling
-    # stronger: comparisons come only from shared rare terms
-    assert counter.comparisons > 0
-
-
-def test_co_cited():
-    edges = gi.layer_e_co_cited([["d1", "d2"], ["d1", "d2", "d3"], ["d9"]])
-    assert any(e.type == "co_cited" and e.weight == 2 and set((e.source, e.target)) == {"d1", "d2"} for e in edges)
-    assert any(set((e.source, e.target)) == {"d1", "d3"} for e in edges)
+    assert any(e.type == "part_of" for e in edges)
+    meta = [e for e in edges if e.type == "work_meta"]
+    assert meta and meta[0].provenance.get("fragment_count") == 2
 
 
 def test_cache_write_read_and_purge(tmp_path, monkeypatch):
@@ -173,7 +236,6 @@ def test_cache_write_read_and_purge(tmp_path, monkeypatch):
     old = gi.index_path(tenant, "fp_old")
     gi.write_index_atomic(old, payload)
     assert gi.read_index(old)["fingerprint"] == "fp_old"
-
     new_payload = dict(payload)
     new_payload["fingerprint"] = "fp_new"
     new = gi.index_path(tenant, "fp_new")

@@ -162,11 +162,223 @@ REFERS_STOP_PHRASES = {
     "txt",
     "pdf",
     "doc",
+    "человек",
+    "горе",
+    "короткая",
+    "короткий",
+    "ссылке",
+    "которая",
+    "который",
+    "особенности",
+    "писателя",
+    "писатель",
+    "двадцать",
 }
+
+# Edition / front-matter noise for entity layer (graph index).
+EDITION_STOP = {
+    "том",
+    "тома",
+    "главе",
+    "глава",
+    "главы",
+    "часть",
+    "части",
+    "первая",
+    "вторая",
+    "третья",
+    "четвертая",
+    "пятая",
+    "полное",
+    "полный",
+    "собрание",
+    "сочинения",
+    "сочинений",
+    "издательство",
+    "художественная",
+    "наука",
+    "ocr",
+    "ссср",
+    "действующие",
+    "лица",
+    "примечания",
+    "комментарии",
+    "содержание",
+    "оглавление",
+    "введение",
+    "предисловие",
+    "послесловие",
+    "произведение",
+    "файл",
+    "название",
+    "когда",
+    "может",
+    "впрочем",
+    "был",
+    "была",
+    "были",
+    "его",
+    "ее",
+    "её",
+    "вся",
+    "весь",
+    "все",
+    "нет",
+    "вот",
+    "только",
+    "так",
+    "каждый",
+    "russian",
+}
+
+# Extended Russian function words for lexical similarity (graph index).
+RU_FUNCTION_WORDS = {
+    "этот",
+    "эта",
+    "эти",
+    "того",
+    "тому",
+    "этого",
+    "этом",
+    "был",
+    "была",
+    "были",
+    "будет",
+    "быть",
+    "есть",
+    "нет",
+    "уже",
+    "еще",
+    "ещё",
+    "только",
+    "также",
+    "всего",
+    "себя",
+    "себе",
+    "него",
+    "нее",
+    "неё",
+    "них",
+    "ним",
+    "нами",
+    "вами",
+    "меня",
+    "тебя",
+    "него",
+    "чтобы",
+    "если",
+    "когда",
+    "тогда",
+    "потому",
+    "поэтому",
+    "здесь",
+    "там",
+    "тут",
+    "куда",
+    "откуда",
+    "очень",
+    "более",
+    "менее",
+    "между",
+    "через",
+    "после",
+    "перед",
+    "около",
+    "своей",
+    "своего",
+    "своих",
+    "свой",
+    "своя",
+    "свое",
+    "своё",
+    "другой",
+    "другая",
+    "другие",
+    "один",
+    "одна",
+    "одно",
+    "два",
+    "три",
+    "четыре",
+    "пять",
+    "могу",
+    "может",
+    "можно",
+    "нужно",
+    "надо",
+    "вдруг",
+    "снова",
+    "опять",
+    "почти",
+    "сейчас",
+    "теперь",
+    "потом",
+    "сразу",
+    "впрочем",
+    "однако",
+    "хотя",
+    "ведь",
+    "лишь",
+    "даже",
+    "будто",
+    "словно",
+    "человек",
+}
+
+_ABBREV_ALLOW = {"ссср", "сша", "фсб", "мвд", "кпсс", "рнб", "гпу", "нквд"}
+
+_RU_ENDINGS = (
+    "ами",
+    "ями",
+    "ого",
+    "ему",
+    "ому",
+    "ыми",
+    "ими",
+    "ах",
+    "ях",
+    "ов",
+    "ев",
+    "ей",
+    "ом",
+    "ем",
+    "ам",
+    "ям",
+    "ую",
+    "юю",
+    "ая",
+    "яя",
+    "ые",
+    "ие",
+    "ых",
+    "их",
+    "ой",
+    "ий",
+    "ый",
+    "а",
+    "я",
+    "у",
+    "ю",
+    "е",
+    "ы",
+    "и",
+    "о",
+)
 
 
 def norm_ru(s: str) -> str:
     return (s or "").lower().replace("ё", "е")
+
+
+def stem_ru(token: str) -> str:
+    """Very light Russian stem: strip common endings if stem stays ≥4 chars."""
+    n = norm_ru(token)
+    if len(n) < 5:
+        return n
+    for end in _RU_ENDINGS:
+        if n.endswith(end) and len(n) - len(end) >= 4:
+            return n[: -len(end)]
+    return n
 
 
 def tokenize(text: str) -> list[str]:
@@ -181,6 +393,39 @@ def tokenize(text: str) -> list[str]:
             continue
         out.append(key)
     return out
+
+
+def tokenize_lex(text: str) -> list[str]:
+    """Tokenizer for lex_similar: letters only, len≥4, stemmed, RU stops filtered."""
+    raw = re.findall(r"[A-Za-zА-Яа-яЁё]{4,}", text or "", flags=re.UNICODE)
+    out: list[str] = []
+    for t in raw:
+        key = norm_ru(t)
+        if any(ch.isdigit() for ch in key):
+            continue
+        if key in STOP or key in ENTITY_DENY or key in RU_FUNCTION_WORDS or key in EDITION_STOP:
+            continue
+        out.append(stem_ru(key))
+    return out
+
+
+def clean_entity_surface(raw: str) -> str | None:
+    """Normalize entity candidate; drop cross-paragraph / edition noise."""
+    if not raw:
+        return None
+    if "\n" in raw or "\r" in raw:
+        return None
+    s = re.sub(r"\s+", " ", raw).strip(" .,:;\"'«»")
+    if len(s) < 3:
+        return None
+    key = norm_ru(s)
+    if key in STOP or key in ENTITY_DENY or key in EDITION_STOP or key in RU_FUNCTION_WORDS:
+        return None
+    # ALL-CAPS long tokens (edition headers) unless short abbrev
+    letters = re.sub(r"[^A-Za-zА-Яа-яЁё]", "", s)
+    if letters and letters == letters.upper() and len(letters) > 3 and key not in _ABBREV_ALLOW:
+        return None
+    return s
 
 
 def split_passage_highlights(text: str) -> tuple[str, str]:
