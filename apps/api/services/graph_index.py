@@ -86,6 +86,95 @@ _AUTHOR_FIRST_NAMES = (
     "сергей",
 )
 
+PLAY_STAGE_WORDS = frozenset(
+    {
+        "действие",
+        "явление",
+        "сцена",
+        "гостиная",
+        "уходит",
+        "входит",
+        "занавес",
+        "акт",
+        "картина",
+        "пауза",
+        "ремарка",
+        "голоса",
+        "голос",
+        "тишина",
+    }
+)
+
+PLACE_LEMMAS = frozenset(
+    {
+        "петербург",
+        "петербурге",
+        "петербурга",
+        "петербургу",
+        "петербургом",
+        "петроград",
+        "москва",
+        "москве",
+        "москвы",
+        "москву",
+        "москвой",
+        "россия",
+        "россии",
+        "россию",
+        "россией",
+        "сибирь",
+        "сибири",
+        "кавказ",
+        "кавказа",
+        "кавказе",
+        "париж",
+        "париже",
+        "парижа",
+        "европа",
+        "европе",
+        "европы",
+    }
+)
+
+GOD_FORMS = frozenset({"бог", "бога", "богу", "богом", "божий", "божья", "божье", "божие", "боже"})
+
+_PATRONYMIC_RE = re.compile(
+    r"(?:ович|евич|овна|евна|ична|инична)$",
+    re.UNICODE,
+)
+_DIMINUTIVE_NAMES = frozenset(
+    {
+        "маша",
+        "машенька",
+        "саша",
+        "сашенька",
+        "миша",
+        "коля",
+        "ваня",
+        "петя",
+        "ката",
+        "катя",
+        "таня",
+        "оля",
+        "даша",
+        "надя",
+        "люба",
+        "вера",
+        "соня",
+        "аня",
+        "вася",
+        "гриша",
+        "лева",
+        "лёва",
+        "серг",
+        "серёжа",
+        "сережа",
+        "анну",
+        "анна",
+        "аня",
+    }
+)
+
 
 @dataclass
 class GraphIndexParams:
@@ -133,9 +222,12 @@ class DocMeta:
     author_ru: str | None
     title: str
     fragment_no: int | None = None
+    part_no: int | None = None
+    volume_no: int | None = None
     work_key: str = ""
     chunk_count: int = 0
     created_at: str | None = None
+    author_source: str | None = None  # filename | ingest_header | text_header | work_merge
 
 
 @dataclass
@@ -246,9 +338,52 @@ def parse_filename_parts(name: str) -> dict[str, Any]:
     }
 
 
+_PART_VOL_RE = re.compile(
+    r"(?i)(?:^|[\s_\-–—]+)"
+    r"(?:"
+    r"(?:часть|ч\.?)\s*(?P<part>\d+)"
+    r"|(?:том|т\.?)\s*(?P<vol>\d+)"
+    r"|(?:книга|кн\.?)\s*(?P<book>\d+)"
+    r")\s*$"
+)
+
+
+def normalize_work_title(title: str) -> tuple[str, int | None, int | None]:
+    """Strip part/volume suffixes; ё→е; return (core_title, part_no, volume_no)."""
+    t = (title or "").replace("ё", "е").replace("Ё", "Е")
+    t = re.sub(r"\s+", " ", t).strip(" ._")
+    part_no: int | None = None
+    volume_no: int | None = None
+    # Repeatedly strip trailing part/volume markers (also underscore form)
+    for _ in range(4):
+        m = _PART_VOL_RE.search(t.replace("_", " "))
+        if not m:
+            # underscore variants: "Том_2", "-_Часть_3"
+            m2 = re.search(
+                r"(?:^|[\s_\-–—]+)(?:часть|ч)_?(?P<part>\d+)\s*$|"
+                r"(?:^|[\s_\-–—]+)(?:том|т)_?(?P<vol>\d+)\s*$|"
+                r"(?:^|[\s_\-–—]+)(?:книга|кн)_?(?P<book>\d+)\s*$",
+                t,
+                flags=re.IGNORECASE,
+            )
+            if not m2:
+                break
+            m = m2
+        if m.groupdict().get("part"):
+            part_no = int(m.group("part"))
+        if m.groupdict().get("vol"):
+            volume_no = int(m.group("vol"))
+        if m.groupdict().get("book"):
+            part_no = int(m.group("book"))
+        t = t[: m.start()].rstrip(" -_–—")
+    t = re.sub(r"\s+", " ", t).strip(" ._")
+    return t or (title or "untitled"), part_no, volume_no
+
+
 def work_key_for(*, pack: str, author_key: str | None, title: str) -> str:
     a = (author_key or "").strip() or "_"
-    t = re.sub(r"\s+", " ", norm_ru(title)).strip()
+    core, _, _ = normalize_work_title(title)
+    t = re.sub(r"\s+", " ", norm_ru(core)).strip()
     t = re.sub(r"[^0-9a-zа-я ]+", "", t)
     t = re.sub(r"\s+", "_", t)[:80] or "untitled"
     return f"{pack}|{a}|{t}"
@@ -262,7 +397,8 @@ def parse_doc_meta(
     created_at: str | None = None,
 ) -> DocMeta:
     parsed = parse_filename_parts(filename)
-    wk = work_key_for(pack=parsed["pack"], author_key=parsed["author_key"], title=parsed["title"])
+    core, part_no, volume_no = normalize_work_title(parsed["title"])
+    wk = work_key_for(pack=parsed["pack"], author_key=parsed["author_key"], title=core)
     return DocMeta(
         document_id=str(document_id),
         filename=filename,
@@ -271,16 +407,29 @@ def parse_doc_meta(
         source=parsed["source"],
         author_key=parsed["author_key"],
         author_ru=parsed["author_ru"],
-        title=parsed["title"],
+        title=core,
         fragment_no=parsed["fragment_no"],
+        part_no=part_no,
+        volume_no=volume_no,
         work_key=wk,
         chunk_count=chunk_count,
         created_at=created_at,
+        author_source="filename" if parsed["author_key"] else None,
     )
 
 
 def resolve_work_keys(docs: list[DocMeta]) -> None:
-    """Merge authorless unique titles into authored work_key when unique in corpus."""
+    """Merge parts/volumes and authorless unique titles into one work_key."""
+    # Recompute keys from normalized titles
+    for d in docs:
+        core, part_no, volume_no = normalize_work_title(d.title)
+        d.title = core
+        if part_no is not None:
+            d.part_no = part_no
+        if volume_no is not None:
+            d.volume_no = volume_no
+        d.work_key = work_key_for(pack=d.pack, author_key=d.author_key, title=d.title)
+
     by_title: dict[str, list[DocMeta]] = defaultdict(list)
     for d in docs:
         by_title[norm_ru(d.title)].append(d)
@@ -295,9 +444,9 @@ def resolve_work_keys(docs: list[DocMeta]) -> None:
         ak = authored_title.get(norm_ru(d.title))
         if not ak:
             continue
-        # only if that title maps to exactly one author across corpus
         d.author_key = ak
         d.author_ru = _AUTHOR_RU_BY_KEY.get(ak)
+        d.author_source = d.author_source or "work_merge"
         d.work_key = work_key_for(pack=d.pack, author_key=d.author_key, title=d.title)
 
 
@@ -452,14 +601,20 @@ def classify_refers_match(
     multiword: bool,
     requires_strong: bool,
     near_author: bool,
+    one_word: bool = False,
 ) -> str | None:
-    """Return match_form or None if the hit must be discarded."""
+    """Return match_form or None if the hit must be discarded.
+
+    One-word titles: only quoted | genre_marker | near_author (not bare capitalization).
+    """
     if _quoted_span(raw, idx, match_len):
         return "quoted"
     if near_author:
         return "near_author"
     if _has_genre_marker_near(raw, idx, match_len):
         return "genre_marker"
+    if one_word:
+        return None
     if _capitalized_mid_sentence(raw, idx):
         return "capitalized"
     if requires_strong:
@@ -593,6 +748,11 @@ def build_refers_phrase_index(
             return
         # Never index author surnames as work phrases
         if n in qi.AUTHOR_ALIASES:
+            return
+        # Genre-word titles ("Рассказы", "Стихотворения") are too ambiguous
+        if n in REFERS_GENRE_MARKERS or n.rstrip("иы") in REFERS_GENRE_MARKERS:
+            return
+        if n in {"рассказы", "стихотворения", "поэмы", "повести", "пьесы", "романы"}:
             return
         key = (n, doc_id)
         if key in seen:
@@ -743,10 +903,11 @@ def layer_b_refers_to(
             continue
         src_meta = by_id.get(doc_id)
         chunk_authors = _authors_in_chunk(raw)
+        # Only phrases whose first token appears in this chunk
+        present = set(re.findall(r"[a-zа-яё]{3,}", body, flags=re.UNICODE))
         candidates: list[tuple[str, str, str, bool]] = []
-        for first, plist in by_first.items():
-            if first in body:
-                candidates.extend(plist)
+        for tok in present:
+            candidates.extend(by_first.get(tok) or [])
         # longest first
         candidates.sort(key=lambda x: -len(x[0]))
         matched_spans: list[tuple[int, int]] = []
@@ -780,6 +941,7 @@ def layer_b_refers_to(
                     multiword=multi,
                     requires_strong=requires_strong,
                     near_author=near_author,
+                    one_word=not multi,
                 )
                 if form:
                     accepted = True
@@ -843,8 +1005,64 @@ def _entity_key(surface: str) -> str:
     parts = norm_ru(surface).split()
     if not parts:
         return ""
+    # God forms collapse
+    if len(parts) == 1 and parts[0] in GOD_FORMS:
+        return "бог"
     parts = [stem_ru(p) for p in parts]
     return " ".join(parts)
+
+
+def entity_kind(surface: str, key: str) -> str:
+    n = norm_ru(surface)
+    if key == "бог" or n in GOD_FORMS:
+        return "other"
+    if n in PLACE_LEMMAS or key in {stem_ru(p) for p in PLACE_LEMMAS}:
+        return "place"
+    return "entity"
+
+
+def is_noise_entity_surface(surface: str, *, author_keys: set[str]) -> bool:
+    s = (surface or "").strip()
+    if not s:
+        return True
+    if re.fullmatch(r"[IVXLCDM]+", s):
+        return True
+    n = norm_ru(s)
+    if n in PLAY_STAGE_WORDS or n in EDITION_STOP:
+        return True
+    # Latin author filename tokens
+    if re.fullmatch(r"[A-Za-z][A-Za-z\-]{2,}", s) and (
+        s in author_keys or s.capitalize() in author_keys
+    ):
+        return True
+    # Corpus author RU surnames → covered by author nodes
+    if n in qi.AUTHOR_ALIASES:
+        return True
+    return False
+
+
+def drop_by_sentence_position(
+    token: str,
+    *,
+    pos_stats: dict[str, dict[str, int]],
+    case_stats: dict[str, dict[str, int]],
+) -> bool:
+    """Drop if almost always sentence-initial or mostly lowercase in corpus."""
+    n = norm_ru(token)
+    ps = pos_stats.get(n) or {}
+    start_n = int(ps.get("sent_start", 0))
+    mid_n = int(ps.get("mid", 0))
+    total_pos = start_n + mid_n
+    if total_pos >= 5 and (mid_n / total_pos < 0.30 or start_n >= mid_n * 2):
+        return True
+    st = case_stats.get(n) or {}
+    low, up = int(st.get("lower", 0)), int(st.get("upper", 0))
+    if low + up >= 6 and low > up * 2:
+        return True
+    # Short discourse / interrogative tokens that rarely appear mid-clause
+    if total_pos >= 3 and start_n >= 3 and mid_n == 0 and len(n) <= 10:
+        return True
+    return False
 
 
 def layer_c_shared_entity(
@@ -853,20 +1071,28 @@ def layer_c_shared_entity(
     doc_entities: dict[str, list[str]],
     doc_entity_chunks: dict[str, dict[str, list[str]]] | None = None,
     case_stats: dict[str, dict[str, int]] | None = None,
+    pos_stats: dict[str, dict[str, int]] | None = None,
     params: GraphIndexParams | None = None,
 ) -> list[Edge]:
-    """case_stats: token_norm -> {upper: n, lower: n} from corpus scan."""
+    """Shared entities with sentence-start / place / stage filters.
+
+    ``pos_stats``: token_norm -> {sent_start, mid} counts from clean_text.
+    Edge requires ≥2 shared entities and at least one non-place.
+    Place entities contribute weight ×0.3.
+    """
     params = params or GraphIndexParams()
     doc_entity_chunks = doc_entity_chunks or {}
     case_stats = case_stats or {}
+    pos_stats = pos_stats or {}
     by_id = {d.document_id: d for d in docs}
     n_works = max(1, len({d.work_key for d in docs}))
+    author_keys = {d.author_key for d in docs if d.author_key}
 
-    # map entity_key -> display, and work-level df
     work_entities: dict[str, set[str]] = defaultdict(set)
     doc_keys: dict[str, set[str]] = {}
     display: dict[str, str] = {}
     display_count: dict[str, Counter[str]] = defaultdict(Counter)
+    kinds: dict[str, str] = {}
 
     for doc_id, ents in doc_entities.items():
         keys: set[str] = set()
@@ -875,18 +1101,17 @@ def layer_c_shared_entity(
             cleaned = clean_entity_surface(e)
             if not cleaned:
                 continue
-            # sentence-initial bias: if mostly lowercase in corpus, drop
+            if is_noise_entity_surface(cleaned, author_keys=author_keys):
+                continue
             first = cleaned.split()[0]
-            st = case_stats.get(norm_ru(first))
-            if st:
-                low, up = st.get("lower", 0), st.get("upper", 0)
-                if low > up * 3 and low + up >= 8:
-                    continue
+            if drop_by_sentence_position(first, pos_stats=pos_stats, case_stats=case_stats):
+                continue
             k = _entity_key(cleaned)
-            if len(k) < 3 or k in EDITION_STOP:
+            if len(k) < 3 or k in EDITION_STOP or k in PLAY_STAGE_WORDS:
                 continue
             keys.add(k)
             display_count[k][cleaned] += 1
+            kinds[k] = entity_kind(cleaned, k)
         doc_keys[doc_id] = keys
         if meta:
             work_entities[meta.work_key] |= keys
@@ -921,11 +1146,16 @@ def layer_c_shared_entity(
                 pair_common[(a, b)].add(e)
 
     def idf(ent: str) -> float:
-        return math.log((n_works + 1) / (work_df[ent] + 1)) + 1.0
+        base = math.log((n_works + 1) / (work_df[ent] + 1)) + 1.0
+        if kinds.get(ent) == "place":
+            return base * 0.3
+        return base
 
     neigh: dict[str, list[tuple[float, str, set[str]]]] = defaultdict(list)
     for (a, b), common in pair_common.items():
         if len(common) < params.shared_min_entities:
+            continue
+        if not any(kinds.get(e) != "place" for e in common):
             continue
         w = sum(idf(e) for e in common)
         neigh[a].append((w, b, common))
@@ -954,6 +1184,7 @@ def layer_c_shared_entity(
                     weight=round(float(w), 4),
                     provenance={
                         "entities": [display.get(e, e) for e in sorted(common)[:10]],
+                        "entity_kinds": {display.get(e, e): kinds.get(e, "entity") for e in sorted(common)[:10]},
                         "chunk_ids": chunk_ids[:3],
                     },
                 )
@@ -970,30 +1201,58 @@ class LexCandidateCounter:
         self.comparisons = 0
 
 
+def is_lex_proper_token(stem: str, case_stats: dict[str, dict[str, int]] | None) -> bool:
+    """True for name-like tokens (mostly capitalized / patronymic / diminutive / latin)."""
+    n = norm_ru(stem)
+    if not n or len(n) < 4:
+        return True
+    if re.search(r"[a-z]", n):
+        return True
+    if n in _DIMINUTIVE_NAMES or n in qi.AUTHOR_ALIASES:
+        return True
+    # patronymic endings on the stem or unstemmed lookalikes
+    if _PATRONYMIC_RE.search(n) or n.endswith(("ович", "евич", "овн", "евн", "ичн", "инич")):
+        return True
+    st = (case_stats or {}).get(n) or (case_stats or {}).get(stem) or {}
+    # Also check unstemmed keys that fold to this stem
+    up = int(st.get("upper", 0))
+    low = int(st.get("lower", 0))
+    if up + low >= 4 and up >= low * 2:
+        return True
+    return False
+
+
 def layer_d_lex_similar(
     *,
     docs: list[DocMeta],
     doc_term_counts: dict[str, Counter[str]],
     params: GraphIndexParams | None = None,
     counter: LexCandidateCounter | None = None,
+    case_stats: dict[str, dict[str, int]] | None = None,
 ) -> tuple[list[Edge], dict[str, Any]]:
-    """Return edges + debug stats (score histogram).
+    """Lex similarity on content words (no proper names / patronymics).
 
-    Bug cause (slice 1): scored pairs via product of tiny per-term TF-IDF weights
-    with a high absolute threshold, while also filtering terms with df up to 35–60%
-    of *documents* (fragments). Rare literary stems rarely co-occurred under that
-    product threshold; only tiny English sample files survived. Fix: stem+RU stops,
-    document-level vectors with cosine, df bounds on *works*, lower cosine threshold.
+    Requires ≥3 shared terms in provenance. Default threshold 0.10.
     """
     params = params or GraphIndexParams()
+    case_stats = case_stats or {}
     by_id = {d.document_id: d for d in docs}
     n_docs = len(doc_term_counts)
     if n_docs < 2:
         return [], {"scores": [], "bugfix": "n_docs<2"}
 
-    # work-level df for term rarity
-    work_terms: dict[str, set[str]] = defaultdict(set)
+    # Drop name-like stems before df / vectors
+    cleaned_counts: dict[str, Counter[str]] = {}
     for doc_id, counts in doc_term_counts.items():
+        c2: Counter[str] = Counter()
+        for t, c in counts.items():
+            if is_lex_proper_token(t, case_stats):
+                continue
+            c2[t] = c
+        cleaned_counts[doc_id] = c2
+
+    work_terms: dict[str, set[str]] = defaultdict(set)
+    for doc_id, counts in cleaned_counts.items():
         meta = by_id.get(doc_id)
         wk = meta.work_key if meta else doc_id
         work_terms[wk] |= set(counts.keys())
@@ -1004,10 +1263,9 @@ def layer_d_lex_similar(
             df_work[t] += 1
 
     max_df = max(2, int(0.30 * n_works))
-    # characteristic vectors per document
     vectors: dict[str, dict[str, float]] = {}
     inv: dict[str, list[str]] = defaultdict(list)
-    for doc_id, counts in doc_term_counts.items():
+    for doc_id, counts in cleaned_counts.items():
         total = sum(counts.values()) or 1
         scored: list[tuple[float, str]] = []
         for t, c in counts.items():
@@ -1022,7 +1280,6 @@ def layer_d_lex_similar(
         vec = {t: s for s, t in top}
         if not vec:
             continue
-        # L2 normalize for cosine
         norm = math.sqrt(sum(v * v for v in vec.values())) or 1.0
         vectors[doc_id] = {t: v / norm for t, v in vec.items()}
         for t in vectors[doc_id]:
@@ -1030,7 +1287,6 @@ def layer_d_lex_similar(
 
     pair_best: dict[tuple[str, str], tuple[float, list[str]]] = {}
     for t, members in inv.items():
-        # rare-ish terms drive candidates
         if df_work.get(t, 0) > max(3, int(0.20 * n_works)):
             continue
         mem = sorted(set(members))
@@ -1045,25 +1301,39 @@ def layer_d_lex_similar(
                 if not va or not vb:
                     continue
                 shared = set(va) & set(vb)
-                if len(shared) < 2:
+                if len(shared) < 3:
                     continue
                 score = sum(va[x] * vb[x] for x in shared)
-                # soft complete cosine over union already L2-normed partial
                 key = (a, b) if a < b else (b, a)
                 prev = pair_best.get(key)
                 if not prev or score > prev[0]:
-                    pair_best[key] = (score, sorted(shared)[:5])
+                    pair_best[key] = (score, sorted(shared)[:8])
 
-    scores = [s for s, _ in pair_best.values()]
+    scores = sorted(s for s, _ in pair_best.values())
+    # Adaptive floor: keep params.lex_min_score, but if many name-only ghosts remain
+    # below ~0.10 they are already filtered by shared>=3 + proper drop.
+    thresh = params.lex_min_score
+    if scores:
+        # optional percentile nudge toward 0.10–0.12
+        p40 = scores[max(0, int(0.40 * (len(scores) - 1)))]
+        if p40 > thresh:
+            thresh = min(0.12, max(thresh, round(p40, 3)))
+
     neigh: dict[str, list[tuple[float, str, list[str]]]] = defaultdict(list)
     for (a, b), (score, terms) in pair_best.items():
-        if score < params.lex_min_score:
+        if score < thresh:
             continue
         neigh[a].append((score, b, terms))
         neigh[b].append((score, a, terms))
 
     edges: list[Edge] = []
     seen: set[tuple[str, str]] = set()
+    near_thresh: list[dict[str, Any]] = []
+    for (a, b), (score, terms) in sorted(pair_best.items(), key=lambda x: abs(x[1][0] - thresh)):
+        if len(near_thresh) >= 10:
+            break
+        near_thresh.append({"a": a, "b": b, "score": round(score, 4), "terms": terms})
+
     for src, lst in neigh.items():
         lst.sort(key=lambda x: (-x[0], x[1]))
         for score, tgt, terms in lst[: params.lex_top_k]:
@@ -1077,26 +1347,27 @@ def layer_d_lex_similar(
                     target=key[1],
                     type="lex_similar",
                     weight=round(float(score), 6),
-                    provenance={"terms": terms},
+                    provenance={"terms": terms, "shared_n": len(terms)},
                 )
             )
 
-    # histogram
     hist = Counter()
     for s in scores:
         bucket = round(s, 2)
         hist[bucket] += 1
     debug = {
         "bugfix": (
-            "Previously used product-of-tiny-TFIDF with document-fragment df caps; "
-            "RU terms never cleared the absolute threshold except tiny English samples."
+            "Name/patronymic stems removed; require ≥3 shared content terms; "
+            "threshold default 0.10 with optional percentile nudge."
         ),
         "score_count": len(scores),
         "score_min": min(scores) if scores else None,
         "score_max": max(scores) if scores else None,
         "score_hist": dict(sorted(hist.items())[:40]),
         "edges": len(edges),
-        "threshold": params.lex_min_score,
+        "threshold": thresh,
+        "threshold_requested": params.lex_min_score,
+        "near_threshold": near_thresh,
         "comparisons": counter.comparisons if counter else None,
     }
     return edges, debug
@@ -1343,8 +1614,14 @@ def assemble_index(
         "fragment_documents": len(frag_docs),
         "documents_without_author": len(no_author),
         "documents_without_author_sample": no_author[:20],
+        "author_source_counts": dict(Counter(d.author_source or "none" for d in docs)),
         "top_works_by_fragments": [
-            {"work_key": wk, "fragment_count": n, "title": works[wk].title, "author_key": works[wk].author_key}
+            {
+                "work_key": wk,
+                "fragment_count": n,
+                "title": works[wk].title,
+                "author_key": works[wk].author_key,
+            }
             for wk, n in work_frag.most_common(20)
         ],
     }
@@ -1366,8 +1643,11 @@ def assemble_index(
                 "source": d.source,
                 "author_key": d.author_key,
                 "author_ru": d.author_ru,
+                "author_source": d.author_source,
                 "title": d.title,
                 "fragment_no": d.fragment_no,
+                "part_no": d.part_no,
+                "volume_no": d.volume_no,
                 "work_key": d.work_key,
                 "chunk_count": d.chunk_count,
                 "created_at": d.created_at,
@@ -1498,15 +1778,17 @@ def build_index_for_tenant(
     doc_entity_chunks: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
     doc_term_counts: dict[str, Counter[str]] = defaultdict(Counter)
     case_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"upper": 0, "lower": 0})
+    pos_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"sent_start": 0, "mid": 0})
     chunk_rows: list[tuple[str, str, str]] = []
     chunk_total = 0
     clean_chars_removed = 0
     clean_chunks_touched = 0
     clean_examples: list[dict[str, str]] = []
+    layer_ms: dict[str, int] = {}
     by_id = {d.document_id: d for d in docs}
-    # ordinals per doc for front-matter strip
     ordinal_by_doc: dict[str, int] = defaultdict(int)
 
+    t_scan = time.perf_counter()
     for doc_id, chunk_id, text in _iter_chunks_batched(db, tenant_id, version_ids, params.chunk_batch):
         meta = by_id.get(doc_id)
         ord_n = ordinal_by_doc[doc_id]
@@ -1532,11 +1814,9 @@ def build_index_for_tenant(
                         "after": clean[:220],
                     }
                 )
-            # author from ingest header for authorless docs
             if meta and not meta.author_key and hdr.get("author"):
                 ak = str(hdr["author"]).strip()
                 if ak and norm_ru(ak) not in LANGUAGE_MARKERS:
-                    # map RU alias or keep Latin key
                     mapped = None
                     for ru, key in qi.AUTHOR_ALIASES.items():
                         if norm_ru(ak) == ru or ak == key:
@@ -1545,6 +1825,7 @@ def build_index_for_tenant(
                     meta.author_key = mapped or (ak if re.fullmatch(r"[A-Z][A-Za-z\-]+", ak) else None)
                     if meta.author_key:
                         meta.author_ru = _AUTHOR_RU_BY_KEY.get(meta.author_key)
+                        meta.author_source = "ingest_header"
                         meta.work_key = work_key_for(
                             pack=meta.pack, author_key=meta.author_key, title=meta.title
                         )
@@ -1555,6 +1836,10 @@ def build_index_for_tenant(
             key = norm_ru(w)
             if w[0].isupper():
                 case_stats[key]["upper"] += 1
+                if _is_sentence_start(clean, m.start()):
+                    pos_stats[key]["sent_start"] += 1
+                else:
+                    pos_stats[key]["mid"] += 1
             else:
                 case_stats[key]["lower"] += 1
         ents = extract_entity_candidates([clean], limit=params.entity_top_n)
@@ -1567,29 +1852,50 @@ def build_index_for_tenant(
                 doc_entity_chunks[doc_id][k].append(chunk_id)
         for tok in tokenize_lex(clean):
             doc_term_counts[doc_id][tok] += 1
+    layer_ms["scan_clean"] = int((time.perf_counter() - t_scan) * 1000)
 
     counts_by_doc = Counter(d for d, _, _ in chunk_rows)
     for d in docs:
         d.chunk_count = int(counts_by_doc.get(d.document_id, d.chunk_count))
     resolve_work_keys(docs)
 
+    t_l = time.perf_counter()
     edges.extend(layer_a_edges(docs))
+    layer_ms["layer_a"] = int((time.perf_counter() - t_l) * 1000)
+
+    t_l = time.perf_counter()
     edges.extend(layer_mentions_author(docs=docs, chunk_iter=chunk_rows))
+    layer_ms["mentions_author"] = int((time.perf_counter() - t_l) * 1000)
+
+    t_l = time.perf_counter()
     edges.extend(layer_b_refers_to(docs=docs, chunk_iter=chunk_rows, params=params))
+    layer_ms["refers_to"] = int((time.perf_counter() - t_l) * 1000)
+
+    t_l = time.perf_counter()
     edges.extend(
         layer_c_shared_entity(
             docs=docs,
             doc_entities=dict(doc_entities),
             doc_entity_chunks={k: dict(v) for k, v in doc_entity_chunks.items()},
             case_stats={k: dict(v) for k, v in case_stats.items()},
+            pos_stats={k: dict(v) for k, v in pos_stats.items()},
             params=params,
         )
     )
+    layer_ms["shared_entity"] = int((time.perf_counter() - t_l) * 1000)
+
+    t_l = time.perf_counter()
     lex_edges, lex_debug = layer_d_lex_similar(
-        docs=docs, doc_term_counts=dict(doc_term_counts), params=params, counter=LexCandidateCounter()
+        docs=docs,
+        doc_term_counts=dict(doc_term_counts),
+        params=params,
+        counter=LexCandidateCounter(),
+        case_stats={k: dict(v) for k, v in case_stats.items()},
     )
     edges.extend(lex_edges)
+    layer_ms["lex_similar"] = int((time.perf_counter() - t_l) * 1000)
 
+    t_l = time.perf_counter()
     cite_lists: list[tuple[list[str], bool]] = []
     msgs = (
         db.query(ChatMessage.citations, ChatSession.title)
@@ -1603,6 +1909,7 @@ def build_index_for_tenant(
             cite_lists.append((ids, is_eval_chat_session(title)))
     edges.extend(layer_e_co_cited(cite_lists, include_eval=params.include_eval_cocited))
     edges.extend(aggregate_work_edges(docs, edges, top_k=params.work_neighbor_top_k))
+    layer_ms["co_cited_and_work_agg"] = int((time.perf_counter() - t_l) * 1000)
 
     built_ms = int((time.perf_counter() - t0) * 1000)
     payload = assemble_index(
@@ -1620,6 +1927,7 @@ def build_index_for_tenant(
                 "chunks_touched": clean_chunks_touched,
                 "examples": clean_examples,
             },
+            "layer_ms": layer_ms,
         },
     )
     write_index_atomic(path, payload)

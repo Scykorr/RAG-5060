@@ -323,6 +323,103 @@ def test_gorky_not_from_gorko_adjective():
     assert any(e.target == "author:Gorky" for e in mentions2)
 
 
+def test_sentence_start_entities_dropped_by_position_rule():
+    from apps.api.services.text_entities import norm_ru
+
+    docs = [
+        gi.parse_doc_meta(document_id="d1", filename="classic_0001_Tolstoy_Анна_aaaaaaaa.txt"),
+        gi.parse_doc_meta(document_id="d2", filename="classic_0002_Dostoevsky_Бесы_bbbbbbbb.txt"),
+    ]
+    noise = [
+        "Зачем",
+        "Наконец",
+        "Разумеется",
+        "Почему",
+        "Кто",
+        "Пусть",
+        "Видите",
+        "Прощай",
+        "Войдя",
+        "Поравнявшись",
+        "Конечно",
+        "Таков",
+        "Погода",
+        "Вронский",
+        "Смердяков",
+        "Покровское",
+    ]
+    keep = {"Вронский", "Смердяков", "Покровское"}
+    pos = {
+        norm_ru(x): {"sent_start": 20, "mid": 1}
+        for x in noise
+        if x not in keep
+    }
+    pos[norm_ru("Вронский")] = {"sent_start": 2, "mid": 18}
+    pos[norm_ru("Смердяков")] = {"sent_start": 1, "mid": 15}
+    pos[norm_ru("Покровское")] = {"sent_start": 3, "mid": 12}
+    edges = gi.layer_c_shared_entity(
+        docs=docs,
+        doc_entities={"d1": noise, "d2": noise},
+        pos_stats=pos,
+        params=gi.GraphIndexParams(shared_min_entities=2),
+    )
+    assert edges
+    joined = " ".join((edges[0].provenance.get("entities") or [])).lower()
+    for bad in ("зачем", "наконец", "разумеется", "почему", "кто", "пусть", "видите", "прощай"):
+        assert bad not in joined
+    assert "вронский" in joined or "смердяков" in joined or "покровское" in joined
+
+
+def test_lex_ignores_name_only_overlap():
+    docs = [
+        gi.parse_doc_meta(document_id="a", filename="classic_0001_Turgenev_Накануне_aaaaaaaa.txt"),
+        gi.parse_doc_meta(document_id="b", filename="classic_0002_Tolstoy_Анна_Каренина_bbbbbbbb.txt"),
+    ]
+    # only shared name stems
+    terms = {
+        "a": Counter({"анна": 5, "александрович": 4, "ивановн": 3}),
+        "b": Counter({"анна": 6, "александрович": 5, "ивановн": 4}),
+    }
+    case = {
+        "анна": {"upper": 20, "lower": 1},
+        "александрович": {"upper": 15, "lower": 0},
+        "ивановн": {"upper": 12, "lower": 0},
+    }
+    edges, _ = gi.layer_d_lex_similar(
+        docs=docs,
+        doc_term_counts=terms,
+        params=gi.GraphIndexParams(lex_min_score=0.01),
+        case_stats=case,
+    )
+    assert edges == []
+
+
+def test_work_parts_and_volumes_merge():
+    a = gi.parse_doc_meta(
+        document_id="a",
+        filename="classic_0001_Dostoevsky_Братья_Карамазовы_aaaaaaaa.txt",
+    )
+    b = gi.parse_doc_meta(
+        document_id="b",
+        filename="classic_0002_Dostoevsky_Братья_Карамазовы_-_Часть_3_bbbbbbbb.txt",
+    )
+    c = gi.parse_doc_meta(
+        document_id="c",
+        filename="classic_0003_Tolstoy_Война_и_мир_Том_2_cccccccc.txt",
+    )
+    d = gi.parse_doc_meta(
+        document_id="d",
+        filename="classic_0004_Tolstoy_Война_и_мир_Том_3_dddddddd.txt",
+    )
+    docs = [a, b, c, d]
+    gi.resolve_work_keys(docs)
+    assert a.work_key == b.work_key
+    assert "часть" not in a.work_key
+    assert c.work_key == d.work_key
+    assert c.volume_no == 2
+    assert d.volume_no == 3
+
+
 def test_work_weight_not_linear_in_fragments():
     docs = []
     edges = []

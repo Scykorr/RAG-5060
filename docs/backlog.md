@@ -26,8 +26,8 @@ Statuses: `planned` → `ready` → `in_progress` → `review` → `verified` | 
 | T-GRAPH-IDX-03 | F04.18 | S3c | graph_index layers C/D + unit tests | verified | same module |
 | T-GRAPH-IDX-04 | F04.18 | S3c | cache wire-up, API /index/*, report script | verified | report artifacts/20261110-120700-graph-index |
 | T-GRAPH-IDX-1B | F04.18 | S3c | Clean index: work_key, refers/entity/lex fixes | verified | report artifacts/20261110-123456-graph-index |
-| T-GRAPH-IDX-1C | F04.18 | S3c | Index cleanup 1c: text clean, mentions_author, strong refers, entities, lex, work merge | in_progress | step1 text clean done |
+| T-GRAPH-IDX-1C | F04.18 | S3c | Index cleanup 1c: text clean, mentions_author, strong refers, entities, lex, work merge | verified | report artifacts/20261110-133444-graph-index |
 
 ## Ready next
 
-T-GRAPH-IDX-1C remaining steps (author/refers → entities → lex → work merge/report); then theme clustering / Obsidian-like tab; F14 smoke / S4 pilot.
+Theme clustering / Obsidian-like graph tab next; F14 smoke / S4 pilot.

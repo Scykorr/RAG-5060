@@ -1,5 +1,16 @@
 # Progress
 
+## 2026-11-10 — Graph connectivity index slice 1c (complete)
+
+- task_id: T-GRAPH-IDX-1C
+- Text clean + mentions_author + strong refers + entity sentence-start + lex sans names + work merge/agg
+- Report: `artifacts/20261110-133444-graph-index/graph_index_report.md`
+- Metrics vs 1b (`20261110-123456`): refers 2602→640; shared 2268→673; lex 1487→664; works 416→406; no-author 54→48; built_ms 319570→45430
+- Layer ms: scan_clean~15s, refers~25s, lex~3s, mentions~1.7s (bottleneck=refers phrase scan)
+- Work merge: Анна Каренина eb+ch+фрагменты; Братья Карамазовы части; Война и мир тома; Мёртвые души тома
+- lex regression: good 4/6 found (Мёртвые души merged=same work; Gandhi pair absent); bad 4/4 absent
+- Tests: 26 passed; INDEX_VERSION=3
+
 ## 2026-11-10 — Graph connectivity index slice 1c step 2 (mentions_author + refers)
 
 - task_id: T-GRAPH-IDX-1C
