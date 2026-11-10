@@ -29,6 +29,7 @@ from apps.api.services.graph_lexicon import frozenset_field, tuple_field
 from apps.api.services.quality_state import corpus_fingerprint
 from apps.api.services.storage import data_root
 from apps.api.services.graph_text_clean import clean_chunk_for_graph
+from apps.api.services import graph_refers as grefer
 from apps.api.services.text_entities import (
     EDITION_STOP,
     ENTITY_DENY,
@@ -44,7 +45,7 @@ from apps.api.services.text_entities import (
 
 log = structlog.get_logger()
 
-INDEX_VERSION = 4
+INDEX_VERSION = 5
 
 # Filename grammar tokens (source-site / language folder markers), not corpus content.
 SOURCE_TOKENS = frozenset({"ch", "eb"})
@@ -506,59 +507,13 @@ def _window(text: str, idx: int, length: int, radius: int = 48) -> str:
     return text[a:b]
 
 
-def _has_genre_marker_near(raw: str, idx: int, length: int) -> bool:
-    win = norm_ru(_window(raw, idx, length, 40))
-    return any(m in win for m in _genre_markers())
+def _context_snip(text: str, idx: int, phrase_len: int, width: int = 120) -> str:
+    a = max(0, idx - width // 3)
+    b = min(len(text), idx + phrase_len + width // 2)
+    return re.sub(r"\s+", " ", text[a:b]).strip()
 
 
-def _quoted_span(raw: str, idx: int, length: int) -> bool:
-    left = raw[max(0, idx - 1) : idx]
-    right = raw[idx + length : idx + length + 1]
-    quotes = set("«»\"“”„'")
-    if left and left in quotes:
-        return True
-    if right and right in quotes:
-        return True
-    # opening quote a few chars before
-    pre = raw[max(0, idx - 2) : idx]
-    return any(c in quotes for c in pre)
-
-
-def _capitalized_mid_sentence(raw: str, idx: int) -> bool:
-    if idx >= len(raw) or not raw[idx].isupper():
-        return False
-    return not _is_sentence_start(raw, idx)
-
-
-def classify_refers_match(
-    raw: str,
-    idx: int,
-    match_len: int,
-    *,
-    multiword: bool,
-    requires_strong: bool,
-    near_author: bool,
-    one_word: bool = False,
-) -> str | None:
-    """Return match_form or None if the hit must be discarded.
-
-    One-word titles: only quoted | genre_marker | near_author (not bare capitalization).
-    """
-    if _quoted_span(raw, idx, match_len):
-        return "quoted"
-    if near_author:
-        return "near_author"
-    if _has_genre_marker_near(raw, idx, match_len):
-        return "genre_marker"
-    if one_word:
-        return None
-    if _capitalized_mid_sentence(raw, idx):
-        return "capitalized"
-    if requires_strong:
-        return None
-    if multiword:
-        return "multiword_plain"
-    return None
+# refers helpers live in graph_refers (strict A1 matching)
 
 
 def find_author_mentions_in_text(raw: str) -> list[tuple[str, str, int, int]]:
@@ -667,134 +622,9 @@ def layer_mentions_author(
     return edges
 
 
-def build_refers_phrase_index(
-    docs: list[DocMeta],
-) -> list[tuple[str, str, str, bool]]:
-    """(norm_phrase, document_id, surface, is_multiword) — titles only, no author names."""
-    items: list[tuple[str, str, str, bool]] = []
-    seen: set[tuple[str, str]] = set()
-
-    def add(surface: str, doc_id: str, *, multi: bool) -> None:
-        s = (surface or "").strip(" .,:;«»\"'")
-        if not s:
-            return
-        n = norm_ru(s)
-        if len(n) < 3:
-            return
-        if n in REFERS_STOP_PHRASES or n in STOP or n in EDITION_STOP:
-            return
-        # Never index author surnames as work phrases
-        if n in qi.AUTHOR_ALIASES:
-            return
-        # Genre-word titles are too ambiguous (language config, not corpus titles)
-        markers = set(_genre_markers()) | _genre_title_blocklist()
-        if n in markers or n.rstrip("иы") in markers:
-            return
-        key = (n, doc_id)
-        if key in seen:
-            return
-        seen.add(key)
-        items.append((n, doc_id, s, multi))
-
-    for d in docs:
-        words = _significant_words(d.title)
-        if len(words) >= 2:
-            add(" ".join(words), d.document_id, multi=True)
-            add(d.title, d.document_id, multi=True)
-        elif len(words) == 1:
-            add(words[0], d.document_id, multi=False)
-            add(d.title, d.document_id, multi=False)
-
-    items.sort(key=lambda x: (-len(x[0]), x[0], x[1]))
-    return items
-
-
-def _word_boundary_find(
-    body: str, phrase: str, *, allow_multi_stem: bool = True
-) -> list[tuple[int, int, bool]]:
-    """Find (start, length, exact) with alnum boundaries; optional multiword stem."""
-    hits: list[tuple[int, int, bool]] = []
-    if not phrase:
-        return hits
-    start = 0
-    while True:
-        idx = body.find(phrase, start)
-        if idx < 0:
-            break
-        end = idx + len(phrase)
-        left_ok = idx == 0 or not body[idx - 1].isalnum()
-        right_ok = end >= len(body) or not body[end].isalnum()
-        if left_ok and right_ok:
-            hits.append((idx, len(phrase), True))
-        start = idx + 1
-    if hits or not allow_multi_stem:
-        return hits
-    parts = phrase.split()
-    if len(parts) < 2:
-        return hits
-    mid = parts[1:-1]
-    first_stem = stem_ru(parts[0])
-    last_stem = stem_ru(parts[-1])
-    if len(first_stem) < 4 or len(last_stem) < 4:
-        return hits
-    mid_re = r"\s+".join(re.escape(m) for m in mid) if mid else ""
-    if mid_re:
-        mid_re = r"\s+" + mid_re + r"\s+"
-    else:
-        mid_re = r"\s+"
-    pat = re.compile(
-        rf"(?<![0-9a-zа-я]){re.escape(first_stem)}[a-zа-я]{{0,4}}{mid_re}"
-        rf"{re.escape(last_stem)}[a-zа-я]{{0,4}}(?![0-9a-zа-я])",
-        re.UNICODE,
-    )
-    for m in pat.finditer(body):
-        hits.append((m.start(), m.end() - m.start(), False))
-    return hits
-
-
-def _context_snip(text: str, idx: int, phrase_len: int, width: int = 120) -> str:
-    a = max(0, idx - width // 3)
-    b = min(len(text), idx + phrase_len + width // 2)
-    return re.sub(r"\s+", " ", text[a:b]).strip()
-
-
-def _phrase_work_df(
-    phrases: list[tuple[str, str, str, bool]],
-    docs: list[DocMeta],
-    chunk_iter: Iterable[tuple[str, str, str]],
-) -> dict[str, int]:
-    """How many distinct works contain each norm phrase (plain occurrence)."""
-    by_id = {d.document_id: d for d in docs}
-    uniq = sorted({p[0] for p in phrases}, key=len, reverse=True)
-    # first-token bucket to avoid scanning every phrase on every chunk
-    by_first: dict[str, list[str]] = defaultdict(list)
-    for p in uniq:
-        first = p.split()[0] if p else p
-        by_first[first].append(p)
-    works_with: dict[str, set[str]] = defaultdict(set)
-    for doc_id, _cid, text in chunk_iter:
-        meta = by_id.get(doc_id)
-        if not meta:
-            continue
-        body = norm_ru(text or "")
-        if not body:
-            continue
-        seen_here: set[str] = set()
-        # candidate first tokens present in body
-        for first, plist in by_first.items():
-            if first not in body:
-                continue
-            for phrase_n in plist:
-                if phrase_n in seen_here:
-                    continue
-                if _word_boundary_find(body, phrase_n, allow_multi_stem=False):
-                    seen_here.add(phrase_n)
-                    works_with[phrase_n].add(meta.work_key)
-    return {p: len(ws) for p, ws in works_with.items()}
-
-
-def _authors_in_chunk(raw: str) -> set[str]:
-    return {k for k, _, _, _ in find_author_mentions_in_text(raw)}
+def build_refers_phrase_index(docs: list[DocMeta]) -> list[tuple[str, str, str, bool]]:
+    """Compatibility wrapper — full-title phrases only (A1)."""
+    return grefer.build_title_phrases(docs)
 
 
 def layer_b_refers_to(
@@ -804,20 +634,22 @@ def layer_b_refers_to(
     params: GraphIndexParams | None = None,
     phrase_work_df: dict[str, int] | None = None,
 ) -> list[Edge]:
-    """refers_to: only work-title phrases; common/one-word need a strong form."""
+    """refers_to with strict full-title matching (A1)."""
     params = params or GraphIndexParams()
     by_id = {d.document_id: d for d in docs}
-    phrases = build_refers_phrase_index(docs)
+    phrases = grefer.build_title_phrases(docs)
     if not phrases:
         return []
 
     chunk_list = list(chunk_iter)
-    df = phrase_work_df if phrase_work_df is not None else _phrase_work_df(phrases, docs, chunk_list)
+    lower_df = grefer.lower_token_df(chunk_list)
+    frequent = grefer.frequent_title_norms(
+        phrases, lower_df, n_docs=len(docs), top_frac=0.20
+    )
 
-    # first-token index: first_norm_token -> list of phrase tuples
     by_first: dict[str, list[tuple[str, str, str, bool]]] = defaultdict(list)
     for item in phrases:
-        first = item[0].split()[0]
+        first = item[0].split()[0] if item[0] else item[0]
         by_first[first].append(item)
 
     hits: dict[str, dict[str, dict[str, Any]]] = defaultdict(
@@ -828,84 +660,100 @@ def layer_b_refers_to(
                 "multi": False,
                 "snips": [],
                 "match_form": "",
+                "zone": "body",
+                "weight_sum": 0.0,
             }
         )
     )
 
     for doc_id, chunk_id, text in chunk_list:
         raw = text or ""
-        body = norm_ru(raw)
-        if not body:
+        if not raw.strip():
             continue
         src_meta = by_id.get(doc_id)
-        chunk_authors = _authors_in_chunk(raw)
-        # Only phrases whose first token appears in this chunk
-        present = set(re.findall(r"[a-zа-яё]{3,}", body, flags=re.UNICODE))
+        tokens_present = {t[0] for t in grefer._tokens_with_spans(raw)}
         candidates: list[tuple[str, str, str, bool]] = []
-        for tok in present:
+        for tok in tokens_present:
             candidates.extend(by_first.get(tok) or [])
-        # longest first
-        candidates.sort(key=lambda x: -len(x[0]))
+        for first, plist in by_first.items():
+            if len(first) >= 4 and any(
+                t.startswith(first[:4]) for t in tokens_present
+            ):
+                candidates.extend(plist)
+        seen_c: set[tuple[str, str]] = set()
+        uniq: list[tuple[str, str, str, bool]] = []
+        for item in sorted(candidates, key=lambda x: -len(x[0])):
+            key = (item[0], item[1])
+            if key in seen_c:
+                continue
+            seen_c.add(key)
+            uniq.append(item)
+
         matched_spans: list[tuple[int, int]] = []
-        for phrase_n, target_id, surface, multi in candidates:
+        for phrase_n, target_id, surface, multi in uniq:
             if target_id == doc_id:
                 continue
             tgt_meta = by_id.get(target_id)
             if same_work(src_meta, tgt_meta):
                 continue
-            found = _word_boundary_find(body, phrase_n, allow_multi_stem=multi)
+            found = grefer.find_title_hits(raw, surface)
             if not found:
                 continue
-            work_df = df.get(phrase_n, 0)
-            common_phrase = work_df > params.refers_common_work_df
-            near_author = bool(tgt_meta and tgt_meta.author_key and tgt_meta.author_key in chunk_authors)
+            same_author = bool(
+                src_meta
+                and tgt_meta
+                and src_meta.author_key
+                and tgt_meta.author_key
+                and src_meta.author_key == tgt_meta.author_key
+            )
+            freq = phrase_n in frequent
             accepted = False
-            best_form = ""
-            best_idx = found[0][0]
-            best_len = found[0][1]
-            for idx, mlen, exact in found:
-                # skip if overlaps a longer already-accepted match
-                if any(not (idx + mlen <= a or idx >= b) for a, b in matched_spans):
+            best = None
+            for hit in found:
+                if any(
+                    not (hit["end"] <= a or hit["start"] >= b)
+                    for a, b in matched_spans
+                ):
                     continue
-                # One-word titles, common collocations, and inflected (stem) hits
-                # need a strong form; plain multiword exact hits may pass.
-                requires_strong = (not multi) or common_phrase or (not exact)
-                form = classify_refers_match(
+                form = grefer.classify_hit(
                     raw,
-                    idx,
-                    mlen,
-                    multiword=multi,
-                    requires_strong=requires_strong,
-                    near_author=near_author,
-                    one_word=not multi,
+                    hit,
+                    author_key=tgt_meta.author_key if tgt_meta else None,
+                    same_author=same_author,
+                    frequent_title=freq,
                 )
                 if form:
+                    hit = dict(hit)
+                    hit["match_form"] = form
                     accepted = True
-                    best_form = form
-                    best_idx = idx
-                    best_len = mlen
+                    best = hit
                     break
-            if not accepted:
+            if not accepted or best is None:
                 continue
-            matched_spans.append((best_idx, best_idx + best_len))
+            matched_spans.append((best["start"], best["end"]))
+            zone = best.get("zone") or grefer.detect_zone(raw, best["start"])
+            w = 0.3 if zone == "commentary" else 1.0
             bucket = hits[doc_id][target_id]
             if chunk_id not in bucket["chunks"]:
                 bucket["chunks"].append(chunk_id)
+                bucket["weight_sum"] += w
             if not bucket["phrase"] or (multi and not bucket["multi"]):
                 bucket["phrase"] = surface
-                bucket["multi"] = multi
-                bucket["match_form"] = best_form
+                bucket["multi"] = bool(multi)
+                bucket["match_form"] = best["match_form"]
+                bucket["zone"] = zone
             elif not bucket["match_form"]:
-                bucket["match_form"] = best_form
+                bucket["match_form"] = best["match_form"]
             if len(bucket["snips"]) < 2:
-                bucket["snips"].append(_context_snip(raw, best_idx, best_len))
+                bucket["snips"].append(
+                    grefer.context_snip(raw, best["start"], best["end"])
+                )
 
     raw_edges: list[Edge] = []
     for src, by_tgt in hits.items():
         for tgt, info in by_tgt.items():
-            w = float(len(info["chunks"]))
-            multi = bool(info["multi"])
-            if w < 1:
+            w = float(info["weight_sum"])
+            if w <= 0:
                 continue
             raw_edges.append(
                 Edge(
@@ -917,8 +765,9 @@ def layer_b_refers_to(
                         "chunk_ids": info["chunks"][:3],
                         "phrase": info["phrase"],
                         "context": (info["snips"][0] if info["snips"] else "")[:160],
-                        "multiword": multi,
+                        "multiword": bool(info["multi"]),
                         "match_form": info["match_form"],
+                        "zone": info.get("zone") or "body",
                     },
                 )
             )
@@ -936,6 +785,7 @@ def layer_b_refers_to(
 # ---------------------------------------------------------------------------
 # Layer C — shared_entity
 # ---------------------------------------------------------------------------
+
 
 def _entity_key(surface: str) -> str:
     parts = norm_ru(surface).split()

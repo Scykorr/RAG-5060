@@ -1,5 +1,13 @@
 # Progress
 
+## 2026-11-10 — Graph connectivity 1d A1 (strict refers_to)
+
+- task_id: T-GRAPH-IDX-1D-A — in progress (A1 done)
+- `apps/api/services/graph_refers.py`: full-title token match; no lowercase; genre 0–2 tokens before; exact quote=title; one-word only quoted|genre; same-author / frequent titles need strong form; zone commentary ×0.3
+- `layer_b_refers_to` wired to grefer; `multiword` from full title tokens; INDEX_VERSION=5
+- Tests: `test_graph_refers.py` + graph_index — 29 passed
+- Next: A2 lex names + A3 entities
+
 ## 2026-11-10 — Graph connectivity lifecycle (1d)
 
 - task_id: T-GRAPH-IDX-1D — verified (unit)
