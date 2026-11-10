@@ -330,17 +330,28 @@ def export_graph(
 def rebuild_connectivity_index(
     user: Annotated[AuthUser, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
+    sync: bool = Query(default=False),
+    mode: str | None = Query(default=None),
 ):
-    """Rebuild tenant connectivity index from active chunks (cached by corpus fingerprint)."""
-    from apps.api.services import graph_index as gidx
+    """Rebuild connectivity index in background (single-flight).
 
-    payload = gidx.build_index_for_tenant(db, user.tenant_id, force=True)
-    return {
-        "status": "ok",
-        "fingerprint": payload.get("fingerprint"),
-        "built_ms": payload.get("built_ms"),
-        "stats": payload.get("stats") or {},
-    }
+    Set ``sync=true`` only for tests/admin debugging — blocks until done.
+    """
+    from apps.api.services import graph_index as gidx
+    from apps.api.services import graph_index_cache as gcache
+
+    if sync:
+        payload = gidx.build_index_for_tenant(db, user.tenant_id, force=True, mode=mode or "full")
+        return {
+            "status": "ok",
+            "fingerprint": payload.get("fingerprint"),
+            "built_ms": payload.get("built_ms"),
+            "stats": payload.get("stats") or {},
+            "build_mode": (payload.get("stats") or {}).get("build_mode"),
+        }
+    started = gidx.schedule_rebuild(user.tenant_id, force=True, mode=mode)
+    st = gcache.read_build_status(user.tenant_id) or {}
+    return {**started, "build": st}
 
 
 @router.get("/index/stats")
@@ -349,16 +360,29 @@ def connectivity_index_stats(
     db: Annotated[Session, Depends(get_db)],
 ):
     from apps.api.services import graph_index as gidx
+    from apps.api.services import graph_index_cache as gcache
 
+    build = gcache.read_build_status(user.tenant_id) or {}
+    if gcache.is_build_running(user.tenant_id) or build.get("status") == "running":
+        return {
+            "status": "building",
+            "build": build,
+        }
     cached = gidx.load_cached_index(db, user.tenant_id)
     if not cached:
-        return {"status": "missing"}
+        return {"status": "missing", "build": build}
+    stats = cached.get("stats") or {}
     return {
         "status": "ok",
         "fingerprint": cached.get("fingerprint"),
         "built_at": cached.get("built_at"),
         "built_ms": cached.get("built_ms"),
-        "stats": cached.get("stats") or {},
+        "params_hash": cached.get("params_hash"),
+        "build_mode": stats.get("build_mode"),
+        "lifecycle": stats.get("lifecycle"),
+        "layer_ms": stats.get("layer_ms"),
+        "stats": stats,
+        "build": build,
     }
 
 

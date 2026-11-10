@@ -221,26 +221,28 @@ def test_layer_a_part_of_and_work_meta():
 
 
 def test_cache_write_read_and_purge(tmp_path, monkeypatch):
-    monkeypatch.setattr(gi, "data_root", lambda: tmp_path)
+    monkeypatch.setattr("apps.api.services.storage.data_root", lambda: tmp_path)
+    monkeypatch.setattr("apps.api.services.graph_index_cache.data_root", lambda: tmp_path)
     (tmp_path / "graph").mkdir(parents=True)
     tenant = "11111111-1111-1111-1111-111111111111"
     docs = [gi.parse_doc_meta(document_id="d1", filename="classic_0001_Pushkin_Пир_aa111111.txt")]
+    params = gi.GraphIndexParams()
     payload = gi.assemble_index(
         tenant_id=tenant,
         fingerprint="fp_old",
         docs=docs,
         edges=gi.layer_a_edges(docs),
-        params=gi.GraphIndexParams(),
+        params=params,
         built_ms=1,
     )
-    old = gi.index_path(tenant, "fp_old")
+    old = gi.index_path(tenant, "fp_old", params=params)
     gi.write_index_atomic(old, payload)
     assert gi.read_index(old)["fingerprint"] == "fp_old"
     new_payload = dict(payload)
     new_payload["fingerprint"] = "fp_new"
-    new = gi.index_path(tenant, "fp_new")
+    new = gi.index_path(tenant, "fp_new", params=params)
     gi.write_index_atomic(new, new_payload)
-    removed = gi.purge_old_indexes(tenant, "fp_new")
+    removed = gi.purge_old_indexes(tenant, new, keep_n=1)
     assert removed >= 1
     assert not old.exists()
     assert new.exists()

@@ -1,5 +1,16 @@
 # Progress
 
+## 2026-11-10 — Graph connectivity lifecycle (1d)
+
+- task_id: T-GRAPH-IDX-1D — verified (unit)
+- Spec: `docs/graph/CONNECTIVITY_LIFECYCLE.md`; S54; A19
+- `configs/graph_lexicon.json` — language-only editable rules (offline)
+- Per-doc artifacts under `graph/doc_cache/<tenant>/`; index key `tenant+fp+v+params_hash`
+- `build_mode` full|incremental; lifecycle counts; background `schedule_rebuild` single-flight
+- `POST /api/graph/index/rebuild` async by default (`sync=true` for tests); stats → building|ok|missing
+- `reset-rag` invalidates indexes + doc caches
+- Tests: `test_graph_index_lifecycle.py` + suite — 32 passed; INDEX_VERSION=4
+
 ## 2026-11-10 — Graph connectivity index slice 1c (complete)
 
 - task_id: T-GRAPH-IDX-1C

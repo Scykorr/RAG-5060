@@ -532,4 +532,16 @@ def reset_rag(
     if body.qdrant:
         out["qdrant"] = _wipe_qdrant_collection()
 
+    # Invalidate connectivity index + per-doc artifacts (offline lifecycle S54).
+    try:
+        from apps.api.models import Tenant
+        from apps.api.services import graph_index as gidx
+
+        cleared = []
+        for t in db.query(Tenant).all():
+            cleared.append({"tenant_id": str(t.id), **gidx.invalidate_tenant(t.id)})
+        out["graph_index_invalidated"] = cleared
+    except Exception as exc:  # noqa: BLE001
+        out["graph_index_invalidate_error"] = type(exc).__name__
+
     return out

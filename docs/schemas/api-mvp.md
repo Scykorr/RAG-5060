@@ -39,12 +39,14 @@ ACL-scoped document graph stored in Postgres (`/api/graph/status`, `/nodes`, `/e
 
 ## Connectivity index (lexical / filename / citations; no Qdrant)
 
-Tenant from session only. Cache: `data_root()/graph/<tenant>_<fingerprint>_index.json`.
+Tenant from session only. Cache key: `tenant + corpus_fingerprint + index_version + params_hash`.
+Files: `data_root()/graph/<tenant>_<fp>_v<ver>_<params>_index.json` + per-doc artifacts under `graph/doc_cache/<tenant>/`.
+Lifecycle: `docs/graph/CONNECTIVITY_LIFECYCLE.md` (S54). Rebuild is background single-flight; `sync=true` for tests.
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| POST | `/api/graph/index/rebuild` | rebuild index for current tenant; returns `stats` |
-| GET | `/api/graph/index/stats` | cached `stats` or `{status:"missing"}` |
+| POST | `/api/graph/index/rebuild?sync=&mode=` | enqueue rebuild (`started`/`already_running`); `sync=true` blocks |
+| GET | `/api/graph/index/stats` | `ok` / `missing` / `building` + lifecycle + layer_ms |
 | GET | `/api/graph/index/document/{document_id}?limit=20` | neighbors grouped by edge type with `weight` + `provenance` |
 
 Edge types: `in_theme`, `wrote`, `refers_to`, `shared_entity`, `lex_similar`, `co_cited`. Every edge has weight and provenance (no decorative links).

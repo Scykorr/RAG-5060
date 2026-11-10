@@ -27,7 +27,8 @@ Statuses: `planned` → `ready` → `in_progress` → `review` → `verified` | 
 | T-GRAPH-IDX-04 | F04.18 | S3c | cache wire-up, API /index/*, report script | verified | report artifacts/20261110-120700-graph-index |
 | T-GRAPH-IDX-1B | F04.18 | S3c | Clean index: work_key, refers/entity/lex fixes | verified | report artifacts/20261110-123456-graph-index |
 | T-GRAPH-IDX-1C | F04.18 | S3c | Index cleanup 1c: text clean, mentions_author, strong refers, entities, lex, work merge | verified | report artifacts/20261110-133444-graph-index |
+| T-GRAPH-IDX-1D | F04.18 | S3c | Offline lifecycle: per-doc cache, incremental≈full, background rebuild, reset invalidate | verified | S54/A19; unit 32 passed |
 
 ## Ready next
 
-Theme clustering / Obsidian-like graph tab next; F14 smoke / S4 pilot.
+Theme clustering / Obsidian-like graph tab (reuse lifecycle); F14 smoke / S4 pilot.

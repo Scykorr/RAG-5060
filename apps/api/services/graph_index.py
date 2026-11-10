@@ -1,6 +1,8 @@
 """Lexical document connectivity index (no Qdrant, no embeddings, no UI).
 
-Slice 1b: work_key / part_of, strict refers_to, cleaned entities, fixed RU lex_similar.
+Offline + corpus lifecycle (1d): per-doc artifacts, full|incremental rebuild,
+cache key = tenant + fingerprint + index_version + params_hash.
+Language rules live in configs/graph_lexicon.json — not corpus-specific facts.
 """
 
 from __future__ import annotations
@@ -8,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import threading
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -21,6 +24,8 @@ from sqlalchemy.orm import Session
 
 from apps.api.models import ChatMessage, ChatSession, Chunk, Document, DocumentVersion
 from apps.api.services import query_intent as qi
+from apps.api.services import graph_index_cache as gcache
+from apps.api.services.graph_lexicon import frozenset_field, tuple_field
 from apps.api.services.quality_state import corpus_fingerprint
 from apps.api.services.storage import data_root
 from apps.api.services.graph_text_clean import clean_chunk_for_graph
@@ -39,9 +44,9 @@ from apps.api.services.text_entities import (
 
 log = structlog.get_logger()
 
-INDEX_VERSION = 3
+INDEX_VERSION = 4
 
-# Source-site tokens observed in classic_* filenames (probe 2026-11-10).
+# Filename grammar tokens (source-site / language folder markers), not corpus content.
 SOURCE_TOKENS = frozenset({"ch", "eb"})
 LANGUAGE_MARKERS = frozenset({"russian", "english", "deutsch", "french"})
 
@@ -58,19 +63,29 @@ DEFAULT_ENTITY_MAX_WORK_FRAC = 0.15
 DEFAULT_REFERS_COMMON_WORK_DF = 3
 DEFAULT_WORK_NEIGHBOR_TOP_K = 10
 
-REFERS_GENRE_MARKERS = (
-    "роман",
-    "повесть",
-    "рассказ",
-    "поэма",
-    "стихотворение",
-    "пьеса",
-    "читал",
-    "читала",
-    "автор",
-)
+def _genre_markers() -> tuple[str, ...]:
+    return tuple_field("genre_markers") or (
+        "роман",
+        "повесть",
+        "рассказ",
+        "поэма",
+        "стихотворение",
+        "пьеса",
+        "читал",
+        "читала",
+        "автор",
+    )
 
-_AUTHOR_FIRST_NAMES = (
+
+def _genre_title_blocklist() -> frozenset[str]:
+    return frozenset_field("genre_title_blocklist") or frozenset(
+        {"рассказы", "стихотворения", "поэмы", "повести", "пьесы", "романы"}
+    )
+
+
+# Back-compat names used across layers (resolved from editable lexicon).
+REFERS_GENRE_MARKERS = _genre_markers()
+_AUTHOR_FIRST_NAMES = tuple_field("author_first_names") or (
     "александр",
     "александра",
     "федор",
@@ -85,94 +100,16 @@ _AUTHOR_FIRST_NAMES = (
     "алексей",
     "сергей",
 )
-
-PLAY_STAGE_WORDS = frozenset(
-    {
-        "действие",
-        "явление",
-        "сцена",
-        "гостиная",
-        "уходит",
-        "входит",
-        "занавес",
-        "акт",
-        "картина",
-        "пауза",
-        "ремарка",
-        "голоса",
-        "голос",
-        "тишина",
-    }
+PLAY_STAGE_WORDS = frozenset_field("play_stage_words")
+PLACE_LEMMAS = frozenset_field("place_lemmas")
+GOD_FORMS = frozenset_field("god_forms") or frozenset(
+    {"бог", "бога", "богу", "богом", "божий", "божья", "божье", "божие", "боже"}
 )
-
-PLACE_LEMMAS = frozenset(
-    {
-        "петербург",
-        "петербурге",
-        "петербурга",
-        "петербургу",
-        "петербургом",
-        "петроград",
-        "москва",
-        "москве",
-        "москвы",
-        "москву",
-        "москвой",
-        "россия",
-        "россии",
-        "россию",
-        "россией",
-        "сибирь",
-        "сибири",
-        "кавказ",
-        "кавказа",
-        "кавказе",
-        "париж",
-        "париже",
-        "парижа",
-        "европа",
-        "европе",
-        "европы",
-    }
-)
-
-GOD_FORMS = frozenset({"бог", "бога", "богу", "богом", "божий", "божья", "божье", "божие", "боже"})
+_DIMINUTIVE_NAMES = frozenset_field("diminutive_names")
 
 _PATRONYMIC_RE = re.compile(
     r"(?:ович|евич|овна|евна|ична|инична)$",
     re.UNICODE,
-)
-_DIMINUTIVE_NAMES = frozenset(
-    {
-        "маша",
-        "машенька",
-        "саша",
-        "сашенька",
-        "миша",
-        "коля",
-        "ваня",
-        "петя",
-        "ката",
-        "катя",
-        "таня",
-        "оля",
-        "даша",
-        "надя",
-        "люба",
-        "вера",
-        "соня",
-        "аня",
-        "вася",
-        "гриша",
-        "лева",
-        "лёва",
-        "серг",
-        "серёжа",
-        "сережа",
-        "анну",
-        "анна",
-        "аня",
-    }
 )
 
 
@@ -571,7 +508,7 @@ def _window(text: str, idx: int, length: int, radius: int = 48) -> str:
 
 def _has_genre_marker_near(raw: str, idx: int, length: int) -> bool:
     win = norm_ru(_window(raw, idx, length, 40))
-    return any(m in win for m in REFERS_GENRE_MARKERS)
+    return any(m in win for m in _genre_markers())
 
 
 def _quoted_span(raw: str, idx: int, length: int) -> bool:
@@ -749,10 +686,9 @@ def build_refers_phrase_index(
         # Never index author surnames as work phrases
         if n in qi.AUTHOR_ALIASES:
             return
-        # Genre-word titles ("Рассказы", "Стихотворения") are too ambiguous
-        if n in REFERS_GENRE_MARKERS or n.rstrip("иы") in REFERS_GENRE_MARKERS:
-            return
-        if n in {"рассказы", "стихотворения", "поэмы", "повести", "пьесы", "романы"}:
+        # Genre-word titles are too ambiguous (language config, not corpus titles)
+        markers = set(_genre_markers()) | _genre_title_blocklist()
+        if n in markers or n.rstrip("иы") in markers:
             return
         key = (n, doc_id)
         if key in seen:
@@ -1660,27 +1596,43 @@ def assemble_index(
 
 
 def graph_dir() -> Path:
-    p = data_root() / "graph"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    return gcache.graph_dir()
 
 
-def index_path(tenant_id: UUID | str, fingerprint: str) -> Path:
-    return graph_dir() / f"{tenant_id}_{fingerprint}_index.json"
+def index_path(
+    tenant_id: UUID | str,
+    fingerprint: str,
+    *,
+    params: GraphIndexParams | None = None,
+    params_hash_value: str | None = None,
+) -> Path:
+    ph = params_hash_value or gcache.params_hash((params or GraphIndexParams()).to_dict())
+    return gcache.index_path(
+        tenant_id,
+        fingerprint,
+        index_version=INDEX_VERSION,
+        params_hash_value=ph,
+    )
 
 
-def purge_old_indexes(tenant_id: UUID | str, keep_fingerprint: str) -> int:
-    removed = 0
-    for p in graph_dir().glob(f"{tenant_id}_*_index.json"):
-        name = p.name
-        mid = name[len(f"{tenant_id}_") : -len("_index.json")]
-        if mid != keep_fingerprint:
-            try:
-                p.unlink()
-                removed += 1
-            except OSError:
-                pass
-    return removed
+def purge_old_indexes(
+    tenant_id: UUID | str,
+    keep_fingerprint: str | Path,
+    *,
+    params: GraphIndexParams | None = None,
+    keep_n: int = gcache.KEEP_INDEX_FILES,
+) -> int:
+    """Remove stale index files; keep current path (and last N)."""
+    if isinstance(keep_fingerprint, Path):
+        keep = keep_fingerprint
+    else:
+        keep = index_path(tenant_id, str(keep_fingerprint), params=params)
+    return gcache.purge_old_indexes(tenant_id, keep, keep_n=keep_n)
+
+
+def invalidate_tenant(tenant_id: UUID | str) -> dict[str, int]:
+    """Drop indexes + doc artifacts after reset-rag / corpus clear."""
+    return gcache.invalidate_tenant_graph(tenant_id)
 
 
 def write_index_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -1699,9 +1651,15 @@ def read_index(path: Path) -> dict[str, Any] | None:
         return None
 
 
-def load_cached_index(db: Session, tenant_id: UUID) -> dict[str, Any] | None:
+def load_cached_index(db: Session, tenant_id: UUID, *, params: GraphIndexParams | None = None) -> dict[str, Any] | None:
+    params = params or GraphIndexParams()
     fp = corpus_fingerprint(db, tenant_id)
-    return read_index(index_path(tenant_id, fp))
+    ph = gcache.params_hash(params.to_dict())
+    cached = read_index(index_path(tenant_id, fp, params_hash_value=ph))
+    if cached and cached.get("fingerprint") == fp and cached.get("version") == INDEX_VERSION:
+        if cached.get("params_hash") in (None, ph):
+            return cached
+    return None
 
 
 def _active_documents(db: Session, tenant_id: UUID) -> list[tuple[Document, DocumentVersion]]:
@@ -1719,118 +1677,72 @@ def _active_documents(db: Session, tenant_id: UUID) -> list[tuple[Document, Docu
     )
 
 
-def _iter_chunks_batched(
-    db: Session,
-    tenant_id: UUID,
-    version_ids: list[UUID],
-    batch_size: int,
-) -> Iterable[tuple[str, str, str]]:
-    if not version_ids:
+def _chunks_for_version(
+    db: Session, tenant_id: UUID, version_id: UUID
+) -> list[tuple[str, int, str]]:
+    rows = (
+        db.query(Chunk.id, Chunk.ordinal, Chunk.text)
+        .filter(Chunk.tenant_id == tenant_id, Chunk.version_id == version_id)
+        .order_by(Chunk.ordinal)
+        .all()
+    )
+    return [(str(cid), int(ord_n or 0), text or "") for cid, ord_n, text in rows]
+
+
+def _apply_header_author(meta: DocMeta, hdr: dict[str, Any]) -> None:
+    if meta.author_key or not hdr.get("author"):
         return
-    for i in range(0, len(version_ids), batch_size):
-        batch = version_ids[i : i + batch_size]
-        rows = (
-            db.query(Chunk.document_id, Chunk.id, Chunk.text)
-            .filter(Chunk.tenant_id == tenant_id, Chunk.version_id.in_(batch))
-            .order_by(Chunk.document_id, Chunk.ordinal)
-            .all()
-        )
-        for doc_id, chunk_id, text in rows:
-            yield str(doc_id), str(chunk_id), text or ""
+    ak = str(hdr["author"]).strip()
+    if not ak or norm_ru(ak) in LANGUAGE_MARKERS:
+        return
+    mapped = None
+    for ru, key in qi.AUTHOR_ALIASES.items():
+        if norm_ru(ak) == ru or ak == key:
+            mapped = key
+            break
+    meta.author_key = mapped or (ak if re.fullmatch(r"[A-Z][A-Za-z\-]+", ak) else None)
+    if meta.author_key:
+        meta.author_ru = _AUTHOR_RU_BY_KEY.get(meta.author_key)
+        meta.author_source = "ingest_header"
+        meta.work_key = work_key_for(pack=meta.pack, author_key=meta.author_key, title=meta.title)
 
 
-def build_index_for_tenant(
-    db: Session,
-    tenant_id: UUID,
+def _build_doc_artifact(
     *,
-    params: GraphIndexParams | None = None,
-    force: bool = False,
+    meta: DocMeta,
+    version_id: str,
+    raw_chunks: list[tuple[str, int, str]],
+    params: GraphIndexParams,
 ) -> dict[str, Any]:
-    params = params or GraphIndexParams()
-    t0 = time.perf_counter()
-    fp = corpus_fingerprint(db, tenant_id)
-    path = index_path(tenant_id, fp)
-    if not force:
-        cached = read_index(path)
-        if cached and cached.get("fingerprint") == fp and cached.get("version") == INDEX_VERSION:
-            log.info("graph_index_cache_hit", tenant_id=str(tenant_id), fingerprint=fp)
-            return cached
-
-    rows = _active_documents(db, tenant_id)
-    docs: list[DocMeta] = []
-    version_ids: list[UUID] = []
-    for doc, ver in rows:
-        created = doc.created_at.isoformat() if doc.created_at else None
-        docs.append(
-            parse_doc_meta(
-                document_id=str(doc.id),
-                filename=ver.original_name,
-                chunk_count=int(ver.indexed_chunk_count or 0),
-                created_at=created,
-            )
-        )
-        version_ids.append(ver.id)
-    resolve_work_keys(docs)
-
-    edges: list[Edge] = []
-
-    doc_entities: dict[str, list[str]] = defaultdict(list)
-    doc_entity_chunks: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
-    doc_term_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    """Process one document into a reusable offline artifact."""
+    clean_chunks: list[dict[str, Any]] = []
+    entities: list[str] = []
+    entity_chunks: dict[str, list[str]] = defaultdict(list)
+    term_counts: Counter[str] = Counter()
     case_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"upper": 0, "lower": 0})
     pos_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"sent_start": 0, "mid": 0})
-    chunk_rows: list[tuple[str, str, str]] = []
-    chunk_total = 0
-    clean_chars_removed = 0
-    clean_chunks_touched = 0
-    clean_examples: list[dict[str, str]] = []
-    layer_ms: dict[str, int] = {}
-    by_id = {d.document_id: d for d in docs}
-    ordinal_by_doc: dict[str, int] = defaultdict(int)
-
-    t_scan = time.perf_counter()
-    for doc_id, chunk_id, text in _iter_chunks_batched(db, tenant_id, version_ids, params.chunk_batch):
-        meta = by_id.get(doc_id)
-        ord_n = ordinal_by_doc[doc_id]
-        ordinal_by_doc[doc_id] = ord_n + 1
+    chars_removed = 0
+    examples: list[dict[str, str]] = []
+    raw_texts = [t for _, _, t in raw_chunks]
+    chash = gcache.content_hash(
+        version_id=version_id, filename=meta.filename, chunk_texts=raw_texts
+    )
+    for chunk_id, ord_n, text in raw_chunks:
         clean, hdr = clean_chunk_for_graph(
-            text or "",
+            text,
             chunk_ordinal=ord_n,
             doc_meta={
-                "author_key": meta.author_key if meta else None,
-                "author_ru": meta.author_ru if meta else None,
-                "title": meta.title if meta else None,
+                "author_key": meta.author_key,
+                "author_ru": meta.author_ru,
+                "title": meta.title,
             },
         )
+        _apply_header_author(meta, hdr)
         removed = int(hdr.get("chars_removed") or 0)
-        if removed > 0:
-            clean_chars_removed += removed
-            clean_chunks_touched += 1
-            if len(clean_examples) < 5:
-                clean_examples.append(
-                    {
-                        "doc_id": doc_id,
-                        "before": (text or "")[:220],
-                        "after": clean[:220],
-                    }
-                )
-            if meta and not meta.author_key and hdr.get("author"):
-                ak = str(hdr["author"]).strip()
-                if ak and norm_ru(ak) not in LANGUAGE_MARKERS:
-                    mapped = None
-                    for ru, key in qi.AUTHOR_ALIASES.items():
-                        if norm_ru(ak) == ru or ak == key:
-                            mapped = key
-                            break
-                    meta.author_key = mapped or (ak if re.fullmatch(r"[A-Z][A-Za-z\-]+", ak) else None)
-                    if meta.author_key:
-                        meta.author_ru = _AUTHOR_RU_BY_KEY.get(meta.author_key)
-                        meta.author_source = "ingest_header"
-                        meta.work_key = work_key_for(
-                            pack=meta.pack, author_key=meta.author_key, title=meta.title
-                        )
-        chunk_rows.append((doc_id, chunk_id, clean))
-        chunk_total += 1
+        chars_removed += removed
+        if removed > 0 and len(examples) < 2:
+            examples.append({"before": (text or "")[:220], "after": clean[:220]})
+        clean_chunks.append({"id": chunk_id, "ordinal": ord_n, "text": clean})
         for m in re.finditer(r"[A-Za-zА-Яа-яЁё]{3,}", clean, flags=re.UNICODE):
             w = m.group(0)
             key = norm_ru(w)
@@ -1842,23 +1754,211 @@ def build_index_for_tenant(
                     pos_stats[key]["mid"] += 1
             else:
                 case_stats[key]["lower"] += 1
-        ents = extract_entity_candidates([clean], limit=params.entity_top_n)
-        for e in ents:
+        for e in extract_entity_candidates([clean], limit=params.entity_top_n):
             cleaned = clean_entity_surface(e) or e
             k = _entity_key(cleaned)
-            if cleaned not in doc_entities[doc_id]:
-                doc_entities[doc_id].append(cleaned)
-            if chunk_id not in doc_entity_chunks[doc_id][k]:
-                doc_entity_chunks[doc_id][k].append(chunk_id)
+            if cleaned not in entities:
+                entities.append(cleaned)
+            if chunk_id not in entity_chunks[k]:
+                entity_chunks[k].append(chunk_id)
         for tok in tokenize_lex(clean):
-            doc_term_counts[doc_id][tok] += 1
-    layer_ms["scan_clean"] = int((time.perf_counter() - t_scan) * 1000)
+            term_counts[tok] += 1
+    return {
+        "document_id": meta.document_id,
+        "version_id": version_id,
+        "filename": meta.filename,
+        "content_hash": chash,
+        "author_key": meta.author_key,
+        "author_ru": meta.author_ru,
+        "author_source": meta.author_source,
+        "title": meta.title,
+        "work_key": meta.work_key,
+        "clean_chunks": clean_chunks,
+        "entities": entities,
+        "entity_chunks": dict(entity_chunks),
+        "term_counts": dict(term_counts),
+        "case_stats": {k: dict(v) for k, v in case_stats.items()},
+        "pos_stats": {k: dict(v) for k, v in pos_stats.items()},
+        "chars_removed": chars_removed,
+        "examples": examples,
+    }
 
-    counts_by_doc = Counter(d for d, _, _ in chunk_rows)
-    for d in docs:
-        d.chunk_count = int(counts_by_doc.get(d.document_id, d.chunk_count))
+
+def _empty_index_payload(
+    *,
+    tenant_id: str,
+    fingerprint: str,
+    params: GraphIndexParams,
+    built_ms: int,
+    mode: str,
+    params_hash_value: str,
+) -> dict[str, Any]:
+    payload = assemble_index(
+        tenant_id=tenant_id,
+        fingerprint=fingerprint,
+        docs=[],
+        edges=[],
+        params=params,
+        built_ms=built_ms,
+        extra_stats={
+            "build_mode": mode,
+            "lifecycle": {
+                "added": 0,
+                "changed": 0,
+                "removed": 0,
+                "cached": 0,
+            },
+            "layer_ms": {},
+            "params_hash": params_hash_value,
+            "text_clean": {"chars_removed": 0, "chunks_touched": 0, "examples": []},
+        },
+    )
+    payload["params_hash"] = params_hash_value
+    return payload
+
+
+def build_index_for_tenant(
+    db: Session,
+    tenant_id: UUID,
+    *,
+    params: GraphIndexParams | None = None,
+    force: bool = False,
+    mode: str | None = None,
+) -> dict[str, Any]:
+    """Build connectivity index. ``mode``: full | incremental | None(auto).
+
+    Per-doc artifacts are reused when content_hash matches (incremental).
+    Global layers always recompute from the artifact set.
+    """
+    params = params or GraphIndexParams()
+    t0 = time.perf_counter()
+    fp = corpus_fingerprint(db, tenant_id)
+    ph = gcache.params_hash(params.to_dict())
+    path = index_path(tenant_id, fp, params_hash_value=ph)
+    if not force:
+        cached = read_index(path)
+        if (
+            cached
+            and cached.get("fingerprint") == fp
+            and cached.get("version") == INDEX_VERSION
+            and cached.get("params_hash") in (None, ph)
+        ):
+            log.info("graph_index_cache_hit", tenant_id=str(tenant_id), fingerprint=fp)
+            return cached
+
+    rows = _active_documents(db, tenant_id)
+    if mode in ("full", "incremental"):
+        build_mode = mode
+    else:
+        # auto: reuse per-doc caches when present; otherwise first full scan
+        build_mode = (
+            "incremental" if any(gcache.doc_cache_dir(tenant_id).glob("*.json")) else "full"
+        )
+
+    if not rows:
+        payload = _empty_index_payload(
+            tenant_id=str(tenant_id),
+            fingerprint=fp,
+            params=params,
+            built_ms=int((time.perf_counter() - t0) * 1000),
+            mode=build_mode,
+            params_hash_value=ph,
+        )
+        write_index_atomic(path, payload)
+        purge_old_indexes(tenant_id, path)
+        gcache.write_build_status(
+            tenant_id,
+            {"status": "ready", "mode": build_mode, "fingerprint": fp, "documents": 0},
+        )
+        return payload
+
+    docs: list[DocMeta] = []
+    ver_by_doc: dict[str, DocumentVersion] = {}
+    for doc, ver in rows:
+        created = doc.created_at.isoformat() if doc.created_at else None
+        meta = parse_doc_meta(
+            document_id=str(doc.id),
+            filename=ver.original_name,
+            chunk_count=int(ver.indexed_chunk_count or 0),
+            created_at=created,
+        )
+        docs.append(meta)
+        ver_by_doc[meta.document_id] = ver
     resolve_work_keys(docs)
 
+    layer_ms: dict[str, int] = {}
+    lifecycle = {"added": 0, "changed": 0, "removed": 0, "cached": 0}
+    t_scan = time.perf_counter()
+    artifacts: dict[str, dict[str, Any]] = {}
+    keep_ids = {d.document_id for d in docs}
+    lifecycle["removed"] = gcache.purge_doc_artifacts(tenant_id, keep_ids)
+
+    for meta in docs:
+        ver = ver_by_doc[meta.document_id]
+        raw_chunks = _chunks_for_version(db, tenant_id, ver.id)
+        chash = gcache.content_hash(
+            version_id=str(ver.id),
+            filename=meta.filename,
+            chunk_texts=[t for _, _, t in raw_chunks],
+        )
+        cached_art = None if build_mode == "full" else gcache.read_doc_artifact(tenant_id, meta.document_id)
+        if cached_art and cached_art.get("content_hash") == chash:
+            artifacts[meta.document_id] = cached_art
+            lifecycle["cached"] += 1
+            if cached_art.get("author_key") and not meta.author_key:
+                meta.author_key = cached_art.get("author_key")
+                meta.author_ru = cached_art.get("author_ru")
+                meta.author_source = cached_art.get("author_source") or "ingest_header"
+                meta.work_key = work_key_for(
+                    pack=meta.pack, author_key=meta.author_key, title=meta.title
+                )
+            continue
+        art = _build_doc_artifact(
+            meta=meta,
+            version_id=str(ver.id),
+            raw_chunks=raw_chunks,
+            params=params,
+        )
+        gcache.write_doc_artifact(tenant_id, meta.document_id, art)
+        artifacts[meta.document_id] = art
+        if cached_art:
+            lifecycle["changed"] += 1
+        else:
+            lifecycle["added"] += 1
+    layer_ms["scan_clean"] = int((time.perf_counter() - t_scan) * 1000)
+    resolve_work_keys(docs)
+
+    # Aggregate artifact fields into layer inputs
+    doc_entities: dict[str, list[str]] = {}
+    doc_entity_chunks: dict[str, dict[str, list[str]]] = {}
+    doc_term_counts: dict[str, Counter[str]] = {}
+    case_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"upper": 0, "lower": 0})
+    pos_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"sent_start": 0, "mid": 0})
+    chunk_rows: list[tuple[str, str, str]] = []
+    clean_chars_removed = 0
+    clean_examples: list[dict[str, str]] = []
+    chunk_total = 0
+    for meta in docs:
+        art = artifacts[meta.document_id]
+        doc_entities[meta.document_id] = list(art.get("entities") or [])
+        doc_entity_chunks[meta.document_id] = dict(art.get("entity_chunks") or {})
+        doc_term_counts[meta.document_id] = Counter(art.get("term_counts") or {})
+        for k, v in (art.get("case_stats") or {}).items():
+            case_stats[k]["upper"] += int(v.get("upper") or 0)
+            case_stats[k]["lower"] += int(v.get("lower") or 0)
+        for k, v in (art.get("pos_stats") or {}).items():
+            pos_stats[k]["sent_start"] += int(v.get("sent_start") or 0)
+            pos_stats[k]["mid"] += int(v.get("mid") or 0)
+        clean_chars_removed += int(art.get("chars_removed") or 0)
+        for ex in art.get("examples") or []:
+            if len(clean_examples) < 5:
+                clean_examples.append({"doc_id": meta.document_id, **ex})
+        for ch in art.get("clean_chunks") or []:
+            chunk_rows.append((meta.document_id, str(ch.get("id")), ch.get("text") or ""))
+            chunk_total += 1
+        meta.chunk_count = len(art.get("clean_chunks") or [])
+
+    edges: list[Edge] = []
     t_l = time.perf_counter()
     edges.extend(layer_a_edges(docs))
     layer_ms["layer_a"] = int((time.perf_counter() - t_l) * 1000)
@@ -1875,8 +1975,8 @@ def build_index_for_tenant(
     edges.extend(
         layer_c_shared_entity(
             docs=docs,
-            doc_entities=dict(doc_entities),
-            doc_entity_chunks={k: dict(v) for k, v in doc_entity_chunks.items()},
+            doc_entities=doc_entities,
+            doc_entity_chunks=doc_entity_chunks,
             case_stats={k: dict(v) for k, v in case_stats.items()},
             pos_stats={k: dict(v) for k, v in pos_stats.items()},
             params=params,
@@ -1887,7 +1987,7 @@ def build_index_for_tenant(
     t_l = time.perf_counter()
     lex_edges, lex_debug = layer_d_lex_similar(
         docs=docs,
-        doc_term_counts=dict(doc_term_counts),
+        doc_term_counts=doc_term_counts,
         params=params,
         counter=LexCandidateCounter(),
         case_stats={k: dict(v) for k, v in case_stats.items()},
@@ -1924,20 +2024,38 @@ def build_index_for_tenant(
             "source_tokens": sorted(SOURCE_TOKENS),
             "text_clean": {
                 "chars_removed": clean_chars_removed,
-                "chunks_touched": clean_chunks_touched,
+                "chunks_touched": sum(1 for a in artifacts.values() if int(a.get("chars_removed") or 0) > 0),
                 "examples": clean_examples,
             },
             "layer_ms": layer_ms,
+            "build_mode": build_mode,
+            "lifecycle": lifecycle,
+            "params_hash": ph,
         },
     )
+    payload["params_hash"] = ph
     write_index_atomic(path, payload)
-    removed = purge_old_indexes(tenant_id, fp)
+    removed = purge_old_indexes(tenant_id, path)
     stats = payload["stats"]
+    gcache.write_build_status(
+        tenant_id,
+        {
+            "status": "ready",
+            "mode": build_mode,
+            "fingerprint": fp,
+            "params_hash": ph,
+            "built_ms": built_ms,
+            "documents": stats["documents"],
+            "lifecycle": lifecycle,
+            "layer_ms": layer_ms,
+        },
+    )
     log.info(
         "graph_index_built",
         tenant_id=str(tenant_id),
         fingerprint=fp,
         built_ms=built_ms,
+        mode=build_mode,
         documents=stats["documents"],
         works=stats["works"],
         chunks=chunk_total,
@@ -1945,8 +2063,51 @@ def build_index_for_tenant(
         isolated_docs=stats["isolated_documents"],
         isolated_works=stats["isolated_works"],
         purged_old=removed,
+        lifecycle=lifecycle,
     )
     return payload
+
+
+def schedule_rebuild(
+    tenant_id: UUID,
+    *,
+    force: bool = True,
+    mode: str | None = None,
+) -> dict[str, Any]:
+    """Enqueue background rebuild; single-flight per tenant. Does not block."""
+    tid = str(tenant_id)
+    if gcache.is_build_running(tid):
+        st = gcache.read_build_status(tid) or {}
+        return {"status": "already_running", "build": st}
+    lock = gcache.tenant_lock(tid)
+    if not lock.acquire(blocking=False):
+        st = gcache.read_build_status(tid) or {}
+        return {"status": "already_running", "build": st}
+
+    gcache.set_build_running(tid, True)
+    gcache.write_build_status(
+        tid,
+        {"status": "running", "mode": mode or "auto", "started_at": datetime.now(timezone.utc).isoformat()},
+    )
+
+    def _worker() -> None:
+        from apps.api.db import SessionLocal
+
+        try:
+            with SessionLocal() as db:
+                build_index_for_tenant(db, tenant_id, force=force, mode=mode)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("graph_index_rebuild_failed", tenant_id=tid, error=type(exc).__name__)
+            gcache.write_build_status(
+                tid,
+                {"status": "error", "error": type(exc).__name__, "message": str(exc)[:300]},
+            )
+        finally:
+            gcache.set_build_running(tid, False)
+            lock.release()
+
+    threading.Thread(target=_worker, daemon=True, name=f"graph-index-{tid[:8]}").start()
+    return {"status": "started", "mode": mode or "auto"}
 
 
 def neighbors_for_document(
