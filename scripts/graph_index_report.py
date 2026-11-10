@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-BASELINE_RUN = "20261110-123456-graph-index"
+BASELINE_RUN = "20261110-133444-graph-index"
 
 LEX_GOOD = [
     ("Севастополь в декабре месяце", "Рубка леса"),
@@ -180,12 +180,16 @@ def main() -> int:
             if typ == "mentions_author" and len(mention_examples) < 10:
                 mention_examples.append(e)
             if typ.startswith("work_") and typ != "work_meta":
-                work_deg[str(e.get("source"))] += 1
-                work_deg[str(e.get("target"))] += 1
+                for node in (e.get("source"), e.get("target")):
+                    s = str(node)
+                    if s.startswith("author:"):
+                        continue
+                    work_deg[s] += 1
 
         deg_vals = sorted(deg.values())
+        rng = random.Random(42)
         lines: list[str] = []
-        lines.append("# Graph connectivity index report (slice 1c)")
+        lines.append("# Graph connectivity index report (slice 1d)")
         lines.append("")
         lines.append(f"- run_id: `{run_id}`")
         lines.append(f"- baseline: `{BASELINE_RUN}`")
@@ -194,6 +198,9 @@ def main() -> int:
         lines.append(f"- index_version: `{payload.get('version')}`")
         lines.append(f"- built_at: `{payload.get('built_at')}`")
         lines.append(f"- built_ms: `{payload.get('built_ms')}`")
+        lines.append(f"- build_mode: `{stats.get('build_mode')}`")
+        lines.append(f"- lifecycle: `{stats.get('lifecycle')}`")
+        lines.append(f"- duplicates: `{stats.get('duplicates')}`")
         lines.append("")
         lines.append("## Totals")
         lines.append("")
@@ -205,13 +212,29 @@ def main() -> int:
         lines.append(f"- themes: **{stats.get('themes')}** — {', '.join(stats.get('theme_list') or [])}")
         lines.append(f"- authors: **{stats.get('authors')}** — {', '.join((stats.get('author_list') or [])[:30])}")
         lines.append(
-            f"- isolated_documents: **{stats.get('isolated_documents')}** "
-            f"({(stats.get('isolated_documents') or 0) / max(1, stats.get('documents') or 1):.1%})"
+            f"- isolated_content: **{stats.get('isolated_content', stats.get('isolated_documents'))}** "
+            f"/ isolated_structural: **{stats.get('isolated_structural')}**"
         )
         lines.append(
             f"- isolated_works: **{stats.get('isolated_works')}** "
             f"(share={stats.get('isolated_work_share')})"
         )
+        lines.append("")
+        lines.append("## Isolated content top-20 (by size)")
+        lines.append("")
+        for row in stats.get("isolated_content_top20") or []:
+            lines.append(
+                f"- chunks={row.get('chunk_count')} reason={row.get('reason')} — "
+                f"{row.get('author_key') or '—'} / {row.get('title')} (`{row.get('document_id')}`)"
+            )
+        lines.append("")
+        lines.append("## Documents without author (manual check)")
+        lines.append("")
+        for row in stats.get("documents_without_author_preview") or []:
+            lines.append(
+                f"- {row.get('title')} · `{row.get('filename')}`\n"
+                f"  head: `{(row.get('head') or '')[:200]}`"
+            )
         lines.append("")
 
         tc = stats.get("text_clean") or {}
@@ -305,6 +328,33 @@ def main() -> int:
                 f"{i}. degree={d} frag={meta.get('fragment_count', '?')} — {meta.get('label', key)}"
             )
         lines.append("")
+        lines.append("## Top-20 authors by degree")
+        lines.append("")
+        for row in stats.get("top_authors_by_degree") or []:
+            lines.append(f"- degree={row.get('degree')} — `{row.get('node')}`")
+        lines.append("")
+
+        # refers_to precision sample (40)
+        refers = by_type.get("refers_to") or []
+        sample = refers[:]
+        rng.shuffle(sample)
+        sample = sample[:40]
+        lines.append("## refers_to precision sample (n=40, manual)")
+        lines.append("")
+        lines.append("| # | phrase | match_form | zone | context | ok? |")
+        lines.append("|---|---|---|---|---|---|")
+        form_dist = Counter((e.get("provenance") or {}).get("match_form") or "?" for e in refers)
+        for i, e in enumerate(sample, 1):
+            prov = e.get("provenance") or {}
+            ctx = (prov.get("context") or "").replace("|", "/")[:100]
+            lines.append(
+                f"| {i} | {(prov.get('phrase') or '')[:40]} | {prov.get('match_form')} | "
+                f"{prov.get('zone')} | {ctx} |  |"
+            )
+        lines.append("")
+        lines.append(f"- match_form distribution: `{dict(form_dist)}`")
+        lines.append("- estimated_precision: _(fill after manual review; target ≥80%)_")
+        lines.append("")
 
         lex_debug = stats.get("lex_debug") or {}
         lines.append("## lex_similar")
@@ -374,7 +424,6 @@ def main() -> int:
             )
         lines.append("")
 
-        rng = random.Random(42)
         for typ in (
             "mentions_author",
             "refers_to",

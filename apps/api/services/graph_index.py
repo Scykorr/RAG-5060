@@ -31,6 +31,7 @@ from apps.api.services.storage import data_root
 from apps.api.services.graph_text_clean import clean_chunk_for_graph
 from apps.api.services import graph_refers as grefer
 from apps.api.services import graph_authors as gauth
+from apps.api.services import graph_duplicates as gdup
 from apps.api.services.text_entities import (
     EDITION_STOP,
     ENTITY_DENY,
@@ -46,7 +47,7 @@ from apps.api.services.text_entities import (
 
 log = structlog.get_logger()
 
-INDEX_VERSION = 7
+INDEX_VERSION = 8
 
 # Filename grammar tokens (source-site / language folder markers), not corpus content.
 SOURCE_TOKENS = frozenset({"ch", "eb"})
@@ -194,6 +195,8 @@ class DocMeta:
     chunk_count: int = 0
     created_at: str | None = None
     author_source: str | None = None  # filename | ingest_header | text_header | work_merge
+    canonical: bool = True
+    duplicate_of: str | None = None
 
 
 @dataclass
@@ -1528,37 +1531,96 @@ def assemble_index(
     extra_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     edge_counts: Counter[str] = Counter(e.type for e in edges)
+    content_types = {
+        "refers_to",
+        "shared_entity",
+        "lex_similar",
+        "co_cited",
+        "co_cited_eval",
+        "mentions_author",
+    }
+    structural_types = {"wrote", "in_theme", "part_of", "work_meta"}
     content_linked: set[str] = set()
+    structural_linked: set[str] = set()
     for e in edges:
-        if e.type in (
-            "refers_to",
-            "shared_entity",
-            "lex_similar",
-            "co_cited",
-            "co_cited_eval",
-            "mentions_author",
-        ):
+        if e.type in content_types:
             content_linked.add(e.source)
             if not str(e.target).startswith("author:"):
                 content_linked.add(e.target)
-    isolated_docs = [d.document_id for d in docs if d.document_id not in content_linked]
+        if e.type in structural_types or e.type in content_types or e.type.startswith("work_"):
+            if not str(e.source).startswith("author:"):
+                structural_linked.add(e.source.removeprefix("work:"))
+            if not str(e.target).startswith("author:"):
+                structural_linked.add(e.target.removeprefix("work:"))
+            # also mark doc endpoints
+            if e.type in structural_types | content_types:
+                structural_linked.add(e.source)
+                if not str(e.target).startswith("author:"):
+                    structural_linked.add(e.target)
+
+    by_id = {d.document_id: d for d in docs}
+    isolated_content_ids = [d.document_id for d in docs if d.document_id not in content_linked]
+    isolated_structural_ids = [
+        d.document_id
+        for d in docs
+        if d.document_id not in structural_linked and d.work_key not in structural_linked
+    ]
+
+    def _iso_reason(d: DocMeta) -> str:
+        if d.chunk_count <= 0:
+            return "empty_after_clean"
+        # rough: no clean text signal if no chunks
+        if not d.author_key:
+            return "no_author"
+        if d.chunk_count <= 2:
+            return "short_text"
+        return "no_content_edges"
+
+    isolated_content_top = sorted(
+        [
+            {
+                "document_id": did,
+                "title": by_id[did].title,
+                "author_key": by_id[did].author_key,
+                "chunk_count": by_id[did].chunk_count,
+                "reason": _iso_reason(by_id[did]),
+            }
+            for did in isolated_content_ids
+            if did in by_id
+        ],
+        key=lambda r: (-int(r["chunk_count"] or 0), r["document_id"]),
+    )[:20]
+
     works = {d.work_key: d for d in docs}
     work_linked: set[str] = set()
     for e in edges:
         if e.type.startswith("work_") and e.type != "work_meta":
             work_linked.add(e.source.removeprefix("work:"))
-            work_linked.add(e.target.removeprefix("work:"))
+            if not str(e.target).startswith("author:"):
+                work_linked.add(e.target.removeprefix("work:"))
         if e.type in ("refers_to", "shared_entity", "lex_similar", "co_cited", "co_cited_eval"):
-            sa = next((d for d in docs if d.document_id == e.source), None)
-            sb = next((d for d in docs if d.document_id == e.target), None)
+            sa = by_id.get(e.source)
+            sb = by_id.get(e.target)
             if sa:
                 work_linked.add(sa.work_key)
             if sb:
                 work_linked.add(sb.work_key)
     isolated_works = [wk for wk in works if wk not in work_linked]
-    no_author = [d.document_id for d in docs if not d.author_key]
+    no_author = [d for d in docs if not d.author_key]
     frag_docs = [d.document_id for d in docs if d.fragment_no is not None]
     work_frag: Counter[str] = Counter(d.work_key for d in docs)
+    dup_count = sum(1 for d in docs if not d.canonical)
+
+    # Degree rankings: works vs authors separately
+    work_degree: Counter[str] = Counter()
+    author_degree: Counter[str] = Counter()
+    for e in edges:
+        for node in (e.source, e.target):
+            s = str(node)
+            if s.startswith("author:"):
+                author_degree[s] += 1
+            elif s.startswith("work:"):
+                work_degree[s] += 1
 
     themes = sorted({d.theme for d in docs})
     authors = sorted({d.author_key for d in docs if d.author_key})
@@ -1570,14 +1632,27 @@ def assemble_index(
         "theme_list": themes,
         "author_list": authors,
         "edge_counts_by_type": dict(edge_counts),
-        "isolated_documents": len(isolated_docs),
-        "isolated_document_ids_sample": isolated_docs[:20],
+        "isolated_documents": len(isolated_content_ids),  # back-compat alias
+        "isolated_content": len(isolated_content_ids),
+        "isolated_structural": len(isolated_structural_ids),
+        "isolated_content_top20": isolated_content_top,
+        "isolated_document_ids_sample": isolated_content_ids[:20],
         "isolated_works": len(isolated_works),
         "isolated_work_share": round(len(isolated_works) / max(1, len(works)), 4),
         "fragment_documents": len(frag_docs),
         "documents_without_author": len(no_author),
-        "documents_without_author_sample": no_author[:20],
+        "documents_without_author_sample": [d.document_id for d in no_author[:20]],
+        "documents_without_author_preview": [
+            {
+                "document_id": d.document_id,
+                "title": d.title,
+                "filename": d.filename,
+            }
+            for d in no_author[:40]
+        ],
         "author_source_counts": dict(Counter(d.author_source or "none" for d in docs)),
+        "duplicate_documents": dup_count,
+        "canonical_documents": sum(1 for d in docs if d.canonical),
         "top_works_by_fragments": [
             {
                 "work_key": wk,
@@ -1586,6 +1661,14 @@ def assemble_index(
                 "author_key": works[wk].author_key,
             }
             for wk, n in work_frag.most_common(20)
+        ],
+        "top_works_by_degree": [
+            {"node": wk, "degree": n}
+            for wk, n in work_degree.most_common(20)
+        ],
+        "top_authors_by_degree": [
+            {"node": ak, "degree": n}
+            for ak, n in author_degree.most_common(20)
         ],
     }
     if extra_stats:
@@ -1614,12 +1697,15 @@ def assemble_index(
                 "work_key": d.work_key,
                 "chunk_count": d.chunk_count,
                 "created_at": d.created_at,
+                "canonical": d.canonical,
+                "duplicate_of": d.duplicate_of,
             }
             for d in docs
         ],
         "edges": [e.to_dict() for e in edges],
         "stats": stats,
     }
+
 
 
 def graph_dir() -> Path:
@@ -1995,25 +2081,58 @@ def build_index_for_tenant(
             chunk_total += 1
         meta.chunk_count = len(art.get("clean_chunks") or [])
 
+    # A6: near-duplicate editions within work_key (stdlib shingles)
+    texts_by_id = {
+        did: "\n".join(ch.get("text") or "" for ch in (art.get("clean_chunks") or []))
+        for did, art in artifacts.items()
+    }
+    dup_map = gdup.mark_canonical_duplicates(docs, texts_by_id)
+    canon_ids = gdup.canonical_doc_ids(dup_map)
+    for meta in docs:
+        info = dup_map.get(meta.document_id) or {}
+        meta.canonical = bool(info.get("canonical", True))
+        meta.duplicate_of = info.get("duplicate_of")
+
+    # Rebuild global stats from canonical docs only
+    case_stats = defaultdict(lambda: {"upper": 0, "lower": 0})
+    pos_stats = defaultdict(lambda: {"sent_start": 0, "mid": 0})
+    for meta in docs:
+        if meta.document_id not in canon_ids:
+            continue
+        art = artifacts[meta.document_id]
+        for k, v in (art.get("case_stats") or {}).items():
+            case_stats[k]["upper"] += int(v.get("upper") or 0)
+            case_stats[k]["lower"] += int(v.get("lower") or 0)
+        for k, v in (art.get("pos_stats") or {}).items():
+            pos_stats[k]["sent_start"] += int(v.get("sent_start") or 0)
+            pos_stats[k]["mid"] += int(v.get("mid") or 0)
+
+    # Textual layers use canonical docs only (duplicates fold at work level)
+    docs_canon = [d for d in docs if d.document_id in canon_ids]
+    chunk_rows_canon = [r for r in chunk_rows if r[0] in canon_ids]
+    doc_entities_canon = {k: v for k, v in doc_entities.items() if k in canon_ids}
+    doc_entity_chunks_canon = {k: v for k, v in doc_entity_chunks.items() if k in canon_ids}
+    doc_term_counts_canon = {k: v for k, v in doc_term_counts.items() if k in canon_ids}
+
     edges: list[Edge] = []
     t_l = time.perf_counter()
     edges.extend(layer_a_edges(docs))
     layer_ms["layer_a"] = int((time.perf_counter() - t_l) * 1000)
 
     t_l = time.perf_counter()
-    edges.extend(layer_mentions_author(docs=docs, chunk_iter=chunk_rows))
+    edges.extend(layer_mentions_author(docs=docs_canon, chunk_iter=chunk_rows_canon))
     layer_ms["mentions_author"] = int((time.perf_counter() - t_l) * 1000)
 
     t_l = time.perf_counter()
-    edges.extend(layer_b_refers_to(docs=docs, chunk_iter=chunk_rows, params=params))
+    edges.extend(layer_b_refers_to(docs=docs_canon, chunk_iter=chunk_rows_canon, params=params))
     layer_ms["refers_to"] = int((time.perf_counter() - t_l) * 1000)
 
     t_l = time.perf_counter()
     edges.extend(
         layer_c_shared_entity(
-            docs=docs,
-            doc_entities=doc_entities,
-            doc_entity_chunks=doc_entity_chunks,
+            docs=docs_canon,
+            doc_entities=doc_entities_canon,
+            doc_entity_chunks=doc_entity_chunks_canon,
             case_stats={k: dict(v) for k, v in case_stats.items()},
             pos_stats={k: dict(v) for k, v in pos_stats.items()},
             params=params,
@@ -2023,8 +2142,8 @@ def build_index_for_tenant(
 
     t_l = time.perf_counter()
     lex_edges, lex_debug = layer_d_lex_similar(
-        docs=docs,
-        doc_term_counts=doc_term_counts,
+        docs=docs_canon,
+        doc_term_counts=doc_term_counts_canon,
         params=params,
         counter=LexCandidateCounter(),
         case_stats={k: dict(v) for k, v in case_stats.items()},
@@ -2059,6 +2178,25 @@ def build_index_for_tenant(
         built_ms=built_ms,
         extra_stats={
             "lex_debug": lex_debug,
+            "duplicates": {
+                "canonical": sum(1 for d in docs if d.canonical),
+                "duplicate": sum(1 for d in docs if not d.canonical),
+                "pairs": [
+                    {"doc": d.document_id, "duplicate_of": d.duplicate_of, "sim": (dup_map.get(d.document_id) or {}).get("sim")}
+                    for d in docs
+                    if not d.canonical
+                ][:40],
+            },
+            "documents_without_author_preview": [
+                {
+                    "document_id": d.document_id,
+                    "title": d.title,
+                    "filename": d.filename,
+                    "head": (texts_by_id.get(d.document_id) or "")[:200],
+                }
+                for d in docs
+                if not d.author_key
+            ][:40],
             "source_tokens": sorted(SOURCE_TOKENS),
             "text_clean": {
                 "chars_removed": clean_chars_removed,

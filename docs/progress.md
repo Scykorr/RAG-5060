@@ -1,5 +1,14 @@
 # Progress
 
+## 2026-11-10 — Graph connectivity 1d A6–A7 (duplicates + isolation report)
+
+- task_id: T-GRAPH-IDX-1D-A — in progress (A1–A7 done)
+- Shingle near-dupes within work_key → canonical / duplicate_of; df/stats from canonical only
+- isolated_content vs isolated_structural + top-20 reasons; author degree separate from works
+- Report: build_mode/lifecycle, refers sample×40, no-author preview; INDEX_VERSION=8
+- Tests: 58 passed
+- Next: full corpus report vs 133444 + lifecycle verify
+
 ## 2026-11-10 — Graph connectivity 1d A4–A5 (authors + text_header)
 
 - task_id: T-GRAPH-IDX-1D-A — in progress (A1–A5 done)
