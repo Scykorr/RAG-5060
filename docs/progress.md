@@ -1,5 +1,11 @@
 # Progress
 
+## 2026-11-10 — Graph connectivity index (slice 1) steps 2–3
+
+- task_id: T-GRAPH-IDX-02 / T-GRAPH-IDX-03
+- `apps/api/services/graph_index.py`: layers A (theme/author), B refers_to, C shared_entity, D lex_similar, E co_cited + JSON cache helpers
+- Unit tests `tests/unit/test_graph_index.py` — 12 passed (no DB, no Qdrant)
+
 ## 2026-11-10 — Graph connectivity index (slice 1) step 1
 
 - task_id: T-GRAPH-IDX-01
