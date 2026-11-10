@@ -9,6 +9,8 @@
 - lex_similar: fixed RU (stem+cosine+work df); prior bug = tiny TF-IDF product threshold on fragment df
 - co_cited: live vs `*-smoke`/`ping` eval sessions; quality_loop does not persist messages
 - Tests: 17 passed; report script expanded
+- New report: `artifacts/20261110-123456-graph-index/graph_index_report.md`
+- Metrics: refers_to 15578→2602; lex_similar 1→1487; works=416; isolated_docs=19 (2.7%); isolated_works=10
 
 ## 2026-11-10 — Graph connectivity index (slice 1) step 4
 
