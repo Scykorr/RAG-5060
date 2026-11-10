@@ -244,3 +244,111 @@ def test_cache_write_read_and_purge(tmp_path, monkeypatch):
     assert removed >= 1
     assert not old.exists()
     assert new.exists()
+
+
+def test_mentions_author_not_refers_to_work():
+    docs = [
+        gi.parse_doc_meta(
+            document_id="poor",
+            filename="classic_0001_Dostoevsky_Бедные_люди_aaaaaaaa.txt",
+        ),
+        gi.parse_doc_meta(
+            document_id="onegin",
+            filename="classic_0002_Pushkin_Евгений_Онегин_bbbbbbbb.txt",
+        ),
+    ]
+    chunks = [
+        ("poor", "c1", "Варенька читала Пушкина и плакала над стихами."),
+    ]
+    mentions = gi.layer_mentions_author(docs=docs, chunk_iter=chunks)
+    assert any(e.target == "author:Pushkin" and e.source == "poor" for e in mentions)
+    refers = gi.layer_b_refers_to(docs=docs, chunk_iter=chunks)
+    assert not any(e.source == "poor" and e.target == "onegin" for e in refers)
+
+
+def test_self_author_mention_skipped():
+    docs = [
+        gi.parse_doc_meta(
+            document_id="p",
+            filename="classic_0001_Pushkin_Пир_aaaaaaaa.txt",
+        ),
+    ]
+    chunks = [("p", "c1", "Пушкин писал эти строки зимой.")]
+    mentions = gi.layer_mentions_author(docs=docs, chunk_iter=chunks)
+    assert mentions == []
+
+
+def test_refers_requires_strong_form_for_common_and_one_word():
+    docs = [
+        gi.parse_doc_meta(document_id="src", filename="essay.txt"),
+        gi.parse_doc_meta(
+            document_id="rail",
+            filename="classic_0001_Nekrasov_Железная_дорога_aaaaaaaa.txt",
+        ),
+        gi.parse_doc_meta(
+            document_id="idiot",
+            filename="classic_0002_Dostoevsky_Идиот_bbbbbbbb.txt",
+        ),
+    ]
+    weak = [("src", "c1", "Он шёл вдоль железной дороги и думал о будущем.")]
+    assert gi.layer_b_refers_to(docs=docs, chunk_iter=weak) == []
+
+    strong = [("src", "c2", "В поэме «Железная дорога» Некрасов говорит о труде.")]
+    edges = gi.layer_b_refers_to(docs=docs, chunk_iter=strong)
+    assert any(e.target == "rail" for e in edges)
+    assert edges[0].provenance.get("match_form") in {"quoted", "genre_marker", "near_author"}
+
+    one_weak = [("src", "c3", "Идиот стоял у двери и молчал.")]
+    assert not any(e.target == "idiot" for e in gi.layer_b_refers_to(docs=docs, chunk_iter=one_weak))
+
+    one_strong = [("src", "c4", "Критик разобрал роман «Идиот» Достоевского.")]
+    edges2 = gi.layer_b_refers_to(docs=docs, chunk_iter=one_strong)
+    assert any(e.target == "idiot" for e in edges2)
+
+
+def test_gorky_not_from_gorko_adjective():
+    docs = [
+        gi.parse_doc_meta(document_id="src", filename="wedding.txt"),
+        gi.parse_doc_meta(
+            document_id="mother",
+            filename="classic_0001_Gorky_Мать_aaaaaaaa.txt",
+        ),
+    ]
+    weak = [("src", "c1", "Горько! Горько! — кричали гости на свадьбе.")]
+    mentions = gi.layer_mentions_author(docs=docs, chunk_iter=weak)
+    assert not any(e.target == "author:Gorky" for e in mentions)
+
+    strong = [("src", "c2", "М. Горький описал это в повести.")]
+    mentions2 = gi.layer_mentions_author(docs=docs, chunk_iter=strong)
+    assert any(e.target == "author:Gorky" for e in mentions2)
+
+
+def test_work_weight_not_linear_in_fragments():
+    docs = []
+    edges = []
+    # 20 fragment pairs all referring with weight 1 → raw_sum=20
+    for i in range(20):
+        a = gi.parse_doc_meta(
+            document_id=f"a{i}",
+            filename=f"classic_{i:04d}_ch_Tolstoy_Анна_Каренина__фрагмент_{i}_aaaaaaaa.txt",
+        )
+        b = gi.parse_doc_meta(
+            document_id=f"b{i}",
+            filename=f"classic_{100+i:04d}_Dostoevsky_Идиот__фрагмент_{i}_bbbbbbbb.txt",
+        )
+        docs.extend([a, b])
+        edges.append(
+            gi.Edge(
+                source=a.document_id,
+                target=b.document_id,
+                type="refers_to",
+                weight=1.0,
+                provenance={"phrase": "Идиот", "match_form": "quoted"},
+            )
+        )
+    work_edges = gi.aggregate_work_edges(docs, edges)
+    wr = [e for e in work_edges if e.type == "work_refers_to"]
+    assert wr
+    # linear sum would be 20; log1p(20)/sqrt(20*20) ≈ 3.04/20 ≈ 0.15
+    assert wr[0].weight < 5.0
+    assert wr[0].provenance.get("agg") == "log1p_sum_over_sqrt_frags"

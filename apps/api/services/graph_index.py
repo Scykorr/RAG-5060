@@ -23,6 +23,7 @@ from apps.api.models import ChatMessage, ChatSession, Chunk, Document, DocumentV
 from apps.api.services import query_intent as qi
 from apps.api.services.quality_state import corpus_fingerprint
 from apps.api.services.storage import data_root
+from apps.api.services.graph_text_clean import clean_chunk_for_graph
 from apps.api.services.text_entities import (
     EDITION_STOP,
     ENTITY_DENY,
@@ -38,7 +39,7 @@ from apps.api.services.text_entities import (
 
 log = structlog.get_logger()
 
-INDEX_VERSION = 2
+INDEX_VERSION = 3
 
 # Source-site tokens observed in classic_* filenames (probe 2026-11-10).
 SOURCE_TOKENS = frozenset({"ch", "eb"})
@@ -50,10 +51,40 @@ DEFAULT_SHARED_MIN = 2
 DEFAULT_SHARED_TOP_K = 8
 DEFAULT_LEX_TOP_M = 50
 DEFAULT_LEX_TOP_K = 5
-DEFAULT_LEX_MIN_SCORE = 0.08
+DEFAULT_LEX_MIN_SCORE = 0.10
 DEFAULT_REFERS_TOP_K = 10
 DEFAULT_REFERS_HUB_FRAC = 0.10
 DEFAULT_ENTITY_MAX_WORK_FRAC = 0.15
+DEFAULT_REFERS_COMMON_WORK_DF = 3
+DEFAULT_WORK_NEIGHBOR_TOP_K = 10
+
+REFERS_GENRE_MARKERS = (
+    "роман",
+    "повесть",
+    "рассказ",
+    "поэма",
+    "стихотворение",
+    "пьеса",
+    "читал",
+    "читала",
+    "автор",
+)
+
+_AUTHOR_FIRST_NAMES = (
+    "александр",
+    "александра",
+    "федор",
+    "фёдор",
+    "лев",
+    "антон",
+    "николай",
+    "михаил",
+    "иван",
+    "максим",
+    "валерий",
+    "алексей",
+    "сергей",
+)
 
 
 @dataclass
@@ -68,6 +99,8 @@ class GraphIndexParams:
     refers_top_k: int = DEFAULT_REFERS_TOP_K
     refers_hub_frac: float = DEFAULT_REFERS_HUB_FRAC
     entity_max_work_frac: float = DEFAULT_ENTITY_MAX_WORK_FRAC
+    refers_common_work_df: int = DEFAULT_REFERS_COMMON_WORK_DF
+    work_neighbor_top_k: int = DEFAULT_WORK_NEIGHBOR_TOP_K
     include_eval_cocited: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -82,6 +115,8 @@ class GraphIndexParams:
             "refers_top_k": self.refers_top_k,
             "refers_hub_frac": self.refers_hub_frac,
             "entity_max_work_frac": self.entity_max_work_frac,
+            "refers_common_work_df": self.refers_common_work_df,
+            "work_neighbor_top_k": self.work_neighbor_top_k,
             "include_eval_cocited": self.include_eval_cocited,
             "index_version": INDEX_VERSION,
         }
@@ -334,7 +369,7 @@ def same_work(a: DocMeta | None, b: DocMeta | None) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Layer B — refers_to
+# Layer B — mentions_author + refers_to (works only, strong forms)
 # ---------------------------------------------------------------------------
 
 def _significant_words(title: str) -> list[str]:
@@ -347,28 +382,203 @@ def _significant_words(title: str) -> list[str]:
     return words
 
 
-def _is_rare_proper_title_word(word: str, *, doc_df: dict[str, int], n_docs: int) -> bool:
-    if not word or not word[0].isupper():
+def _author_forms_by_key() -> dict[str, list[str]]:
+    """author_key → RU surface forms (from AUTHOR_ALIASES), longest first."""
+    out: dict[str, list[str]] = defaultdict(list)
+    for surface, key in qi.AUTHOR_ALIASES.items():
+        out[key].append(surface)
+    for key, forms in out.items():
+        out[key] = sorted(set(forms), key=len, reverse=True)
+    return dict(out)
+
+
+_AUTHOR_FORMS_CACHE: dict[str, list[str]] | None = None
+
+
+def author_forms_by_key() -> dict[str, list[str]]:
+    global _AUTHOR_FORMS_CACHE
+    if _AUTHOR_FORMS_CACHE is None:
+        _AUTHOR_FORMS_CACHE = _author_forms_by_key()
+    return _AUTHOR_FORMS_CACHE
+
+
+def _is_sentence_start(text: str, idx: int) -> bool:
+    """True if idx is at the start of a sentence / dialogue turn."""
+    j = idx - 1
+    while j >= 0 and text[j] in " \t«\"“„":
+        j -= 1
+    if j < 0:
+        return True
+    if text[j] in ".!?\n—–":
+        return True
+    return False
+
+
+def _window(text: str, idx: int, length: int, radius: int = 48) -> str:
+    a = max(0, idx - radius)
+    b = min(len(text), idx + length + radius)
+    return text[a:b]
+
+
+def _has_genre_marker_near(raw: str, idx: int, length: int) -> bool:
+    win = norm_ru(_window(raw, idx, length, 40))
+    return any(m in win for m in REFERS_GENRE_MARKERS)
+
+
+def _quoted_span(raw: str, idx: int, length: int) -> bool:
+    left = raw[max(0, idx - 1) : idx]
+    right = raw[idx + length : idx + length + 1]
+    quotes = set("«»\"“”„'")
+    if left and left in quotes:
+        return True
+    if right and right in quotes:
+        return True
+    # opening quote a few chars before
+    pre = raw[max(0, idx - 2) : idx]
+    return any(c in quotes for c in pre)
+
+
+def _capitalized_mid_sentence(raw: str, idx: int) -> bool:
+    if idx >= len(raw) or not raw[idx].isupper():
         return False
-    n = norm_ru(word)
-    if len(n) < 6:
-        return False
-    if n in REFERS_STOP_PHRASES or n in STOP or n in RU_FUNCTION_WORDS or n in EDITION_STOP:
-        return False
-    df = doc_df.get(n, 0)
-    if n_docs > 0 and df > max(1, int(0.01 * n_docs)):
-        return False
-    return True
+    return not _is_sentence_start(raw, idx)
+
+
+def classify_refers_match(
+    raw: str,
+    idx: int,
+    match_len: int,
+    *,
+    multiword: bool,
+    requires_strong: bool,
+    near_author: bool,
+) -> str | None:
+    """Return match_form or None if the hit must be discarded."""
+    if _quoted_span(raw, idx, match_len):
+        return "quoted"
+    if near_author:
+        return "near_author"
+    if _has_genre_marker_near(raw, idx, match_len):
+        return "genre_marker"
+    if _capitalized_mid_sentence(raw, idx):
+        return "capitalized"
+    if requires_strong:
+        return None
+    if multiword:
+        return "multiword_plain"
+    return None
+
+
+def find_author_mentions_in_text(raw: str) -> list[tuple[str, str, int, int]]:
+    """Return (author_key, surface, start, end) for capitalized / initialed mentions.
+
+    Lowercase adjective-like forms (горько, горький as mid-sentence lower) are skipped
+    unless initials or a known first name sits next to the surname.
+    """
+    if not raw:
+        return []
+    body = norm_ru(raw)
+    hits: list[tuple[str, str, int, int]] = []
+    forms = author_forms_by_key()
+    # Initials + surname: «М. Горький», «Л. Н. Толстой», «Ф.М.Достоевский»
+    init_pat = re.compile(
+        r"(?<![0-9A-Za-zА-Яа-яЁё])([A-ZА-ЯЁ]\.\s*){1,3}"
+        r"([A-ZА-ЯЁ][a-zа-яёA-ZА-ЯЁ\-]{2,40})"
+        r"(?![0-9A-Za-zА-Яа-яЁё])",
+        re.UNICODE,
+    )
+    for m in init_pat.finditer(raw):
+        surname = m.group(2)
+        sn = norm_ru(surname)
+        for key, surfaces in forms.items():
+            if sn in surfaces or any(sn.startswith(stem_ru(s)) and abs(len(sn) - len(s)) <= 2 for s in surfaces):
+                hits.append((key, m.group(0), m.start(), m.end()))
+                break
+
+    for key, surfaces in forms.items():
+        for surface in surfaces:
+            start = 0
+            while True:
+                idx = body.find(surface, start)
+                if idx < 0:
+                    break
+                end = idx + len(surface)
+                left_ok = idx == 0 or not body[idx - 1].isalnum()
+                right_ok = end >= len(body) or not body[end].isalnum()
+                start = idx + 1
+                if not (left_ok and right_ok):
+                    continue
+                # Map to raw index (norm_ru only lowercases / ё→е; lengths match for Cyrillic)
+                raw_ch = raw[idx] if idx < len(raw) else ""
+                win = norm_ru(_window(raw, idx, len(surface), 24))
+                has_first = any(fn in win for fn in _AUTHOR_FIRST_NAMES)
+                has_initials = bool(
+                    re.search(
+                        r"[A-ZА-ЯЁ]\.\s*" + re.escape(surface[:1]),
+                        raw[max(0, idx - 8) : end + 1],
+                    )
+                )
+                if raw_ch.isupper() or has_first or has_initials:
+                    hits.append((key, raw[idx:end], idx, end))
+    # Dedup overlapping (keep longer surface)
+    hits.sort(key=lambda h: (h[2], -(h[3] - h[2])))
+    out: list[tuple[str, str, int, int]] = []
+    last_end = -1
+    for h in hits:
+        if h[2] < last_end:
+            continue
+        out.append(h)
+        last_end = h[3]
+    return out
+
+
+def layer_mentions_author(
+    *,
+    docs: list[DocMeta],
+    chunk_iter: Iterable[tuple[str, str, str]],
+) -> list[Edge]:
+    """document → author:<key> when clean text mentions another author."""
+    by_id = {d.document_id: d for d in docs}
+    # doc -> author_key -> {chunks, snips}
+    hits: dict[str, dict[str, dict[str, Any]]] = defaultdict(
+        lambda: defaultdict(lambda: {"chunks": [], "snips": []})
+    )
+    for doc_id, chunk_id, text in chunk_iter:
+        raw = text or ""
+        src = by_id.get(doc_id)
+        for key, surface, idx, end in find_author_mentions_in_text(raw):
+            if src and src.author_key and key == src.author_key:
+                continue  # self-mention
+            bucket = hits[doc_id][key]
+            if chunk_id not in bucket["chunks"]:
+                bucket["chunks"].append(chunk_id)
+            if len(bucket["snips"]) < 3:
+                bucket["snips"].append(_context_snip(raw, idx, end - idx))
+
+    edges: list[Edge] = []
+    for doc_id, by_auth in hits.items():
+        for key, info in by_auth.items():
+            edges.append(
+                Edge(
+                    source=doc_id,
+                    target=f"author:{key}",
+                    type="mentions_author",
+                    weight=float(len(info["chunks"])),
+                    provenance={
+                        "author_key": key,
+                        "chunk_ids": info["chunks"][:5],
+                        "context": (info["snips"][0] if info["snips"] else "")[:160],
+                        "contexts": info["snips"][:3],
+                    },
+                )
+            )
+    return edges
 
 
 def build_refers_phrase_index(
     docs: list[DocMeta],
-    *,
-    title_token_df: dict[str, int] | None = None,
 ) -> list[tuple[str, str, str, bool]]:
-    """(norm_phrase, document_id, surface, is_multiword) longest-first."""
-    title_token_df = title_token_df or {}
-    n_docs = max(1, len(docs))
+    """(norm_phrase, document_id, surface, is_multiword) — titles only, no author names."""
     items: list[tuple[str, str, str, bool]] = []
     seen: set[tuple[str, str]] = set()
 
@@ -381,37 +591,35 @@ def build_refers_phrase_index(
             return
         if n in REFERS_STOP_PHRASES or n in STOP or n in EDITION_STOP:
             return
+        # Never index author surnames as work phrases
+        if n in qi.AUTHOR_ALIASES:
+            return
         key = (n, doc_id)
         if key in seen:
             return
         seen.add(key)
         items.append((n, doc_id, s, multi))
 
-    # author RU full forms (not Latin filename tokens)
     for d in docs:
         words = _significant_words(d.title)
         if len(words) >= 2:
             add(" ".join(words), d.document_id, multi=True)
             add(d.title, d.document_id, multi=True)
         elif len(words) == 1:
-            w = words[0]
-            if _is_rare_proper_title_word(w, doc_df=title_token_df, n_docs=n_docs):
-                add(w, d.document_id, multi=False)
-        if d.author_ru:
-            for ru, key in qi.AUTHOR_ALIASES.items():
-                if key == d.author_key:
-                    add(ru, d.document_id, multi=False)
+            add(words[0], d.document_id, multi=False)
+            add(d.title, d.document_id, multi=False)
 
     items.sort(key=lambda x: (-len(x[0]), x[0], x[1]))
     return items
 
 
-def _word_boundary_find(body: str, phrase: str) -> list[int]:
-    """Find phrase starts with alnum boundaries; allow last-word stem for multiword."""
-    hits: list[int] = []
+def _word_boundary_find(
+    body: str, phrase: str, *, allow_multi_stem: bool = True
+) -> list[tuple[int, int, bool]]:
+    """Find (start, length, exact) with alnum boundaries; optional multiword stem."""
+    hits: list[tuple[int, int, bool]] = []
     if not phrase:
         return hits
-    # exact
     start = 0
     while True:
         idx = body.find(phrase, start)
@@ -421,11 +629,10 @@ def _word_boundary_find(body: str, phrase: str) -> list[int]:
         left_ok = idx == 0 or not body[idx - 1].isalnum()
         right_ok = end >= len(body) or not body[end].isalnum()
         if left_ok and right_ok:
-            hits.append(idx)
+            hits.append((idx, len(phrase), True))
         start = idx + 1
-    if hits:
+    if hits or not allow_multi_stem:
         return hits
-    # multiword: stem first + last tokens (handles «Героя нашего времени»)
     parts = phrase.split()
     if len(parts) < 2:
         return hits
@@ -440,11 +647,12 @@ def _word_boundary_find(body: str, phrase: str) -> list[int]:
     else:
         mid_re = r"\s+"
     pat = re.compile(
-        rf"(?<![0-9a-zа-я]){re.escape(first_stem)}[a-zа-я]{{0,4}}{mid_re}{re.escape(last_stem)}[a-zа-я]{{0,4}}(?![0-9a-zа-я])",
+        rf"(?<![0-9a-zа-я]){re.escape(first_stem)}[a-zа-я]{{0,4}}{mid_re}"
+        rf"{re.escape(last_stem)}[a-zа-я]{{0,4}}(?![0-9a-zа-я])",
         re.UNICODE,
     )
     for m in pat.finditer(body):
-        hits.append(m.start())
+        hits.append((m.start(), m.end() - m.start(), False))
     return hits
 
 
@@ -454,67 +662,152 @@ def _context_snip(text: str, idx: int, phrase_len: int, width: int = 120) -> str
     return re.sub(r"\s+", " ", text[a:b]).strip()
 
 
+def _phrase_work_df(
+    phrases: list[tuple[str, str, str, bool]],
+    docs: list[DocMeta],
+    chunk_iter: Iterable[tuple[str, str, str]],
+) -> dict[str, int]:
+    """How many distinct works contain each norm phrase (plain occurrence)."""
+    by_id = {d.document_id: d for d in docs}
+    uniq = sorted({p[0] for p in phrases}, key=len, reverse=True)
+    # first-token bucket to avoid scanning every phrase on every chunk
+    by_first: dict[str, list[str]] = defaultdict(list)
+    for p in uniq:
+        first = p.split()[0] if p else p
+        by_first[first].append(p)
+    works_with: dict[str, set[str]] = defaultdict(set)
+    for doc_id, _cid, text in chunk_iter:
+        meta = by_id.get(doc_id)
+        if not meta:
+            continue
+        body = norm_ru(text or "")
+        if not body:
+            continue
+        seen_here: set[str] = set()
+        # candidate first tokens present in body
+        for first, plist in by_first.items():
+            if first not in body:
+                continue
+            for phrase_n in plist:
+                if phrase_n in seen_here:
+                    continue
+                if _word_boundary_find(body, phrase_n, allow_multi_stem=False):
+                    seen_here.add(phrase_n)
+                    works_with[phrase_n].add(meta.work_key)
+    return {p: len(ws) for p, ws in works_with.items()}
+
+
+def _authors_in_chunk(raw: str) -> set[str]:
+    return {k for k, _, _, _ in find_author_mentions_in_text(raw)}
+
+
 def layer_b_refers_to(
     *,
     docs: list[DocMeta],
     chunk_iter: Iterable[tuple[str, str, str]],
     params: GraphIndexParams | None = None,
+    phrase_work_df: dict[str, int] | None = None,
 ) -> list[Edge]:
+    """refers_to: only work-title phrases; common/one-word need a strong form."""
     params = params or GraphIndexParams()
     by_id = {d.document_id: d for d in docs}
-    # title token df across documents (for rare proper filter)
-    title_df: Counter[str] = Counter()
-    for d in docs:
-        for w in _significant_words(d.title):
-            title_df[norm_ru(w)] += 1
-    phrases = build_refers_phrase_index(docs, title_token_df=dict(title_df))
+    phrases = build_refers_phrase_index(docs)
     if not phrases:
         return []
 
-    # src -> target -> {chunks, phrase, multi, snips}
+    chunk_list = list(chunk_iter)
+    df = phrase_work_df if phrase_work_df is not None else _phrase_work_df(phrases, docs, chunk_list)
+
+    # first-token index: first_norm_token -> list of phrase tuples
+    by_first: dict[str, list[tuple[str, str, str, bool]]] = defaultdict(list)
+    for item in phrases:
+        first = item[0].split()[0]
+        by_first[first].append(item)
+
     hits: dict[str, dict[str, dict[str, Any]]] = defaultdict(
-        lambda: defaultdict(lambda: {"chunks": [], "phrase": "", "multi": False, "snips": []})
+        lambda: defaultdict(
+            lambda: {
+                "chunks": [],
+                "phrase": "",
+                "multi": False,
+                "snips": [],
+                "match_form": "",
+            }
+        )
     )
 
-    edition_pat = re.compile(
-        r"(полное\s+собрание|действующие\s+лица|оглавление|содержание|примечания)",
-        re.I,
-    )
-
-    for doc_id, chunk_id, text in chunk_iter:
+    for doc_id, chunk_id, text in chunk_list:
         raw = text or ""
         body = norm_ru(raw)
-        if not body or edition_pat.search(body[:400]):
-            # still search but skip if chunk looks like TOC-only short header
-            if len(body) < 80 and edition_pat.search(body):
-                continue
+        if not body:
+            continue
         src_meta = by_id.get(doc_id)
-        for phrase_n, target_id, surface, multi in phrases:
+        chunk_authors = _authors_in_chunk(raw)
+        candidates: list[tuple[str, str, str, bool]] = []
+        for first, plist in by_first.items():
+            if first in body:
+                candidates.extend(plist)
+        # longest first
+        candidates.sort(key=lambda x: -len(x[0]))
+        matched_spans: list[tuple[int, int]] = []
+        for phrase_n, target_id, surface, multi in candidates:
             if target_id == doc_id:
                 continue
             tgt_meta = by_id.get(target_id)
             if same_work(src_meta, tgt_meta):
                 continue
-            found = _word_boundary_find(body, phrase_n)
+            found = _word_boundary_find(body, phrase_n, allow_multi_stem=multi)
             if not found:
                 continue
+            work_df = df.get(phrase_n, 0)
+            common_phrase = work_df > params.refers_common_work_df
+            near_author = bool(tgt_meta and tgt_meta.author_key and tgt_meta.author_key in chunk_authors)
+            accepted = False
+            best_form = ""
+            best_idx = found[0][0]
+            best_len = found[0][1]
+            for idx, mlen, exact in found:
+                # skip if overlaps a longer already-accepted match
+                if any(not (idx + mlen <= a or idx >= b) for a, b in matched_spans):
+                    continue
+                # One-word titles, common collocations, and inflected (stem) hits
+                # need a strong form; plain multiword exact hits may pass.
+                requires_strong = (not multi) or common_phrase or (not exact)
+                form = classify_refers_match(
+                    raw,
+                    idx,
+                    mlen,
+                    multiword=multi,
+                    requires_strong=requires_strong,
+                    near_author=near_author,
+                )
+                if form:
+                    accepted = True
+                    best_form = form
+                    best_idx = idx
+                    best_len = mlen
+                    break
+            if not accepted:
+                continue
+            matched_spans.append((best_idx, best_idx + best_len))
             bucket = hits[doc_id][target_id]
             if chunk_id not in bucket["chunks"]:
                 bucket["chunks"].append(chunk_id)
             if not bucket["phrase"] or (multi and not bucket["multi"]):
                 bucket["phrase"] = surface
                 bucket["multi"] = multi
+                bucket["match_form"] = best_form
+            elif not bucket["match_form"]:
+                bucket["match_form"] = best_form
             if len(bucket["snips"]) < 2:
-                # map approx index on original via norm (best-effort)
-                bucket["snips"].append(_context_snip(raw, min(found[0], max(0, len(raw) - 1)), len(surface)))
+                bucket["snips"].append(_context_snip(raw, best_idx, best_len))
 
-    # build edges with filters
     raw_edges: list[Edge] = []
     for src, by_tgt in hits.items():
         for tgt, info in by_tgt.items():
             w = float(len(info["chunks"]))
             multi = bool(info["multi"])
-            if w < 2 and not multi:
+            if w < 1:
                 continue
             raw_edges.append(
                 Edge(
@@ -527,25 +820,13 @@ def layer_b_refers_to(
                         "phrase": info["phrase"],
                         "context": (info["snips"][0] if info["snips"] else "")[:160],
                         "multiword": multi,
+                        "match_form": info["match_form"],
                     },
                 )
             )
 
-    # hub filter: one-word phrase pointing to target from >X% sources
-    n_docs = max(1, len(docs))
-    inbound: dict[str, list[Edge]] = defaultdict(list)
-    for e in raw_edges:
-        inbound[e.target].append(e)
-    drop_targets: set[str] = set()
-    for tgt, lst in inbound.items():
-        one_word = [e for e in lst if not (e.provenance or {}).get("multiword")]
-        if len(one_word) > params.refers_hub_frac * n_docs:
-            drop_targets.add(tgt)
-    filtered = [e for e in raw_edges if not (e.target in drop_targets and not (e.provenance or {}).get("multiword"))]
-
-    # per-source top-k
     by_src: dict[str, list[Edge]] = defaultdict(list)
-    for e in filtered:
+    for e in raw_edges:
         by_src[e.source].append(e)
     out: list[Edge] = []
     for src, lst in by_src.items():
@@ -890,18 +1171,48 @@ def layer_e_co_cited(
     return edges
 
 
-def aggregate_work_edges(docs: list[DocMeta], edges: list[Edge]) -> list[Edge]:
-    """Collapse doc↔doc textual edges into work↔work for reporting/future UI."""
+def aggregate_work_edges(
+    docs: list[DocMeta],
+    edges: list[Edge],
+    *,
+    top_k: int = DEFAULT_WORK_NEIGHBOR_TOP_K,
+) -> list[Edge]:
+    """Collapse doc↔doc textual edges into work↔work.
+
+    Weight uses ``log1p(sum_w) / sqrt(frag_a * frag_b)`` so long novels do not
+    dominate purely by fragment count. ``mentions_author`` aggregates to
+    work → author.
+    """
     by_id = {d.document_id: d for d in docs}
+    frag_count: Counter[str] = Counter(d.work_key for d in docs)
     textual = {"refers_to", "shared_entity", "lex_similar", "co_cited", "co_cited_eval"}
     acc: dict[tuple[str, str, str], dict[str, Any]] = {}
+    author_acc: dict[tuple[str, str], dict[str, Any]] = {}
+
     for e in edges:
+        if e.type == "mentions_author":
+            sa = by_id.get(e.source)
+            if not sa or not str(e.target).startswith("author:"):
+                continue
+            key = (sa.work_key, e.target)
+            slot = author_acc.setdefault(key, {"weight": 0.0, "examples": [], "chunks": 0})
+            slot["weight"] += float(e.weight)
+            slot["chunks"] += int(e.weight)
+            if len(slot["examples"]) < 5:
+                slot["examples"].append(
+                    {
+                        "doc": e.source,
+                        "weight": e.weight,
+                        "provenance": e.provenance,
+                    }
+                )
+            continue
         if e.type not in textual:
             continue
         sa, sb = by_id.get(e.source), by_id.get(e.target)
         if not sa or not sb or same_work(sa, sb):
             continue
-        wa, wb = f"work:{sa.work_key}", f"work:{sb.work_key}"
+        wa, wb = sa.work_key, sb.work_key
         if wa > wb:
             wa, wb = wb, wa
         key = (wa, wb, e.type)
@@ -916,15 +1227,53 @@ def aggregate_work_edges(docs: list[DocMeta], edges: list[Edge]) -> list[Edge]:
                     "provenance": e.provenance,
                 }
             )
-    out: list[Edge] = []
+
+    candidates: list[Edge] = []
     for (wa, wb, typ), slot in acc.items():
+        fa = max(1, frag_count.get(wa, 1))
+        fb = max(1, frag_count.get(wb, 1))
+        # log1p(sum) / sqrt(frags) — see docstring
+        w = math.log1p(float(slot["weight"])) / math.sqrt(fa * fb)
+        candidates.append(
+            Edge(
+                source=f"work:{wa}",
+                target=f"work:{wb}",
+                type=f"work_{typ}",
+                weight=round(w, 4),
+                provenance={
+                    "examples": slot["examples"],
+                    "from_docs": True,
+                    "raw_sum": round(float(slot["weight"]), 4),
+                    "fragment_count_a": fa,
+                    "fragment_count_b": fb,
+                    "agg": "log1p_sum_over_sqrt_frags",
+                },
+            )
+        )
+
+    by_work_type: dict[tuple[str, str], list[Edge]] = defaultdict(list)
+    for e in candidates:
+        typ = e.type
+        by_work_type[(e.source, typ)].append(e)
+        by_work_type[(e.target, typ)].append(e)
+    kept: set[int] = set()
+    for lst in by_work_type.values():
+        lst.sort(key=lambda e: (-e.weight, e.source, e.target))
+        for e in lst[:top_k]:
+            kept.add(id(e))
+    out = [e for e in candidates if id(e) in kept]
+
+    for (wk, author_node), slot in author_acc.items():
         out.append(
             Edge(
-                source=wa,
-                target=wb,
-                type=f"work_{typ}",
-                weight=round(float(slot["weight"]), 4),
-                provenance={"examples": slot["examples"], "from_docs": True},
+                source=f"work:{wk}",
+                target=author_node,
+                type="work_mentions_author",
+                weight=float(slot["chunks"]),
+                provenance={
+                    "examples": slot["examples"],
+                    "chunk_mentions": slot["chunks"],
+                },
             )
         )
     return out
@@ -947,9 +1296,17 @@ def assemble_index(
     edge_counts: Counter[str] = Counter(e.type for e in edges)
     content_linked: set[str] = set()
     for e in edges:
-        if e.type in ("refers_to", "shared_entity", "lex_similar", "co_cited", "co_cited_eval"):
+        if e.type in (
+            "refers_to",
+            "shared_entity",
+            "lex_similar",
+            "co_cited",
+            "co_cited_eval",
+            "mentions_author",
+        ):
             content_linked.add(e.source)
-            content_linked.add(e.target)
+            if not str(e.target).startswith("author:"):
+                content_linked.add(e.target)
     isolated_docs = [d.document_id for d in docs if d.document_id not in content_linked]
     works = {d.work_key: d for d in docs}
     work_linked: set[str] = set()
@@ -1136,7 +1493,6 @@ def build_index_for_tenant(
     resolve_work_keys(docs)
 
     edges: list[Edge] = []
-    edges.extend(layer_a_edges(docs))
 
     doc_entities: dict[str, list[str]] = defaultdict(list)
     doc_entity_chunks: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
@@ -1144,19 +1500,64 @@ def build_index_for_tenant(
     case_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"upper": 0, "lower": 0})
     chunk_rows: list[tuple[str, str, str]] = []
     chunk_total = 0
+    clean_chars_removed = 0
+    clean_chunks_touched = 0
+    clean_examples: list[dict[str, str]] = []
+    by_id = {d.document_id: d for d in docs}
+    # ordinals per doc for front-matter strip
+    ordinal_by_doc: dict[str, int] = defaultdict(int)
 
     for doc_id, chunk_id, text in _iter_chunks_batched(db, tenant_id, version_ids, params.chunk_batch):
-        chunk_rows.append((doc_id, chunk_id, text))
+        meta = by_id.get(doc_id)
+        ord_n = ordinal_by_doc[doc_id]
+        ordinal_by_doc[doc_id] = ord_n + 1
+        clean, hdr = clean_chunk_for_graph(
+            text or "",
+            chunk_ordinal=ord_n,
+            doc_meta={
+                "author_key": meta.author_key if meta else None,
+                "author_ru": meta.author_ru if meta else None,
+                "title": meta.title if meta else None,
+            },
+        )
+        removed = int(hdr.get("chars_removed") or 0)
+        if removed > 0:
+            clean_chars_removed += removed
+            clean_chunks_touched += 1
+            if len(clean_examples) < 5:
+                clean_examples.append(
+                    {
+                        "doc_id": doc_id,
+                        "before": (text or "")[:220],
+                        "after": clean[:220],
+                    }
+                )
+            # author from ingest header for authorless docs
+            if meta and not meta.author_key and hdr.get("author"):
+                ak = str(hdr["author"]).strip()
+                if ak and norm_ru(ak) not in LANGUAGE_MARKERS:
+                    # map RU alias or keep Latin key
+                    mapped = None
+                    for ru, key in qi.AUTHOR_ALIASES.items():
+                        if norm_ru(ak) == ru or ak == key:
+                            mapped = key
+                            break
+                    meta.author_key = mapped or (ak if re.fullmatch(r"[A-Z][A-Za-z\-]+", ak) else None)
+                    if meta.author_key:
+                        meta.author_ru = _AUTHOR_RU_BY_KEY.get(meta.author_key)
+                        meta.work_key = work_key_for(
+                            pack=meta.pack, author_key=meta.author_key, title=meta.title
+                        )
+        chunk_rows.append((doc_id, chunk_id, clean))
         chunk_total += 1
-        # case stats for first letters of tokens
-        for m in re.finditer(r"[A-Za-zА-Яа-яЁё]{3,}", text or "", flags=re.UNICODE):
+        for m in re.finditer(r"[A-Za-zА-Яа-яЁё]{3,}", clean, flags=re.UNICODE):
             w = m.group(0)
             key = norm_ru(w)
             if w[0].isupper():
                 case_stats[key]["upper"] += 1
             else:
                 case_stats[key]["lower"] += 1
-        ents = extract_entity_candidates([text], limit=params.entity_top_n)
+        ents = extract_entity_candidates([clean], limit=params.entity_top_n)
         for e in ents:
             cleaned = clean_entity_surface(e) or e
             k = _entity_key(cleaned)
@@ -1164,13 +1565,16 @@ def build_index_for_tenant(
                 doc_entities[doc_id].append(cleaned)
             if chunk_id not in doc_entity_chunks[doc_id][k]:
                 doc_entity_chunks[doc_id][k].append(chunk_id)
-        for tok in tokenize_lex(text):
+        for tok in tokenize_lex(clean):
             doc_term_counts[doc_id][tok] += 1
 
     counts_by_doc = Counter(d for d, _, _ in chunk_rows)
     for d in docs:
         d.chunk_count = int(counts_by_doc.get(d.document_id, d.chunk_count))
+    resolve_work_keys(docs)
 
+    edges.extend(layer_a_edges(docs))
+    edges.extend(layer_mentions_author(docs=docs, chunk_iter=chunk_rows))
     edges.extend(layer_b_refers_to(docs=docs, chunk_iter=chunk_rows, params=params))
     edges.extend(
         layer_c_shared_entity(
@@ -1198,7 +1602,7 @@ def build_index_for_tenant(
         if len(ids) >= 2:
             cite_lists.append((ids, is_eval_chat_session(title)))
     edges.extend(layer_e_co_cited(cite_lists, include_eval=params.include_eval_cocited))
-    edges.extend(aggregate_work_edges(docs, edges))
+    edges.extend(aggregate_work_edges(docs, edges, top_k=params.work_neighbor_top_k))
 
     built_ms = int((time.perf_counter() - t0) * 1000)
     payload = assemble_index(
@@ -1208,7 +1612,15 @@ def build_index_for_tenant(
         edges=edges,
         params=params,
         built_ms=built_ms,
-        extra_stats={"lex_debug": lex_debug, "source_tokens": sorted(SOURCE_TOKENS)},
+        extra_stats={
+            "lex_debug": lex_debug,
+            "source_tokens": sorted(SOURCE_TOKENS),
+            "text_clean": {
+                "chars_removed": clean_chars_removed,
+                "chunks_touched": clean_chunks_touched,
+                "examples": clean_examples,
+            },
+        },
     )
     write_index_atomic(path, payload)
     removed = purge_old_indexes(tenant_id, fp)

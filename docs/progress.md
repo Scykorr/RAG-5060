@@ -1,5 +1,14 @@
 # Progress
 
+## 2026-11-10 — Graph connectivity index slice 1c step 2 (mentions_author + refers)
+
+- task_id: T-GRAPH-IDX-1C
+- `mentions_author`: capitalized/initialed author forms → `author:<key>`; self-mentions skipped; no refers_to on works via surname
+- `refers_to`: titles only; one-word/common/inflected hits need strong form (quoted|capitalized|genre_marker|near_author); `match_form` in provenance
+- Build path cleans chunks via `clean_chunk_for_graph` before all textual layers; INDEX_VERSION=3
+- Work aggregation: `log1p(sum)/sqrt(frag_a*frag_b)` + top-k; `work_mentions_author`
+- Tests: 23 passed (graph_index + graph_text_clean)
+
 ## 2026-11-10 — Graph connectivity index slice 1c step 1 (text clean)
 
 - task_id: T-GRAPH-IDX-1C
