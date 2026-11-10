@@ -45,7 +45,7 @@ from apps.api.services.text_entities import (
 
 log = structlog.get_logger()
 
-INDEX_VERSION = 5
+INDEX_VERSION = 6
 
 # Filename grammar tokens (source-site / language folder markers), not corpus content.
 SOURCE_TOKENS = frozenset({"ch", "eb"})
@@ -107,9 +107,36 @@ GOD_FORMS = frozenset_field("god_forms") or frozenset(
     {"бог", "бога", "богу", "богом", "божий", "божья", "божье", "божие", "боже"}
 )
 _DIMINUTIVE_NAMES = frozenset_field("diminutive_names")
+_DIMINUTIVE_SUFFIXES = tuple_field("diminutive_suffixes") or (
+    "ша",
+    "шка",
+    "нька",
+    "енька",
+    "ушка",
+    "юша",
+    "юшка",
+)
+_EDITORIAL_STOP = frozenset_field("editorial_stop_terms")
+_SPEECH_VERBS = frozenset(
+    stem_ru(v) for v in (tuple_field("speech_verbs") or ())
+) | frozenset(norm_ru(v) for v in (tuple_field("speech_verbs") or ()))
+_ENTITY_INTERJECTIONS = frozenset_field("entity_interjections") or frozenset(
+    {"господи", "извините", "ей-богу", "ейбогу", "простите", "пожалуйста"}
+)
+_RELIGIOUS_WEAK = frozenset_field("god_forms") | frozenset(
+    {"бог", "господь", "христос", "евангелие", "господи"}
+)
 
 _PATRONYMIC_RE = re.compile(
     r"(?:ович|евич|овна|евна|ична|инична)$",
+    re.UNICODE,
+)
+_SURNAME_RE = re.compile(
+    r"(?:ов|ев|ёв|ин|ын|ский|ская|цкая|енко|дзе|швили)$",
+    re.UNICODE,
+)
+_PRONOUN_PARTICLE_RE = re.compile(
+    r"(?:^|-)(?:то|нибудь|либо)$",
     re.UNICODE,
 )
 
@@ -492,11 +519,16 @@ def author_forms_by_key() -> dict[str, list[str]]:
 def _is_sentence_start(text: str, idx: int) -> bool:
     """True if idx is at the start of a sentence / dialogue turn."""
     j = idx - 1
-    while j >= 0 and text[j] in " \t«\"“„":
+    while j >= 0 and text[j] in " \t«\"“„'":
         j -= 1
     if j < 0:
         return True
-    if text[j] in ".!?\n—–":
+    if text[j] in ".!?\n":
+        return True
+    # Dialogue dash forms: "— Word", "-- Word", "– Word"
+    if text[j] in "—–":
+        return True
+    if text[j] == "-" and (j == 0 or text[j - 1] in "\n \t-"):
         return True
     return False
 
@@ -787,22 +819,46 @@ def layer_b_refers_to(
 # ---------------------------------------------------------------------------
 
 
+def stem_entity_token(token: str) -> str:
+    """Aggressive stem for entity lemma grouping (Анна/Анной → анн)."""
+    n = norm_ru(token)
+    if not n:
+        return ""
+    if n in GOD_FORMS or n in _RELIGIOUS_WEAK:
+        return "бог" if n.startswith("бог") or n in {"боже", "божий", "божья", "божье", "божие"} else (
+            "господь" if n.startswith("господ") else (
+                "христос" if n.startswith("христ") else (
+                    "евангелие" if n.startswith("евангел") else stem_ru(n)
+                )
+            )
+        )
+    if len(n) < 4:
+        return n
+    for end in (
+        "ами", "ями", "ого", "ему", "ому", "ыми", "ими",
+        "ах", "ях", "ов", "ев", "ей", "ом", "ем", "ам", "ям",
+        "ую", "юю", "ая", "яя", "ые", "ие", "ых", "их",
+        "ой", "ий", "ый", "а", "я", "у", "ю", "е", "ы", "и", "о",
+    ):
+        if n.endswith(end) and len(n) - len(end) >= 3:
+            return n[: len(n) - len(end)]
+    return n
+
+
 def _entity_key(surface: str) -> str:
     parts = norm_ru(surface).split()
     if not parts:
         return ""
-    # God forms collapse
-    if len(parts) == 1 and parts[0] in GOD_FORMS:
-        return "бог"
-    parts = [stem_ru(p) for p in parts]
-    return " ".join(parts)
+    if len(parts) == 1 and (parts[0] in GOD_FORMS or parts[0] in _RELIGIOUS_WEAK):
+        return stem_entity_token(parts[0])
+    return " ".join(stem_entity_token(p) for p in parts)
 
 
 def entity_kind(surface: str, key: str) -> str:
     n = norm_ru(surface)
-    if key == "бог" or n in GOD_FORMS:
-        return "other"
-    if n in PLACE_LEMMAS or key in {stem_ru(p) for p in PLACE_LEMMAS}:
+    if key in {"бог", "господь", "христос", "евангелие"} or n in GOD_FORMS:
+        return "religious"
+    if n in PLACE_LEMMAS or key in {stem_entity_token(p) for p in PLACE_LEMMAS}:
         return "place"
     return "entity"
 
@@ -816,12 +872,18 @@ def is_noise_entity_surface(surface: str, *, author_keys: set[str]) -> bool:
     n = norm_ru(s)
     if n in PLAY_STAGE_WORDS or n in EDITION_STOP:
         return True
-    # Latin author filename tokens
+    if n in _ENTITY_INTERJECTIONS:
+        return True
+    # «Какое-то», «кто-нибудь»
+    compact = n.replace("-", "")
+    if _PRONOUN_PARTICLE_RE.search(n) or compact.endswith(("нибудь", "либо")) and "-" in n:
+        return True
+    if n.endswith("-то") or n.endswith("то") and "-" in n:
+        return True
     if re.fullmatch(r"[A-Za-z][A-Za-z\-]{2,}", s) and (
         s in author_keys or s.capitalize() in author_keys
     ):
         return True
-    # Corpus author RU surnames → covered by author nodes
     if n in qi.AUTHOR_ALIASES:
         return True
     return False
@@ -845,10 +907,43 @@ def drop_by_sentence_position(
     low, up = int(st.get("lower", 0)), int(st.get("upper", 0))
     if low + up >= 6 and low > up * 2:
         return True
-    # Short discourse / interrogative tokens that rarely appear mid-clause
     if total_pos >= 3 and start_n >= 3 and mid_n == 0 and len(n) <= 10:
         return True
     return False
+
+
+def entity_strength(
+    surface: str,
+    key: str,
+    *,
+    work_df: Counter[str],
+    n_works: int,
+    kind: str,
+) -> str:
+    """Return strong | weak | drop for a grouped entity."""
+    n = norm_ru(surface)
+    parts = n.split()
+    df = int(work_df.get(key, 0))
+    if key in _ENTITY_INTERJECTIONS or n in _ENTITY_INTERJECTIONS:
+        return "drop"
+    if kind == "religious" or key in {"бог", "господь", "христос", "евангелие"}:
+        return "weak"
+    max_df = max(2, int(0.15 * n_works))
+    if df > max_df:
+        return "drop"
+    if kind == "place":
+        return "strong" if df <= 3 else "weak"
+    if len(parts) >= 2:
+        # multiword name / ФИО
+        return "strong"
+    # single token — check surface (before aggressive lemma stem) for surname endings
+    last = parts[-1] if parts else n
+    if df <= 3 and (_SURNAME_RE.search(last) or _SURNAME_RE.search(key)):
+        return "strong"
+    if df <= 1 and len(key) >= 4:
+        return "strong"  # unique proper
+    # lone given name without patronymic/surname
+    return "weak"
 
 
 def layer_c_shared_entity(
@@ -860,12 +955,7 @@ def layer_c_shared_entity(
     pos_stats: dict[str, dict[str, int]] | None = None,
     params: GraphIndexParams | None = None,
 ) -> list[Edge]:
-    """Shared entities with sentence-start / place / stage filters.
-
-    ``pos_stats``: token_norm -> {sent_start, mid} counts from clean_text.
-    Edge requires ≥2 shared entities and at least one non-place.
-    Place entities contribute weight ×0.3.
-    """
+    """Shared entities grouped by lemma; require ≥1 strong; weight by groups."""
     params = params or GraphIndexParams()
     doc_entity_chunks = doc_entity_chunks or {}
     case_stats = case_stats or {}
@@ -895,6 +985,8 @@ def layer_c_shared_entity(
             k = _entity_key(cleaned)
             if len(k) < 3 or k in EDITION_STOP or k in PLAY_STAGE_WORDS:
                 continue
+            if k in _ENTITY_INTERJECTIONS:
+                continue
             keys.add(k)
             display_count[k][cleaned] += 1
             kinds[k] = entity_kind(cleaned, k)
@@ -910,9 +1002,18 @@ def layer_c_shared_entity(
         for e in ents:
             work_df[e] += 1
 
-    max_df = max(2, int(params.entity_max_work_frac * n_works))
-    valid = {e for e, c in work_df.items() if 2 <= c <= max_df}
+    strength: dict[str, str] = {}
+    for k in list(work_df.keys()):
+        strength[k] = entity_strength(
+            display.get(k, k),
+            k,
+            work_df=work_df,
+            n_works=n_works,
+            kind=kinds.get(k, "entity"),
+        )
 
+    # drop-strength entities out
+    valid = {e for e, c in work_df.items() if c >= 2 and strength.get(e) != "drop"}
     for doc_id in list(doc_keys.keys()):
         doc_keys[doc_id] = {e for e in doc_keys[doc_id] if e in valid}
 
@@ -933,15 +1034,15 @@ def layer_c_shared_entity(
 
     def idf(ent: str) -> float:
         base = math.log((n_works + 1) / (work_df[ent] + 1)) + 1.0
-        if kinds.get(ent) == "place":
+        st = strength.get(ent, "weak")
+        if st == "weak" or kinds.get(ent) in {"place", "religious"}:
             return base * 0.3
         return base
 
     neigh: dict[str, list[tuple[float, str, set[str]]]] = defaultdict(list)
     for (a, b), common in pair_common.items():
-        if len(common) < params.shared_min_entities:
-            continue
-        if not any(kinds.get(e) != "place" for e in common):
+        strong_common = {e for e in common if strength.get(e) == "strong"}
+        if not strong_common:
             continue
         w = sum(idf(e) for e in common)
         neigh[a].append((w, b, common))
@@ -957,6 +1058,16 @@ def layer_c_shared_entity(
                 continue
             seen.add(key)
             chunk_ids: list[str] = []
+            # dedupe display labels
+            labels: list[str] = []
+            seen_labels: set[str] = set()
+            for e in sorted(common):
+                lab = display.get(e, e)
+                nl = norm_ru(lab)
+                if nl in seen_labels:
+                    continue
+                seen_labels.add(nl)
+                labels.append(lab)
             for ent in sorted(common)[:5]:
                 for did in (src, tgt):
                     for cid in (doc_entity_chunks.get(did) or {}).get(ent, [])[:2]:
@@ -969,8 +1080,13 @@ def layer_c_shared_entity(
                     type="shared_entity",
                     weight=round(float(w), 4),
                     provenance={
-                        "entities": [display.get(e, e) for e in sorted(common)[:10]],
-                        "entity_kinds": {display.get(e, e): kinds.get(e, "entity") for e in sorted(common)[:10]},
+                        "entities": labels[:10],
+                        "entity_kinds": {
+                            display.get(e, e): kinds.get(e, "entity") for e in sorted(common)[:10]
+                        },
+                        "entity_strength": {
+                            display.get(e, e): strength.get(e, "weak") for e in sorted(common)[:10]
+                        },
                         "chunk_ids": chunk_ids[:3],
                     },
                 )
@@ -987,8 +1103,64 @@ class LexCandidateCounter:
         self.comparisons = 0
 
 
-def is_lex_proper_token(stem: str, case_stats: dict[str, dict[str, int]] | None) -> bool:
-    """True for name-like tokens (mostly capitalized / patronymic / diminutive / latin)."""
+def is_name_surface_form(
+    form: str,
+    *,
+    case_stats: dict[str, dict[str, int]],
+    pos_stats: dict[str, dict[str, int]],
+) -> bool:
+    """Proper name if ≥70% of occurrences are capitalized mid-sentence/replica."""
+    n = norm_ru(form)
+    st = case_stats.get(n) or {}
+    ps = pos_stats.get(n) or {}
+    mid = int(ps.get("mid", 0))
+    start = int(ps.get("sent_start", 0))
+    low = int(st.get("lower", 0))
+    total = mid + start + low
+    if total < 2:
+        # sparse: if only capitalized mid evidence
+        up = int(st.get("upper", 0))
+        return up >= 1 and low == 0 and mid >= start
+    return (mid / total) >= 0.7
+
+
+def collect_lex_name_exclusions(
+    case_stats: dict[str, dict[str, int]] | None,
+    pos_stats: dict[str, dict[str, int]] | None = None,
+) -> tuple[set[str], set[str]]:
+    """Return (exact_stems, prefix_bases≥4) to drop from lex terms."""
+    case_stats = case_stats or {}
+    pos_stats = pos_stats or {}
+    name_forms = [
+        f for f in case_stats if is_name_surface_form(f, case_stats=case_stats, pos_stats=pos_stats)
+    ]
+    name_stems = {stem_ru(f) for f in name_forms}
+    name_stems |= {stem_ru(d) for d in _DIMINUTIVE_NAMES}
+    name_stems |= set(_DIMINUTIVE_NAMES)
+    # diminutive suffixes off name bases
+    for form in list(name_forms):
+        n = norm_ru(form)
+        for suf in _DIMINUTIVE_SUFFIXES:
+            if n.endswith(suf) and len(n) - len(suf) >= 3:
+                name_stems.add(stem_ru(n[: -len(suf)]))
+                name_stems.add(n)
+    bases = {s[:4] for s in name_stems if len(s) >= 4}
+    # expand: any name stem sharing base
+    for s in list(name_stems):
+        if len(s) >= 4:
+            bases.add(s[:4])
+    return name_stems, bases
+
+
+def is_lex_proper_token(
+    stem: str,
+    case_stats: dict[str, dict[str, int]] | None,
+    *,
+    name_stems: set[str] | None = None,
+    name_bases: set[str] | None = None,
+    pos_stats: dict[str, dict[str, int]] | None = None,
+) -> bool:
+    """True for name-like / editorial / speech tokens to exclude from lex."""
     n = norm_ru(stem)
     if not n or len(n) < 4:
         return True
@@ -996,11 +1168,22 @@ def is_lex_proper_token(stem: str, case_stats: dict[str, dict[str, int]] | None)
         return True
     if n in _DIMINUTIVE_NAMES or n in qi.AUTHOR_ALIASES:
         return True
-    # patronymic endings on the stem or unstemmed lookalikes
+    if n in _EDITORIAL_STOP or stem_ru(n) in _EDITORIAL_STOP:
+        return True
+    if n in _SPEECH_VERBS or stem_ru(n) in _SPEECH_VERBS:
+        return True
     if _PATRONYMIC_RE.search(n) or n.endswith(("ович", "евич", "овн", "евн", "ичн", "инич")):
         return True
-    st = (case_stats or {}).get(n) or (case_stats or {}).get(stem) or {}
-    # Also check unstemmed keys that fold to this stem
+    ns = name_stems or set()
+    nb = name_bases or set()
+    if n in ns or stem_ru(n) in ns:
+        return True
+    if len(n) >= 4 and n[:4] in nb:
+        return True
+    # fallback case bias on unstemmed keys
+    if is_name_surface_form(n, case_stats=case_stats or {}, pos_stats=pos_stats or {}):
+        return True
+    st = (case_stats or {}).get(n) or {}
     up = int(st.get("upper", 0))
     low = int(st.get("lower", 0))
     if up + low >= 4 and up >= low * 2:
@@ -1015,24 +1198,26 @@ def layer_d_lex_similar(
     params: GraphIndexParams | None = None,
     counter: LexCandidateCounter | None = None,
     case_stats: dict[str, dict[str, int]] | None = None,
+    pos_stats: dict[str, dict[str, int]] | None = None,
 ) -> tuple[list[Edge], dict[str, Any]]:
-    """Lex similarity on content words (no proper names / patronymics).
-
-    Requires ≥3 shared terms in provenance. Default threshold 0.10.
-    """
+    """Lex similarity on content words (names excluded before stemming)."""
     params = params or GraphIndexParams()
     case_stats = case_stats or {}
+    pos_stats = pos_stats or {}
     by_id = {d.document_id: d for d in docs}
     n_docs = len(doc_term_counts)
     if n_docs < 2:
         return [], {"scores": [], "bugfix": "n_docs<2"}
 
-    # Drop name-like stems before df / vectors
+    name_stems, name_bases = collect_lex_name_exclusions(case_stats, pos_stats)
+
     cleaned_counts: dict[str, Counter[str]] = {}
     for doc_id, counts in doc_term_counts.items():
         c2: Counter[str] = Counter()
         for t, c in counts.items():
-            if is_lex_proper_token(t, case_stats):
+            if is_lex_proper_token(
+                t, case_stats, name_stems=name_stems, name_bases=name_bases, pos_stats=pos_stats
+            ):
                 continue
             c2[t] = c
         cleaned_counts[doc_id] = c2
@@ -1089,18 +1274,20 @@ def layer_d_lex_similar(
                 shared = set(va) & set(vb)
                 if len(shared) < 3:
                     continue
-                score = sum(va[x] * vb[x] for x in shared)
+                contrib = {x: va[x] * vb[x] for x in shared}
+                score = sum(contrib.values())
+                if score <= 0:
+                    continue
+                if max(contrib.values()) > 0.5 * score:
+                    continue
                 key = (a, b) if a < b else (b, a)
                 prev = pair_best.get(key)
                 if not prev or score > prev[0]:
                     pair_best[key] = (score, sorted(shared)[:8])
 
     scores = sorted(s for s, _ in pair_best.values())
-    # Adaptive floor: keep params.lex_min_score, but if many name-only ghosts remain
-    # below ~0.10 they are already filtered by shared>=3 + proper drop.
     thresh = params.lex_min_score
     if scores:
-        # optional percentile nudge toward 0.10–0.12
         p40 = scores[max(0, int(0.40 * (len(scores) - 1)))]
         if p40 > thresh:
             thresh = min(0.12, max(thresh, round(p40, 3)))
@@ -1143,8 +1330,9 @@ def layer_d_lex_similar(
         hist[bucket] += 1
     debug = {
         "bugfix": (
-            "Name/patronymic stems removed; require ≥3 shared content terms; "
-            "threshold default 0.10 with optional percentile nudge."
+            "Names detected on surface forms before stemming (≥0.7 mid-cap); "
+            "diminutives/editorial/speech dropped; ≥3 shared terms; "
+            "single-term >50% score rejected."
         ),
         "score_count": len(scores),
         "score_min": min(scores) if scores else None,
@@ -1155,8 +1343,10 @@ def layer_d_lex_similar(
         "threshold_requested": params.lex_min_score,
         "near_threshold": near_thresh,
         "comparisons": counter.comparisons if counter else None,
+        "name_stems_sample": sorted(name_stems)[:30],
     }
     return edges, debug
+
 
 
 # ---------------------------------------------------------------------------
@@ -1841,6 +2031,7 @@ def build_index_for_tenant(
         params=params,
         counter=LexCandidateCounter(),
         case_stats={k: dict(v) for k, v in case_stats.items()},
+        pos_stats={k: dict(v) for k, v in pos_stats.items()},
     )
     edges.extend(lex_edges)
     layer_ms["lex_similar"] = int((time.perf_counter() - t_l) * 1000)

@@ -23,13 +23,17 @@ LEX_GOOD = [
     ("Два письма к М Ганди", "Письмо студенту о праве"),
     ("О безумии", "Патриотизм и правительство"),
     ("Борис Годунов", "Евгений Онегин"),
-    ("Мёртвые души", "Мертвые души"),
+]
+LEX_SAME_WORK = [
+    ("Мёртвые души", "Мертвые души"),  # ё/е — one work_key after merge
 ]
 LEX_BAD = [
     ("Накануне", "Анна Каренина"),
     ("Ревизор", "Анна Каренина"),
     ("Яков Пасынков", "Анна Каренина"),
     ("Арап Петра Великого", "Муму"),
+    ("Слабое сердце", "Отцы и дети"),
+    ("Обручение Даши", "Отцы и дети"),
 ]
 
 
@@ -323,10 +327,32 @@ def main() -> int:
         for a, b in LEX_GOOD:
             found = _title_pair_found(edges, docs, a, b)
             lines.append(f"  - {'found' if found else 'absent'}: {a} ↔ {b}")
+        lines.append("- same-work checks (must share one work_key, no lex edge needed):")
+        from apps.api.services.text_entities import norm_ru as _nr
+
+        for a, b in LEX_SAME_WORK:
+            ids_a = [d for d in docs if _nr(a) in _nr(d.get("title") or "")]
+            ids_b = [d for d in docs if _nr(b) in _nr(d.get("title") or "")]
+            keys = {_nr(d.get("work_key") or "") for d in ids_a + ids_b}
+            same = len(keys) == 1 and bool(keys)
+            lines.append(
+                f"  - {'same_work' if same else 'SPLIT'}: {a} ↔ {b} keys={sorted(keys)[:3]}"
+            )
         lines.append("- regression bad pairs:")
         for a, b in LEX_BAD:
             found = _title_pair_found(edges, docs, a, b)
             lines.append(f"  - {'found' if found else 'absent'}: {a} ↔ {b}")
+        # Gandhi pair diagnostics (why absent?)
+        g_a, g_b = "Два письма к М Ганди", "Письмо студенту о праве"
+        ga = next((d for d in docs if _nr(g_a) in _nr(d.get("title") or "")), None)
+        gb = next((d for d in docs if _nr(g_b) in _nr(d.get("title") or "")), None)
+        if ga and gb:
+            lines.append(
+                f"- Gandhi pair docs: {ga.get('document_id')} / {gb.get('document_id')} "
+                f"titles={ga.get('title')!r} / {gb.get('title')!r}"
+            )
+        else:
+            lines.append(f"- Gandhi pair docs missing in corpus: a={bool(ga)} b={bool(gb)}")
         lines.append("")
 
         lines.append("## Merged works / author_source samples")

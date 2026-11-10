@@ -163,14 +163,14 @@ def test_lex_similar_russian_texts():
             )
         )
     docs.extend(extra)
+    # Content stems only (no character names — those are excluded by A2).
     terms = {
-        "a": Counter({"онегин": 6, "татьяна": 4, "дуэль": 3, "садик": 2}),
-        "b": Counter({"онегин": 5, "татьяна": 3, "дуэль": 2, "пиршество": 2}),
+        "a": Counter({"дуэль": 5, "садик": 4, "романс": 4, "строф": 3}),
+        "b": Counter({"дуэль": 5, "садик": 4, "романс": 3, "пиршество": 3}),
         "c": Counter({"медведь": 6, "тайга": 5, "берлога": 3}),
     }
     for i in range(8):
         terms[f"e{i}"] = Counter({"рассказик": 3, "дачник": 2, f"уник{i}": 2})
-    # sprinkle shared rare stems into extras so df_work(онегин)>=2 already from a,b
     counter = gi.LexCandidateCounter()
     edges, debug = gi.layer_d_lex_similar(
         docs=docs,

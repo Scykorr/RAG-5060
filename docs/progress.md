@@ -1,5 +1,14 @@
 # Progress
 
+## 2026-11-10 — Graph connectivity 1d A2–A3 (lex names + entity strength)
+
+- task_id: T-GRAPH-IDX-1D-A — in progress (A1–A3 done)
+- Lex: name forms from mid-cap ≥0.7 before stemming; diminutive/editorial/speech dropped; ≥3 shared; single-term >50% rejected
+- Entities: lemma group (Анна/Анной); strong/weak/drop; ≥1 strong required; interjections/pronouns dropped
+- Regression list: bad += Слабое сердце/Обручение Даши ↔ Отцы и дети; Мёртвые души → same_work check
+- Tests: 36 passed; INDEX_VERSION=6
+- Next: A4 mentions zones + A5 text_header
+
 ## 2026-11-10 — Graph connectivity 1d A1 (strict refers_to)
 
 - task_id: T-GRAPH-IDX-1D-A — in progress (A1 done)
