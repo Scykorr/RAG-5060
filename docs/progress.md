@@ -1,5 +1,13 @@
 # Progress
 
+## 2026-11-10 — Graph connectivity index slice 1c step 1 (text clean)
+
+- task_id: T-GRAPH-IDX-1C
+- `apps/api/services/graph_text_clean.py`: `clean_chunk_for_graph` strips real corpus banners (`Автор/папка`+`Файл`, `Автор`+`Название/часть`, fetch-ru-corpus `Произведение/Источник/Фрагмент`) and early-chunk edition/title lines; returns `header_info` (author/title/file)
+- Ingestion does not inject these labels — they live in source `.txt`; cleaner parses observed formats, not guessed regexes
+- Tests: `tests/unit/test_graph_text_clean.py` — 6 passed
+- Next: mentions_author + strong-form refers_to
+
 ## 2026-11-10 — Graph connectivity index slice 1b (cleanup)
 
 - task_id: T-GRAPH-IDX-1B
