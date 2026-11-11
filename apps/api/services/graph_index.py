@@ -57,9 +57,11 @@ DEFAULT_CHUNK_BATCH = 200
 DEFAULT_ENTITY_TOP_N = 20
 DEFAULT_SHARED_MIN = 2
 DEFAULT_SHARED_TOP_K = 8
-DEFAULT_LEX_TOP_M = 50
+DEFAULT_LEX_TOP_M = 200
 DEFAULT_LEX_TOP_K = 5
-DEFAULT_LEX_MIN_SCORE = 0.10
+DEFAULT_LEX_MIN_SCORE = 0.08
+DEFAULT_LEX_WEAK_FLOOR = 0.05
+DEFAULT_LEX_BURST_MAX_RATIO = 0.90
 DEFAULT_REFERS_TOP_K = 10
 DEFAULT_REFERS_HUB_FRAC = 0.10
 DEFAULT_ENTITY_MAX_WORK_FRAC = 0.15
@@ -122,6 +124,9 @@ _EDITORIAL_STOP = frozenset_field("editorial_stop_terms")
 _SPEECH_VERBS = frozenset(
     stem_ru(v) for v in (tuple_field("speech_verbs") or ())
 ) | frozenset(norm_ru(v) for v in (tuple_field("speech_verbs") or ()))
+_STYLE_BURST_HINTS = frozenset(
+    stem_ru(v) for v in (tuple_field("style_burst_hints") or ())
+) | frozenset(norm_ru(v) for v in (tuple_field("style_burst_hints") or ()))
 _ENTITY_INTERJECTIONS = frozenset_field("entity_interjections") or frozenset(
     {"господи", "извините", "ей-богу", "ейбогу", "простите", "пожалуйста"}
 )
@@ -152,12 +157,16 @@ class GraphIndexParams:
     lex_top_m: int = DEFAULT_LEX_TOP_M
     lex_top_k: int = DEFAULT_LEX_TOP_K
     lex_min_score: float = DEFAULT_LEX_MIN_SCORE
+    lex_weak_floor: float = DEFAULT_LEX_WEAK_FLOOR
+    lex_burst_max_ratio: float = DEFAULT_LEX_BURST_MAX_RATIO
     refers_top_k: int = DEFAULT_REFERS_TOP_K
     refers_hub_frac: float = DEFAULT_REFERS_HUB_FRAC
     entity_max_work_frac: float = DEFAULT_ENTITY_MAX_WORK_FRAC
     refers_common_work_df: int = DEFAULT_REFERS_COMMON_WORK_DF
     work_neighbor_top_k: int = DEFAULT_WORK_NEIGHBOR_TOP_K
     include_eval_cocited: bool = False
+    co_cited_max_sources: int = 6
+    co_cited_weight_scale: float = 0.5
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -168,12 +177,16 @@ class GraphIndexParams:
             "lex_top_m": self.lex_top_m,
             "lex_top_k": self.lex_top_k,
             "lex_min_score": self.lex_min_score,
+            "lex_weak_floor": self.lex_weak_floor,
+            "lex_burst_max_ratio": self.lex_burst_max_ratio,
             "refers_top_k": self.refers_top_k,
             "refers_hub_frac": self.refers_hub_frac,
             "entity_max_work_frac": self.entity_max_work_frac,
             "refers_common_work_df": self.refers_common_work_df,
             "work_neighbor_top_k": self.work_neighbor_top_k,
             "include_eval_cocited": self.include_eval_cocited,
+            "co_cited_max_sources": self.co_cited_max_sources,
+            "co_cited_weight_scale": self.co_cited_weight_scale,
             "index_version": INDEX_VERSION,
         }
 
@@ -1198,6 +1211,10 @@ def is_lex_proper_token(
         return True
     if n in _SPEECH_VERBS or stem_ru(n) in _SPEECH_VERBS:
         return True
+    if n in PLAY_STAGE_WORDS or stem_ru(n) in PLAY_STAGE_WORDS:
+        return True
+    if n in _STYLE_BURST_HINTS or stem_ru(n) in _STYLE_BURST_HINTS:
+        return True
     if _PATRONYMIC_RE.search(n) or n.endswith(("ович", "евич", "овн", "евн", "ичн", "инич")):
         return True
     ns = name_stems or set()
@@ -1217,6 +1234,14 @@ def is_lex_proper_token(
     return False
 
 
+def _expected_df(n_works: int, cf: int) -> float:
+    """Expected df if ``cf`` occurrences placed independently into works."""
+    if n_works <= 0 or cf <= 0:
+        return 0.0
+    # 1 - (1 - 1/N)^cf
+    return float(n_works) * (1.0 - (1.0 - 1.0 / n_works) ** cf)
+
+
 def layer_d_lex_similar(
     *,
     docs: list[DocMeta],
@@ -1226,150 +1251,236 @@ def layer_d_lex_similar(
     case_stats: dict[str, dict[str, int]] | None = None,
     pos_stats: dict[str, dict[str, int]] | None = None,
 ) -> tuple[list[Edge], dict[str, Any]]:
-    """Lex similarity on content words (names excluded before stemming)."""
+    """Work-level lex similarity: sublinear TF-IDF, burstiness filter, mutual kNN."""
     params = params or GraphIndexParams()
     case_stats = case_stats or {}
     pos_stats = pos_stats or {}
     by_id = {d.document_id: d for d in docs}
-    n_docs = len(doc_term_counts)
-    if n_docs < 2:
-        return [], {"scores": [], "bugfix": "n_docs<2"}
+    if len(doc_term_counts) < 1:
+        return [], {"scores": [], "bugfix": "empty"}
 
     name_stems, name_bases = collect_lex_name_exclusions(case_stats, pos_stats)
 
-    cleaned_counts: dict[str, Counter[str]] = {}
+    # Aggregate cleaned terms per work (canonical docs only expected)
+    work_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    work_rep: dict[str, str] = {}  # work_key → representative document_id
+    all_works = {d.work_key for d in docs}
     for doc_id, counts in doc_term_counts.items():
-        c2: Counter[str] = Counter()
+        meta = by_id.get(doc_id)
+        if not meta:
+            continue
+        wk = meta.work_key
+        work_rep.setdefault(wk, doc_id)
         for t, c in counts.items():
             if is_lex_proper_token(
                 t, case_stats, name_stems=name_stems, name_bases=name_bases, pos_stats=pos_stats
             ):
                 continue
-            c2[t] = c
-        cleaned_counts[doc_id] = c2
+            work_counts[wk][t] += int(c)
 
-    work_terms: dict[str, set[str]] = defaultdict(set)
-    for doc_id, counts in cleaned_counts.items():
-        meta = by_id.get(doc_id)
-        wk = meta.work_key if meta else doc_id
-        work_terms[wk] |= set(counts.keys())
-    n_works = max(1, len(work_terms))
+    # IDF / df caps use all works in the layer (including sparse ones)
+    n_works = max(1, len(all_works) or len(work_counts))
+    if len(work_counts) < 2:
+        return [], {"scores": [], "bugfix": "n_works<2"}
+
     df_work: Counter[str] = Counter()
-    for terms in work_terms.values():
-        for t in terms:
+    cf_work: Counter[str] = Counter()
+    for counts in work_counts.values():
+        for t, c in counts.items():
             df_work[t] += 1
+            cf_work[t] += int(c)
 
     max_df = max(2, int(0.30 * n_works))
+    kept_terms: set[str] = set()
+    dropped_burst: list[tuple[float, str, int, float]] = []
+    kept_burst: list[tuple[float, str, int, float]] = []
+    for t, dw in df_work.items():
+        if dw < 2 or dw > max_df:
+            continue
+        cf = int(cf_work.get(t, 0))
+        exp = _expected_df(n_works, cf)
+        ratio = (dw / exp) if exp > 0 else 1.0
+        # style-like: df close to random expectation → drop
+        if ratio >= params.lex_burst_max_ratio and dw >= max(3, int(0.05 * n_works)):
+            dropped_burst.append((ratio, t, dw, exp))
+            continue
+        kept_terms.add(t)
+        kept_burst.append((ratio, t, dw, exp))
+
+    dropped_burst.sort(reverse=True)
+    kept_burst.sort()
+
+    # Work vectors: sublinear tf * idf, top-M
     vectors: dict[str, dict[str, float]] = {}
     inv: dict[str, list[str]] = defaultdict(list)
-    for doc_id, counts in cleaned_counts.items():
-        total = sum(counts.values()) or 1
+    for wk, counts in work_counts.items():
         scored: list[tuple[float, str]] = []
         for t, c in counts.items():
-            dw = df_work.get(t, 0)
-            if dw <= 1 or dw > max_df:
+            if t not in kept_terms:
                 continue
-            tf = c / total
+            dw = df_work[t]
+            tf = 1.0 + math.log(float(c))
             idf = math.log((n_works + 1) / (dw + 1)) + 1.0
             scored.append((tf * idf, t))
         scored.sort(reverse=True)
         top = scored[: params.lex_top_m]
-        vec = {t: s for s, t in top}
-        if not vec:
+        if not top:
             continue
+        vec = {t: s for s, t in top}
         norm = math.sqrt(sum(v * v for v in vec.values())) or 1.0
-        vectors[doc_id] = {t: v / norm for t, v in vec.items()}
-        for t in vectors[doc_id]:
-            inv[t].append(doc_id)
+        vectors[wk] = {t: v / norm for t, v in vec.items()}
+        for t in vectors[wk]:
+            inv[t].append(wk)
 
     pair_best: dict[tuple[str, str], tuple[float, list[str]]] = {}
     for t, members in inv.items():
-        if df_work.get(t, 0) > max(3, int(0.20 * n_works)):
-            continue
         mem = sorted(set(members))
+        if len(mem) > 80:
+            continue
         for i in range(len(mem)):
             for j in range(i + 1, len(mem)):
                 a, b = mem[i], mem[j]
-                if same_work(by_id.get(a), by_id.get(b)):
-                    continue
                 if counter is not None:
                     counter.comparisons += 1
                 va, vb = vectors.get(a), vectors.get(b)
                 if not va or not vb:
                     continue
                 shared = set(va) & set(vb)
-                if len(shared) < 3:
+                if len(shared) < 2:
                     continue
                 contrib = {x: va[x] * vb[x] for x in shared}
                 score = sum(contrib.values())
                 if score <= 0:
                     continue
-                if max(contrib.values()) > 0.5 * score:
+                # Reject only when a single term clearly dominates a tiny overlap
+                if len(shared) == 2 and max(contrib.values()) > 0.85 * score:
                     continue
                 key = (a, b) if a < b else (b, a)
                 prev = pair_best.get(key)
+                terms = sorted(shared, key=lambda x: -contrib[x])[:8]
                 if not prev or score > prev[0]:
-                    pair_best[key] = (score, sorted(shared)[:8])
+                    pair_best[key] = (score, terms)
 
     scores = sorted(s for s, _ in pair_best.values())
     thresh = params.lex_min_score
     if scores:
-        p40 = scores[max(0, int(0.40 * (len(scores) - 1)))]
-        if p40 > thresh:
-            thresh = min(0.12, max(thresh, round(p40, 3)))
+        p35 = scores[max(0, int(0.35 * (len(scores) - 1)))]
+        if p35 > thresh:
+            thresh = min(0.15, max(thresh, round(p35, 3)))
 
+    # Mutual kNN among works
     neigh: dict[str, list[tuple[float, str, list[str]]]] = defaultdict(list)
     for (a, b), (score, terms) in pair_best.items():
-        if score < thresh:
-            continue
         neigh[a].append((score, b, terms))
         neigh[b].append((score, a, terms))
+    for wk in neigh:
+        neigh[wk].sort(key=lambda x: (-x[0], x[1]))
+        neigh[wk] = neigh[wk][: params.lex_top_k]
+
+    mutual: set[tuple[str, str]] = set()
+    for a, lst in neigh.items():
+        for score, b, terms in lst:
+            if any(x[1] == a for x in neigh.get(b) or []):
+                key = (a, b) if a < b else (b, a)
+                if pair_best.get(key, (0.0, []))[0] >= thresh:
+                    mutual.add(key)
 
     edges: list[Edge] = []
-    seen: set[tuple[str, str]] = set()
-    near_thresh: list[dict[str, Any]] = []
-    for (a, b), (score, terms) in sorted(pair_best.items(), key=lambda x: abs(x[1][0] - thresh)):
-        if len(near_thresh) >= 10:
-            break
-        near_thresh.append({"a": a, "b": b, "score": round(score, 4), "terms": terms})
-
-    for src, lst in neigh.items():
-        lst.sort(key=lambda x: (-x[0], x[1]))
-        for score, tgt, terms in lst[: params.lex_top_k]:
-            key = tuple(sorted((src, tgt)))
-            if key in seen:
-                continue
-            seen.add(key)
-            edges.append(
-                Edge(
-                    source=key[0],
-                    target=key[1],
-                    type="lex_similar",
-                    weight=round(float(score), 6),
-                    provenance={"terms": terms, "shared_n": len(terms)},
-                )
+    weak_edges = 0
+    for a, b in sorted(mutual):
+        score, terms = pair_best[(a, b)]
+        ra, rb = work_rep.get(a), work_rep.get(b)
+        if not ra or not rb:
+            continue
+        edges.append(
+            Edge(
+                source=ra,
+                target=rb,
+                type="lex_similar",
+                weight=round(float(score), 6),
+                provenance={
+                    "terms": terms,
+                    "shared_n": len(terms),
+                    "work_a": a,
+                    "work_b": b,
+                    "level": "work",
+                },
             )
+        )
 
-    hist = Counter()
-    for s in scores:
-        bucket = round(s, 2)
-        hist[bucket] += 1
+    # Orphan works: one weak edge to best neighbor if score ≥ floor
+    linked_works: set[str] = set()
+    for e in edges:
+        pa = by_id.get(e.source)
+        pb = by_id.get(e.target)
+        if pa:
+            linked_works.add(pa.work_key)
+        if pb:
+            linked_works.add(pb.work_key)
+
+    for wk in work_counts:
+        if wk in linked_works:
+            continue
+        best: tuple[float, str, list[str]] | None = None
+        for (a, b), (score, terms) in pair_best.items():
+            if a != wk and b != wk:
+                continue
+            other = b if a == wk else a
+            if best is None or score > best[0]:
+                best = (score, other, terms)
+        if best is None or best[0] < params.lex_weak_floor:
+            continue
+        score, other, terms = best
+        ra, rb = work_rep.get(wk), work_rep.get(other)
+        if not ra or not rb:
+            continue
+        edges.append(
+            Edge(
+                source=ra,
+                target=rb,
+                type="lex_similar",
+                weight=round(float(score), 6),
+                provenance={
+                    "terms": terms,
+                    "shared_n": len(terms),
+                    "work_a": wk,
+                    "work_b": other,
+                    "level": "work",
+                    "weak": True,
+                },
+            )
+        )
+        weak_edges += 1
+        linked_works.add(wk)
+
+    hist = Counter(round(s, 2) for s in scores)
     debug = {
         "bugfix": (
-            "Names detected on surface forms before stemming (≥0.7 mid-cap); "
-            "diminutives/editorial/speech dropped; ≥3 shared terms; "
-            "single-term >50% score rejected."
+            "Work-level vectors: 1+log tf, IDF over works, df∈[2,30%], "
+            "burstiness drops style terms, mutual kNN, weak floor for orphans."
         ),
         "score_count": len(scores),
         "score_min": min(scores) if scores else None,
         "score_max": max(scores) if scores else None,
         "score_hist": dict(sorted(hist.items())[:40]),
         "edges": len(edges),
+        "weak_edges": weak_edges,
         "threshold": thresh,
         "threshold_requested": params.lex_min_score,
-        "near_threshold": near_thresh,
+        "weak_floor": params.lex_weak_floor,
         "comparisons": counter.comparisons if counter else None,
         "name_stems_sample": sorted(name_stems)[:30],
+        "burst_dropped_top30": [
+            {"term": t, "df": dw, "expected_df": round(exp, 2), "ratio": round(r, 3)}
+            for r, t, dw, exp in dropped_burst[:30]
+        ],
+        "burst_kept_top30": [
+            {"term": t, "df": dw, "expected_df": round(exp, 2), "ratio": round(r, 3)}
+            for r, t, dw, exp in kept_burst[:30]
+        ],
+        "n_works": n_works,
+        "kept_terms": len(kept_terms),
+        "dropped_burst_n": len(dropped_burst),
     }
     return edges, debug
 

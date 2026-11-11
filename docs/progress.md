@@ -1,3 +1,9 @@
+## 2026-11-11 — Graph 1e E2 (work-level lex)
+
+- Work vectors: 1+log tf, IDF, df∈[2,30%], burstiness, mutual kNN, weak floor
+- style_burst_hints + speech/stage excluded; INDEX_VERSION=10
+- Tests: theme link, burstiness, weak floor
+
 ## 2026-11-11 — Graph 1e E1 (duplicates + contained_in)
 
 - task_id: T-GRAPH-IDX-1E — in progress (E1 done)
