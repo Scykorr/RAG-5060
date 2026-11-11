@@ -101,9 +101,10 @@ def test_burstiness_drops_style_keeps_theme():
 
 
 def test_weak_edge_only_above_floor():
+    # Different authors so same-author soft-kNN cannot bypass the high mutual threshold.
     docs = [
         gi.parse_doc_meta(document_id="iso", filename="classic_0001_Tolstoy_Холстомер_aaaaaaaa.txt"),
-        gi.parse_doc_meta(document_id="n1", filename="classic_0002_Tolstoy_Поликушка_bbbbbbbb.txt"),
+        gi.parse_doc_meta(document_id="n1", filename="classic_0002_Turgenev_Поликушка_bbbbbbbb.txt"),
         gi.parse_doc_meta(document_id="n2", filename="classic_0003_Chekhov_Степь_cccccccc.txt"),
     ]
     gi.resolve_work_keys(docs)

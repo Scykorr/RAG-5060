@@ -48,7 +48,7 @@ from apps.api.services.text_entities import (
 
 log = structlog.get_logger()
 
-INDEX_VERSION = 10
+INDEX_VERSION = 11
 
 # Filename grammar tokens (source-site / language folder markers), not corpus content.
 SOURCE_TOKENS = frozenset({"ch", "eb"})
@@ -58,11 +58,12 @@ DEFAULT_CHUNK_BATCH = 200
 DEFAULT_ENTITY_TOP_N = 20
 DEFAULT_SHARED_MIN = 2
 DEFAULT_SHARED_TOP_K = 8
-DEFAULT_LEX_TOP_M = 200
-DEFAULT_LEX_TOP_K = 5
+DEFAULT_LEX_TOP_M = 250
+DEFAULT_LEX_TOP_K = 6
 DEFAULT_LEX_MIN_SCORE = 0.05
 DEFAULT_LEX_WEAK_FLOOR = 0.05
 DEFAULT_LEX_BURST_MAX_RATIO = 0.95
+DEFAULT_LEX_AUTO_SCORE = 0.12  # emit without mutual kNN when score ≥ this
 DEFAULT_REFERS_TOP_K = 10
 DEFAULT_REFERS_HUB_FRAC = 0.10
 DEFAULT_ENTITY_MAX_WORK_FRAC = 0.15
@@ -128,6 +129,9 @@ _SPEECH_VERBS = frozenset(
 _STYLE_BURST_HINTS = frozenset(
     stem_ru(v) for v in (tuple_field("style_burst_hints") or ())
 ) | frozenset(norm_ru(v) for v in (tuple_field("style_burst_hints") or ()))
+_LEX_CROSS_THEME = frozenset(
+    stem_ru(v) for v in (tuple_field("lex_cross_theme_stems") or ())
+) | frozenset(norm_ru(v) for v in (tuple_field("lex_cross_theme_stems") or ()))
 _ENTITY_INTERJECTIONS = frozenset_field("entity_interjections") or frozenset(
     {"господи", "извините", "ей-богу", "ейбогу", "простите", "пожалуйста"}
 )
@@ -160,6 +164,7 @@ class GraphIndexParams:
     lex_min_score: float = DEFAULT_LEX_MIN_SCORE
     lex_weak_floor: float = DEFAULT_LEX_WEAK_FLOOR
     lex_burst_max_ratio: float = DEFAULT_LEX_BURST_MAX_RATIO
+    lex_auto_score: float = DEFAULT_LEX_AUTO_SCORE
     refers_top_k: int = DEFAULT_REFERS_TOP_K
     refers_hub_frac: float = DEFAULT_REFERS_HUB_FRAC
     entity_max_work_frac: float = DEFAULT_ENTITY_MAX_WORK_FRAC
@@ -180,6 +185,7 @@ class GraphIndexParams:
             "lex_min_score": self.lex_min_score,
             "lex_weak_floor": self.lex_weak_floor,
             "lex_burst_max_ratio": self.lex_burst_max_ratio,
+            "lex_auto_score": self.lex_auto_score,
             "refers_top_k": self.refers_top_k,
             "refers_hub_frac": self.refers_hub_frac,
             "entity_max_work_frac": self.entity_max_work_frac,
@@ -1392,63 +1398,107 @@ def layer_d_lex_similar(
     dropped_burst.sort(reverse=True)
     kept_burst.sort()
 
-    # Work vectors: sublinear tf * idf, top-M
-    vectors: dict[str, dict[str, float]] = {}
+    # Dual signature: top-M by tf*idf ∪ top-M by residual burst — keeps thematic stems.
+    signatures: dict[str, dict[str, float]] = {}
     inv: dict[str, list[str]] = defaultdict(list)
+    res_n = max(80, params.lex_top_m)
     for wk, counts in work_counts.items():
-        scored: list[tuple[float, str]] = []
+        by_tf: list[tuple[float, str]] = []
+        by_res: list[tuple[float, str]] = []
+        weights: dict[str, float] = {}
         for t, c in counts.items():
             if t not in kept_terms:
                 continue
             dw = df_work[t]
             tf = 1.0 + math.log(float(c))
             idf = math.log((n_works + 1) / (dw + 1)) + 1.0
-            scored.append((tf * idf, t))
-        scored.sort(reverse=True)
-        top = scored[: params.lex_top_m]
-        if not top:
+            cf = int(cf_work.get(t, 0))
+            exp = _expected_df(n_works, cf)
+            residual = math.log((exp + 1.0) / (dw + 1.0)) + 1.0
+            # Blend: residual pulls theme stems that classic IDF buries under essay jargon
+            w = tf * (0.55 * idf + 0.45 * residual)
+            weights[t] = w
+            by_tf.append((tf * idf, t))
+            by_res.append((tf * residual, t))
+        by_tf.sort(reverse=True)
+        by_res.sort(reverse=True)
+        chosen = {t for _, t in by_tf[: params.lex_top_m]} | {t for _, t in by_res[:res_n]}
+        if not chosen:
             continue
-        vec = {t: s for s, t in top}
-        norm = math.sqrt(sum(v * v for v in vec.values())) or 1.0
-        vectors[wk] = {t: v / norm for t, v in vec.items()}
-        for t in vectors[wk]:
+        sig = {t: weights[t] for t in chosen}
+        sn = math.sqrt(sum(v * v for v in sig.values())) or 1.0
+        signatures[wk] = {t: v / sn for t, v in sig.items()}
+        for t in signatures[wk]:
             inv[t].append(wk)
+
+    def _score_pair(a: str, b: str) -> tuple[float, list[str]] | None:
+        sa, sb = signatures.get(a), signatures.get(b)
+        if not sa or not sb:
+            return None
+        shared = set(sa) & set(sb)
+        if len(shared) < 3:
+            return None
+        contrib = {x: sa[x] * sb[x] for x in shared}
+        score = sum(contrib.values())
+        if score <= 0:
+            return None
+        if len(shared) <= 3 and max(contrib.values()) > 0.7 * score:
+            return None
+        terms = sorted(shared, key=lambda x: -contrib[x])[:8]
+        return score, terms
 
     pair_best: dict[tuple[str, str], tuple[float, list[str]]] = {}
     for t, members in inv.items():
         mem = sorted(set(members))
-        if len(mem) > 80:
+        if len(mem) > 160:
             continue
         for i in range(len(mem)):
             for j in range(i + 1, len(mem)):
                 a, b = mem[i], mem[j]
                 if counter is not None:
                     counter.comparisons += 1
-                va, vb = vectors.get(a), vectors.get(b)
-                if not va or not vb:
+                got = _score_pair(a, b)
+                if not got:
                     continue
-                shared = set(va) & set(vb)
-                if len(shared) < 2:
-                    continue
-                contrib = {x: va[x] * vb[x] for x in shared}
-                score = sum(contrib.values())
-                if score <= 0:
-                    continue
-                # Reject only when a single term clearly dominates a tiny overlap
-                if len(shared) == 2 and max(contrib.values()) > 0.85 * score:
-                    continue
+                score, terms = got
                 key = (a, b) if a < b else (b, a)
                 prev = pair_best.get(key)
-                terms = sorted(shared, key=lambda x: -contrib[x])[:8]
                 if not prev or score > prev[0]:
                     pair_best[key] = (score, terms)
+    # Same-author: also score pairs that share residual terms even if inv skipped
+    by_auth_w: dict[str, list[str]] = defaultdict(list)
+    for d in docs:
+        if d.author_key and d.work_key in signatures:
+            by_auth_w[str(d.author_key)].append(d.work_key)
+    for wks in by_auth_w.values():
+        uniq = sorted(set(wks))
+        for i, a in enumerate(uniq):
+            for b in uniq[i + 1 :]:
+                key = (a, b) if a < b else (b, a)
+                if key in pair_best:
+                    continue
+                if counter is not None:
+                    counter.comparisons += 1
+                got = _score_pair(a, b)
+                if got:
+                    pair_best[key] = got
 
     scores = sorted(s for s, _ in pair_best.values())
     thresh = params.lex_min_score
     if scores:
         p35 = scores[max(0, int(0.35 * (len(scores) - 1)))]
         if p35 > thresh:
-            thresh = min(0.15, max(thresh, round(p35, 3)))
+            thresh = min(0.10, max(thresh, round(p35, 3)))
+    auto_thresh = max(params.lex_auto_score, thresh)
+    work_author = {d.work_key: d.author_key for d in docs}
+
+    def _need(a: str, b: str, base: float, *, mode: str = "mutual") -> float:
+        if work_author.get(a) and work_author.get(a) == work_author.get(b):
+            return max(0.035, base * 0.55)
+        # Cross-author: mutual may be modest; auto must stay high (blocks bad pairs)
+        if mode == "auto":
+            return max(base, 0.20)
+        return max(0.08, base)
 
     # Mutual kNN among works
     neigh: dict[str, list[tuple[float, str, list[str]]]] = defaultdict(list)
@@ -1459,17 +1509,59 @@ def layer_d_lex_similar(
         neigh[wk].sort(key=lambda x: (-x[0], x[1]))
         neigh[wk] = neigh[wk][: params.lex_top_k]
 
-    mutual: set[tuple[str, str]] = set()
+    selected: set[tuple[str, str]] = set()
     for a, lst in neigh.items():
         for score, b, terms in lst:
             if any(x[1] == a for x in neigh.get(b) or []):
                 key = (a, b) if a < b else (b, a)
-                if pair_best.get(key, (0.0, []))[0] >= thresh:
-                    mutual.add(key)
+                if pair_best.get(key, (0.0, []))[0] >= _need(a, b, thresh, mode="mutual"):
+                    selected.add(key)
+    # High absolute score → keep even without mutual (thematic pairs on large corpora)
+    for (a, b), (score, _terms) in pair_best.items():
+        if score >= _need(a, b, auto_thresh, mode="auto"):
+            selected.add((a, b))
+
+    def _cross_theme_hit(terms: list[str]) -> int:
+        n = 0
+        for t in terms:
+            tn = norm_ru(t)
+            ts = stem_ru(t)
+            if tn in _LEX_CROSS_THEME or ts in _LEX_CROSS_THEME:
+                n += 1
+                continue
+            if any(tn.startswith(s) or ts.startswith(s) for s in _LEX_CROSS_THEME if len(s) >= 4):
+                n += 1
+        return n
+
+    # Cross-author theme bridge (lexicon stems): e.g. courtroom novels, not romance noise
+    for (a, b), (score, terms) in pair_best.items():
+        if work_author.get(a) and work_author.get(a) == work_author.get(b):
+            continue
+        if score < 0.08:
+            continue
+        if _cross_theme_hit(terms) >= 2:
+            selected.add((a, b))
+
+    # Same-author soft kNN: keep top soft_k partners ≥ soft_min (recovers essay theme pairs)
+    soft_min = max(0.03, params.lex_min_score * 0.6)
+    soft_k = max(params.lex_top_k, 10)
+    same_neigh: dict[str, list[tuple[float, str, list[str]]]] = defaultdict(list)
+    for (a, b), (score, terms) in pair_best.items():
+        if score < soft_min:
+            continue
+        if not (work_author.get(a) and work_author.get(a) == work_author.get(b)):
+            continue
+        same_neigh[a].append((score, b, terms))
+        same_neigh[b].append((score, a, terms))
+    for wk, lst in same_neigh.items():
+        lst.sort(key=lambda x: (-x[0], x[1]))
+        for score, other, _terms in lst[:soft_k]:
+            key = (wk, other) if wk < other else (other, wk)
+            selected.add(key)
 
     edges: list[Edge] = []
     weak_edges = 0
-    for a, b in sorted(mutual):
+    for a, b in sorted(selected):
         score, terms = pair_best[(a, b)]
         ra, rb = work_rep.get(a), work_rep.get(b)
         if not ra or not rb:
@@ -1500,19 +1592,41 @@ def layer_d_lex_similar(
         if pb:
             linked_works.add(pb.work_key)
 
+    vec_keys = list(signatures.keys())
+
+    max_weak = max(1, int(0.15 * max(1, len(edges))))
+    orphan_scored: list[tuple[float, str, str, list[str]]] = []
     for wk in work_counts:
-        if wk in linked_works:
+        if wk in linked_works or wk not in signatures:
             continue
         best: tuple[float, str, list[str]] | None = None
-        for (a, b), (score, terms) in pair_best.items():
-            if a != wk and b != wk:
-                continue
-            other = b if a == wk else a
+        # Prefer same-author candidates, then any
+        same = [
+            o
+            for o in vec_keys
+            if o != wk and work_author.get(o) and work_author.get(o) == work_author.get(wk)
+        ]
+        pool = same or [o for o in vec_keys if o != wk]
+        for other in pool:
+            key = (wk, other) if wk < other else (other, wk)
+            prev = pair_best.get(key)
+            if prev:
+                score, terms = prev
+            else:
+                got = _score_pair(wk, other)
+                if not got:
+                    continue
+                score, terms = got
             if best is None or score > best[0]:
                 best = (score, other, terms)
         if best is None or best[0] < params.lex_weak_floor:
             continue
         score, other, terms = best
+        orphan_scored.append((score, wk, other, terms))
+    orphan_scored.sort(reverse=True)
+    for score, wk, other, terms in orphan_scored[:max_weak]:
+        if wk in linked_works:
+            continue
         ra, rb = work_rep.get(wk), work_rep.get(other)
         if not ra or not rb:
             continue
@@ -1536,10 +1650,37 @@ def layer_d_lex_similar(
         linked_works.add(wk)
 
     hist = Counter(round(s, 2) for s in scores)
+    # Watch-list scores for regression diagnostics (title substrings → work_keys)
+    watch_needles = (
+        ("ганди", "праве"),
+        ("безумии", "патриотизм"),
+        ("воскресение", "карамазов"),
+        ("накануне", "каренин"),
+        ("севастопол", "рубка"),
+    )
+    title_by_wk = {d.work_key: norm_ru(d.title) for d in docs}
+    watch_scores: list[dict[str, Any]] = []
+    for na, nb in watch_needles:
+        wka = next((wk for wk, t in title_by_wk.items() if na in t), None)
+        wkb = next((wk for wk, t in title_by_wk.items() if nb in t), None)
+        if not wka or not wkb:
+            watch_scores.append({"a": na, "b": nb, "score": None, "missing": True})
+            continue
+        key = (wka, wkb) if wka < wkb else (wkb, wka)
+        sc = pair_best.get(key)
+        watch_scores.append(
+            {
+                "a": title_by_wk.get(wka),
+                "b": title_by_wk.get(wkb),
+                "score": None if not sc else round(sc[0], 5),
+                "terms": None if not sc else sc[1],
+                "selected": key in selected,
+            }
+        )
     debug = {
         "bugfix": (
-            "Work-level vectors: 1+log tf, IDF over works, df∈[2,30%], "
-            "burstiness drops style terms, mutual kNN, weak floor for orphans."
+            "Work-level dual signatures (tfidf∪residual), burstiness, "
+            "mutual kNN + same-author soft kNN, weak floor for orphans."
         ),
         "score_count": len(scores),
         "score_min": min(scores) if scores else None,
@@ -1549,6 +1690,7 @@ def layer_d_lex_similar(
         "weak_edges": weak_edges,
         "threshold": thresh,
         "threshold_requested": params.lex_min_score,
+        "auto_score": auto_thresh,
         "weak_floor": params.lex_weak_floor,
         "comparisons": counter.comparisons if counter else None,
         "name_stems_sample": sorted(name_stems)[:30],
@@ -1563,6 +1705,7 @@ def layer_d_lex_similar(
         "n_works": n_works,
         "kept_terms": len(kept_terms),
         "dropped_burst_n": len(dropped_burst),
+        "watch_scores": watch_scores,
     }
     return edges, debug
 
@@ -2261,6 +2404,12 @@ def _build_doc_artifact(
                 entity_chunks[k].append(chunk_id)
         for tok in tokenize_lex(clean):
             term_counts[tok] += 1
+    clean_text = "\n".join(ch["text"] for ch in clean_chunks)
+    shingles = gdup.shingle_set(clean_text)
+    word_count = len(gdup.tokenize_words(clean_text))
+    minhash = list(gdup.minhash_signature(shingles))
+    # Store full shingle ids only for short docs (containment reuse without rehash).
+    shingle_payload: list[int] | None = sorted(shingles) if len(shingles) <= 12_000 else None
     return {
         "document_id": meta.document_id,
         "version_id": version_id,
@@ -2279,6 +2428,9 @@ def _build_doc_artifact(
         "pos_stats": {k: dict(v) for k, v in pos_stats.items()},
         "chars_removed": chars_removed,
         "examples": examples,
+        "word_count": word_count,
+        "minhash": minhash,
+        "shingles": shingle_payload,
     }
 
 
@@ -2507,7 +2659,18 @@ def build_index_for_tenant(
         did: "\n".join(ch.get("text") or "" for ch in (art.get("clean_chunks") or []))
         for did, art in artifacts.items()
     }
-    dup_map = gdup.detect_relations(docs, texts_by_id)
+    fingerprints: dict[str, dict[str, Any]] = {}
+    for did, art in artifacts.items():
+        fp: dict[str, Any] = {}
+        if art.get("word_count") is not None:
+            fp["word_count"] = int(art["word_count"])
+        if isinstance(art.get("minhash"), list) and art["minhash"]:
+            fp["minhash"] = art["minhash"]
+        if isinstance(art.get("shingles"), list) and art["shingles"]:
+            fp["shingles"] = art["shingles"]
+        if fp.get("minhash"):
+            fingerprints[did] = fp
+    dup_map = gdup.detect_relations(docs, texts_by_id, fingerprints=fingerprints)
     canon_ids = gdup.canonical_doc_ids(dup_map)
     for meta in docs:
         info = dup_map.get(meta.document_id) or {}

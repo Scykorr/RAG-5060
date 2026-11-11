@@ -1,3 +1,10 @@
+## 2026-11-11 — Graph 1e lex recall + dup speed
+
+- Dual signatures (tf·idf ∪ residual), same-author soft kNN, cross-theme stems from lexicon
+- Isolation metrics on canonical docs only; faster blake2b/int shingles + minhash
+- Regression good (Gandhi / безумие / Воскресение↔Карамазовы) green; bad clean
+- INDEX_VERSION=11; pytest graph unit 76 passed
+
 ## 2026-11-11 — Graph 1e report status
 
 - Report: `artifacts/20261111-055631-graph-index/` vs `20261111-050958`

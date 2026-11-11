@@ -36,24 +36,32 @@ def tokenize_shingles(text: str, *, n: int = SHINGLE_N) -> list[str]:
 
 
 def _h64(s: str, seed: int) -> int:
-    raw = hashlib.md5(f"{seed}:{s}".encode("utf-8")).digest()
-    return int.from_bytes(raw[:8], "big")
+    raw = hashlib.blake2b(f"{seed}:{s}".encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(raw, "big")
 
 
-def minhash_signature(shingles: list[str] | set[str], *, size: int = MINHASH_SIZE) -> tuple[int, ...]:
+def _shingle_id(s: str) -> int:
+    """Stable 64-bit id for a shingle (faster than hex MD5 strings)."""
+    return int.from_bytes(hashlib.blake2b(s.encode("utf-8"), digest_size=8).digest(), "big")
+
+
+def minhash_signature(shingles: list[str] | set[str] | set[int], *, size: int = MINHASH_SIZE) -> tuple[int, ...]:
     if not shingles:
         return tuple(0 for _ in range(size))
     sig = [2**63 - 1] * size
+    # Fixed odd multipliers for independent permutations over 64-bit ids.
+    mults = tuple(((i * 2 + 1) * 0x9E3779B97F4A7C15) & ((1 << 64) - 1) for i in range(size))
     for sh in shingles:
-        for i in range(size):
-            v = _h64(sh, i)
+        base = sh if isinstance(sh, int) else _shingle_id(str(sh))
+        for i, m in enumerate(mults):
+            v = (base * m) & ((1 << 64) - 1)
             if v < sig[i]:
                 sig[i] = v
     return tuple(sig)
 
 
-def shingle_hashes(text: str, *, n: int = SHINGLE_N, max_keep: int = 120_000) -> set[str]:
-    """MD5 of each n-shingle. Keep all hashes up to ``max_keep`` (no sparse subsample).
+def shingle_hashes(text: str, *, n: int = SHINGLE_N, max_keep: int = 120_000) -> set[int]:
+    """64-bit ids of each n-shingle. Keep all up to ``max_keep`` (no sparse subsample).
 
     Sparse hash-order sampling destroyed containment of fragments inside novels.
     """
@@ -61,22 +69,22 @@ def shingle_hashes(text: str, *, n: int = SHINGLE_N, max_keep: int = 120_000) ->
     if not sh:
         return set()
     if len(sh) <= max_keep:
-        return {hashlib.md5(s.encode("utf-8")).hexdigest() for s in sh}
+        return {_shingle_id(s) for s in sh}
     # If truly huge: keep head+tail+stride so local fragments still hit
     head = sh[: max_keep // 3]
     tail = sh[-(max_keep // 3) :]
     mid = sh[max_keep // 3 : len(sh) - max_keep // 3]
     step = max(1, len(mid) // max(1, max_keep - len(head) - len(tail)))
     chosen = head + mid[::step] + tail
-    return {hashlib.md5(s.encode("utf-8")).hexdigest() for s in chosen[:max_keep]}
+    return {_shingle_id(s) for s in chosen[:max_keep]}
 
 
-def shingle_set(text: str, *, n: int = SHINGLE_N, max_keep: int = 120_000) -> set[str]:
+def shingle_set(text: str, *, n: int = SHINGLE_N, max_keep: int = 120_000) -> set[int]:
     """Alias: hash set used for Jaccard / containment."""
     return shingle_hashes(text, n=n, max_keep=max_keep)
 
 
-def jaccard(a: set[str], b: set[str]) -> float:
+def jaccard(a: set[int] | set[str], b: set[int] | set[str]) -> float:
     if not a and not b:
         return 1.0
     if not a or not b:
@@ -86,19 +94,19 @@ def jaccard(a: set[str], b: set[str]) -> float:
     return inter / union if union else 0.0
 
 
-def containment(small: set[str], big: set[str]) -> float:
+def containment(small: set[int] | set[str], big: set[int] | set[str]) -> float:
     """Fraction of small's shingles found in big."""
     if not small:
         return 0.0
     return len(small & big) / len(small)
 
 
-def shingle_fingerprint(text: str, *, n: int = 5, sample: int = 64) -> set[str]:
+def shingle_fingerprint(text: str, *, n: int = 5, sample: int = 64) -> set[int]:
     """Back-compat helper used by older tests (hash sample of n-shingles)."""
     shingles = tokenize_shingles(text, n=n)
     if not shingles:
         return set()
-    hashed = sorted(hashlib.md5(s.encode("utf-8")).hexdigest() for s in shingles)
+    hashed = sorted(_shingle_id(s) for s in shingles)
     if len(hashed) <= sample:
         return set(hashed)
     step = max(1, len(hashed) // sample)
@@ -149,23 +157,47 @@ def detect_relations(
     *,
     dup_threshold: float = DUP_JACCARD,
     contain_threshold: float = CONTAIN_COVERAGE,
+    fingerprints: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Return document_id → relation info.
 
     Keys: canonical, duplicate_of, contained_in, sim, coverage, relation
     (canonical | duplicate | contained_in).
+
+    Optional ``fingerprints``: document_id → {minhash, word_count, shingles?}
+    to skip rehashing clean text when artifacts already carry them.
     """
     ids = [d.document_id for d in docs]
-    sets: dict[str, set[str]] = {}
+    sets: dict[str, set[int]] = {}
     sigs: dict[str, tuple[int, ...]] = {}
     sizes: dict[str, int] = {}
+    fps = fingerprints or {}
+
+    def _ensure_set(did: str) -> set[int]:
+        if did in sets:
+            return sets[did]
+        fp = fps.get(did) or {}
+        raw = fp.get("shingles")
+        if isinstance(raw, list) and raw:
+            s = {int(x) for x in raw}
+        else:
+            s = shingle_set(texts_by_id.get(did, "") or "")
+        sets[did] = s
+        return s
+
     for d in docs:
         did = d.document_id
-        text = texts_by_id.get(did, "") or ""
-        s = shingle_set(text)
-        sets[did] = s
-        sizes[did] = len(tokenize_words(text))
-        sigs[did] = minhash_signature(s)
+        fp = fps.get(did) or {}
+        if fp.get("word_count") is not None:
+            sizes[did] = int(fp["word_count"])
+        else:
+            sizes[did] = len(tokenize_words(texts_by_id.get(did, "") or ""))
+        mh = fp.get("minhash")
+        if isinstance(mh, (list, tuple)) and len(mh) == MINHASH_SIZE:
+            sigs[did] = tuple(int(x) for x in mh)
+        else:
+            # Need set to derive signature once
+            sigs[did] = minhash_signature(_ensure_set(did))
 
     # LSH buckets within each candidate group
     pair_scores: dict[tuple[str, str], dict[str, float]] = {}
@@ -176,7 +208,7 @@ def detect_relations(
             return
         # Metrics always in sorted key order (pk[0], pk[1]).
         x, y = pk
-        sx, sy = sets[x], sets[y]
+        sx, sy = _ensure_set(x), _ensure_set(y)
         pair_scores[pk] = {
             "jaccard": jaccard(sx, sy),
             "cov_ab": containment(sx, sy),  # x inside y
