@@ -49,7 +49,7 @@
 | A17 | Graph UI: анимация layout / hover / pulse | yes | Вкладка графа; hover узла | Визуально + `graph.js` offline vendor | S50 |
 | A18 | Graph Obsidian-like: chain BFS, orphans, degree size | yes | Клик узла → local; hover depth≥2 dim | `/graph.js` содержит `highlightChain`; hide-orphans | S53 |
 | A19 | Connectivity index: full replace + incremental top-up offline | yes | reset-rag → rebuild empty; import → stale; rebuild manual/auto; add edition/volume → work/canonical/author; delete → edges gone; fail build → previous index | `pytest tests/unit/test_graph_index_lifecycle.py` (params_hash/lexicon, lock, stale, tenant isolation, test6 edition) | S54 |
-| A20 | Connectivity quality 1d/1e | yes | Rebuild → duplicates/contains, work-lex regression (Gandhi/безумие/Воскресение↔Карамазовы), bad clean, co_cited not alpha, entity strong rare, work_mentions>0, noop≤2s | `pytest tests/unit/test_graph_*.py` (76); report after 1e vs `20261111-050958` (INDEX_VERSION=11) | S54, S55 |
+| A20 | Connectivity quality 1d/1e | yes | Rebuild → duplicates/contains, work-lex regression (Gandhi/безумие/Воскресение↔Карамазовы), bad clean, co_cited not alpha, entity strong rare, work_mentions>0, noop≤2s | `pytest tests/unit/test_graph_*.py` (76); report `artifacts/20261111-062930-graph-index/` vs `20261111-050958` (INDEX_VERSION=11; isolated_works 1.3%; noop≈1.9s; full≈139s) | S54, S55 |
 
 ## Контекст для смены документов (replay корпуса)
 

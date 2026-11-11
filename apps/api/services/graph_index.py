@@ -2493,7 +2493,18 @@ def build_index_for_tenant(
             and cached.get("version") == INDEX_VERSION
             and cached.get("params_hash") in (None, ph)
         ):
-            log.info("graph_index_cache_hit", tenant_id=str(tenant_id), fingerprint=fp)
+            cached = dict(cached)
+            cached["built_ms"] = int((time.perf_counter() - t0) * 1000)
+            st = dict(cached.get("stats") or {})
+            st["build_mode"] = "noop"
+            st["stale"] = False
+            cached["stats"] = st
+            log.info(
+                "graph_index_cache_hit",
+                tenant_id=str(tenant_id),
+                fingerprint=fp,
+                built_ms=cached["built_ms"],
+            )
             return cached
 
     # E8 noop: unchanged corpus + params → return current index in ~1s (even if force)
@@ -2589,16 +2600,9 @@ def build_index_for_tenant(
 
     for meta in docs:
         ver = ver_by_doc[meta.document_id]
-        raw_chunks = _chunks_for_version(db, tenant_id, ver.id)
-        chash = gcache.content_hash(
-            version_id=str(ver.id),
-            filename=meta.filename,
-            chunk_texts=[t for _, _, t in raw_chunks],
-        )
-        # Reuse per-doc artifacts whenever content_hash matches (full rebuild still
-        # recomputes global stats/edges; only changed docs are re-scanned).
         cached_art = gcache.read_doc_artifact(tenant_id, meta.document_id)
-        if cached_art and cached_art.get("content_hash") == chash:
+        # Fast path: same active version_id → reuse artifact without loading chunks
+        if cached_art and str(cached_art.get("version_id") or "") == str(ver.id):
             artifacts[meta.document_id] = cached_art
             lifecycle["cached"] += 1
             if cached_art.get("author_key") and not meta.author_key:
@@ -2608,6 +2612,20 @@ def build_index_for_tenant(
                 meta.work_key = work_key_for(
                     pack=meta.pack, author_key=meta.author_key, title=meta.title
                 )
+            continue
+        raw_chunks = _chunks_for_version(db, tenant_id, ver.id)
+        chash = gcache.content_hash(
+            version_id=str(ver.id),
+            filename=meta.filename,
+            chunk_texts=[t for _, _, t in raw_chunks],
+        )
+        # Reuse when content_hash matches even if version_id field was missing
+        if cached_art and cached_art.get("content_hash") == chash:
+            cached_art = dict(cached_art)
+            cached_art["version_id"] = str(ver.id)
+            gcache.write_doc_artifact(tenant_id, meta.document_id, cached_art)
+            artifacts[meta.document_id] = cached_art
+            lifecycle["cached"] += 1
             continue
         art = _build_doc_artifact(
             meta=meta,
@@ -2622,6 +2640,55 @@ def build_index_for_tenant(
         else:
             lifecycle["added"] += 1
     layer_ms["scan_clean"] = int((time.perf_counter() - t_scan) * 1000)
+
+    # E8: unchanged corpus + params → reuse published index (skip global layers)
+    if (
+        not force
+        and lifecycle["added"] == 0
+        and lifecycle["changed"] == 0
+        and lifecycle["removed"] == 0
+    ):
+        ptr2 = gcache.read_current_pointer(tenant_id) or {}
+        prev2 = None
+        if ptr2.get("index_file"):
+            prev2 = read_index(gcache.graph_dir() / str(ptr2["index_file"]))
+        if not prev2:
+            prev2 = read_index(path)
+        # Artifact scan already proved content unchanged; require version+params only.
+        if (
+            prev2
+            and prev2.get("version") == INDEX_VERSION
+            and prev2.get("params_hash") in (None, ph)
+        ):
+            prev2 = dict(prev2)
+            prev2["built_ms"] = int((time.perf_counter() - t0) * 1000)
+            prev2["fingerprint"] = fp
+            st = dict(prev2.get("stats") or {})
+            st["build_mode"] = "noop"
+            st["lifecycle"] = dict(lifecycle)
+            st["stale"] = False
+            st["layer_ms"] = {"scan_clean": layer_ms.get("scan_clean", 0)}
+            prev2["stats"] = st
+            prev2["params_hash"] = ph
+            log.info(
+                "graph_index_noop",
+                tenant_id=str(tenant_id),
+                built_ms=prev2["built_ms"],
+                cached=lifecycle["cached"],
+                ptr_ph=ptr2.get("params_hash"),
+                ph=ph,
+            )
+            return prev2
+        log.info(
+            "graph_index_noop_miss",
+            tenant_id=str(tenant_id),
+            has_prev=bool(prev2),
+            prev_ver=None if not prev2 else prev2.get("version"),
+            prev_ph=None if not prev2 else prev2.get("params_hash"),
+            ph=ph,
+            ptr=ptr2,
+        )
+
     resolve_work_keys(docs)
 
     # Aggregate artifact fields into layer inputs

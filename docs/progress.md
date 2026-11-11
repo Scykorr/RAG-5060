@@ -1,3 +1,13 @@
+## 2026-11-11 — Graph 1e acceptance report
+
+- Report: `artifacts/20261111-062930-graph-index/` vs `20261111-050958` (INDEX_VERSION=11)
+- isolated_works_no_cocited: **5 / 386 (1.3%)** (was 105 / 38%); weak 5/2814
+- regression good: **all found**; bad: **all absent**
+- duplicates 28 + contained_in 97; Anna frag=165 one work_key; co_cited accepted=0
+- built_ms full≈139s (**over** ≤70s target); noop≈1.9s (**pass** ≤2s)
+- pytest graph unit: **76 passed**
+- refers_to sample n=40 in report (manual ≥90% — fill ok?); overrides stub 33 no-author
+
 ## 2026-11-11 — Graph 1e lex recall + dup speed
 
 - Dual signatures (tf·idf ∪ residual), same-author soft kNN, cross-theme stems from lexicon
