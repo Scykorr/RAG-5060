@@ -367,11 +367,14 @@ def mark_canonical_duplicates(
 
 
 def canonical_doc_ids(dup_map: dict[str, dict[str, Any]]) -> set[str]:
-    """Docs that contribute to global DF/IDF (exclude duplicates and contained)."""
+    """Docs that contribute to global DF/IDF (exclude duplicates/contained/editions)."""
     return {
         did
         for did, info in dup_map.items()
-        if info.get("canonical") and not info.get("contained_in") and not info.get("duplicate_of")
+        if info.get("canonical")
+        and not info.get("contained_in")
+        and not info.get("duplicate_of")
+        and not info.get("edition_of")
     }
 
 

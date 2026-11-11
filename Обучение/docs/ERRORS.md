@@ -250,3 +250,25 @@
 - prevent: S54, A19; `GRAPH_AUTO_REBUILD` по умолчанию false
 - links: `graph_index_cache.py`, CONNECTIVITY_LIFECYCLE.md
 - status: fixed
+
+## 2026-11-11 — EN lex: Latin tokens всегда drop
+- id: E-20261111-lex-latin-drop-en
+- symptom: два английских tech-дока про одну технологию не получают `lex_similar`
+- reproduce: `pytest tests/unit/test_graph_multilang.py::test_en_stopwords_no_spurious_lex_theme_pair_links` до фикса; `is_lex_proper_token` на `encrypt` → True
+- root_cause: фильтр `re.search(r"[a-z]")` заточен под RU-корпус (латиница = шум)
+- fix: `is_lex_proper_token(..., lang=)`; при `lang=en` — только EN stops/style/speech; `layer_d_lex_similar` передаёт `lang` из per-lang wrapper
+- replay: `pytest tests/unit/test_graph_multilang.py` (8 passed)
+- prevent: S56, A21; не применять RU proper-name pipeline к EN без `lang`
+- links: `graph_index.is_lex_proper_token`, `layer_d_lex_similar`
+- status: fixed
+
+## 2026-11-11 — identifiers: римские цифры и URL как shared_entity
+- id: E-20261111-id-roman-url
+- symptom: в отчёте tech examples = XIV/XIX; ложные cross_lang по `/www.rvb.ru/...`
+- reproduce: report `artifacts/20261111-071146-graph-index/` technical entity examples
+- root_cause: `_ACRONYM` ловил Roman chapter marks; `_PATH` — любые `/a/b` URL
+- fix: skip `_ROMAN`; path только unix roots (`/usr|/var|…`); tech acronym allowlist; artifact `index_version` invalidate (INDEX_VERSION=14)
+- replay: `pytest tests/unit/test_graph_multilang.py::test_identifiers_skip_roman_and_web_paths`; report `20261111-072215` без XIV/OCR noise
+- prevent: S56
+- links: `graph_lang.extract_identifiers`
+- status: fixed

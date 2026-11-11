@@ -1,0 +1,14 @@
+TLS Protocol Specification v1.3
+
+Abstract
+This document specifies version 1.3 of the Transport Layer Security (TLS)
+protocol. See also RFC 8446. The handshake and certificate exchange are
+described in section 4.2. Figure 1 shows the message flow.
+
+Note: Implementations MUST support AES-GCM. Refer to Appendix A for
+cipher suites. The API for openssl s_client is illustrative only.
+
+Table of Contents
+1. Introduction
+1.2.3 Requirements Language
+2. Protocol Overview

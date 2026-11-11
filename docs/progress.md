@@ -1,3 +1,13 @@
+## 2026-11-11 — Graph 1e-M multilang (ru+en)
+
+- INDEX_VERSION=14; S56/A21; F04.18e
+- `graph_lang.py`: language/doc_kind, EN stem, identifiers (RFC/ISO/TLS/code), literary gate
+- Lexicon nested `{ru,en,shared}`; per-lang IDF/lex (no cross-lang lex; note → local Ollama later)
+- `shared_entity` cross_lang for language-agnostic ids; technical `edition_of` + tech refers
+- Tests: `test_graph_multilang.py` 8 + full graph unit **84 passed**; fixtures `tests/fixtures/graph_multilang/`
+- Report: `artifacts/20261111-072215-graph-index/` — lang `{ru:690,mixed:10,en:2}`, doc_kind fiction-heavy; cross_lang=0 on classic (EN only in fixtures); isolated_works **1.3%**; good/bad green
+- Artifact cache now keyed by `index_version` (invalidate on extractor changes)
+
 ## 2026-11-11 — Graph 1e acceptance report
 
 - Report: `artifacts/20261111-062930-graph-index/` vs `20261111-050958` (INDEX_VERSION=11)

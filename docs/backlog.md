@@ -31,6 +31,7 @@ Statuses: `planned` → `ready` → `in_progress` → `review` → `verified` | 
 | T-GRAPH-IDX-1D-A | F04.18b | S3c | Quality 1d: strict refers/lex/ents/authors/dupes + report; lifecycle verify | verified | S55/A20; report artifacts/20261111-050958; INDEX_VERSION=9 |
 | T-GRAPH-IDX-1D-C | F04.18c | S3c | Lifecycle clarifications: lexicon in params_hash, atomic+pointer, file lock, stale/auto_rebuild, tenant iso, test6 | verified | S54/A19; pytest test_graph_index_lifecycle 15 + suite 64 |
 | T-GRAPH-IDX-1E | F04.18d | S3c | 1e: duplicates/contains, work-lex, co_cited, entities, refers, overrides, noop | verified | report artifacts/20261111-062930; full~139s over 70s |
+| T-GRAPH-IDX-1E-M | F04.18e | S3c | 1e-M multilang ru/en + technical identifiers/edition_of | verified | S56/A21; pytest 84; report artifacts/20261111-072215; INDEX_VERSION=14 |
 
 ## Ready next
 

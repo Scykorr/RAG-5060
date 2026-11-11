@@ -1,7 +1,10 @@
 {
-  "comment": "Optional manual author/work overrides. Edit by hand. author_source becomes override. Offline only.",
+  "comment": "Optional manual author/work/doc_kind overrides. Edit by hand. Offline only.",
   "authors_by_filename_prefix": {},
   "authors_by_work_key": {},
+  "doc_kind_by_filename_prefix": {},
+  "doc_kind_by_work_key": {},
+  "language_by_filename_prefix": {},
   "merge_works": [],
   "split_works": []
 }

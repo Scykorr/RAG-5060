@@ -78,6 +78,7 @@
 | S53 | Graph Obsidian-like на Cytoscape (не D3) | Вкладка графа / «сетка» узлов | Hide orphans; size∝degree; BFS depth; click→local; Анализ при 0 рёбер | graph.js |
 | S54 | Connectivity index offline + lifecycle | Сборка графа / reset / дозагрузка корпуса | Кэш `tenant+fp+version+params_hash` (**params_hash включает SHA1 `graph_lexicon.json`**); atomic write + `current/<tenant>.json`; lock-файл `graph/locks/<tenant>.lock` (timeout/dead pid); после ingestion `stale=true` → `POST /index/rebuild` или `GRAPH_AUTO_REBUILD=true`; invalidate только свой tenant; report: volume `rag5060_ragdata` | CONNECTIVITY_LIFECYCLE.md; A19 |
 | S55 | Connectivity quality 1d/1e | Правки `graph_index` / ложные рёбра / отчёт | 1d gates + 1e: duplicate/contained_in/contains; work-lex dual sig (tfidf∪residual)+burst+mutual/same-author soft kNN+weak; `lex_cross_theme_stems` for cross-author; co_cited filter; strong df≤3; overrides; noop; isolation on canonical | `pytest tests/unit/test_graph_*.py`; report vs `artifacts/20261111-050958-graph-index/` |
+| S56 | Multilang connectivity (ru/en) | Техдок/EN корпус / mixed RU+code; не только литература | 1) `graph_lang.detect_language` + `detect_doc_kind` → artifact; 2) lexicon `configs/graph_lexicon.json` nested `{ru,en,shared}`; stem/IDF/lex **per lang** (`layer_d` `lang=` — EN Latin не drop); 3) identifiers RFC/ISO/TLS → `shared_entity` + `cross_lang`; 4) literary (ИО/жанр) только если `literary_rules_enabled`; technical: `edition_of`, tech refers | `pytest tests/unit/test_graph_multilang.py`; fixtures `tests/fixtures/graph_multilang/`; A21 |
 
 ---
 
@@ -90,7 +91,7 @@
 | Корпус / prefix / reset | S06, S11, S21, S27, S28, S30–S32, S54 |
 | Intent / catalog | S33, S34 |
 | Login / WSL / UI port | S37–S45, S47, S49, S52 |
-| Graph Explorer | S50, S53, S54, S55 |
+| Graph Explorer | S50, S53, S54, S55, S56 |
 | Offline / deps | S29, S46, S54 |
-| Graph | S35, S36, S50, S54, S55 |
+| Graph | S35, S36, S50, S54, S55, S56 |
 | Ритуал агента | S23, S48, S51 |

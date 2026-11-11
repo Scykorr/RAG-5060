@@ -227,6 +227,26 @@ def main() -> int:
             f"- isolated_works_no_cocited: **{stats.get('isolated_works_no_cocited')}** "
             f"(share={stats.get('isolated_work_share_no_cocited')})"
         )
+        lines.append(f"- language_distribution: `{stats.get('language_distribution')}`")
+        lines.append(f"- doc_kind_distribution: `{stats.get('doc_kind_distribution')}`")
+        lines.append(f"- cross_lang_edges: **{stats.get('cross_lang_edges')}**")
+        lines.append("")
+        lines.append("## Multilingual / technical")
+        lines.append("")
+        lines.append(
+            "- Cross-language **lex** similarity is not built in this slice; "
+            "future option: local Ollama embeddings on GPU (offline, no cloud)."
+        )
+        lex_dbg = stats.get("lex_debug") or {}
+        if lex_dbg.get("cross_lang_note"):
+            lines.append(f"- note: {lex_dbg.get('cross_lang_note')}")
+        if lex_dbg.get("by_lang"):
+            lines.append(f"- lex by_lang: `{lex_dbg.get('by_lang')}`")
+        lines.append("- technical entity examples:")
+        for row in (stats.get("technical_entity_examples") or [])[:15]:
+            lines.append(
+                f"  - `{row.get('entity')}` kind={row.get('kind')} cross_lang={row.get('cross_lang')}"
+            )
         lines.append("")
         lines.append("## Isolated content top-20 (by size)")
         lines.append("")

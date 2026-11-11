@@ -33,6 +33,7 @@ from apps.api.services import graph_refers as grefer
 from apps.api.services import graph_authors as gauth
 from apps.api.services import graph_duplicates as gdup
 from apps.api.services import graph_overrides as govr
+from apps.api.services import graph_lang as glang
 from apps.api.services.text_entities import (
     EDITION_STOP,
     ENTITY_DENY,
@@ -48,7 +49,7 @@ from apps.api.services.text_entities import (
 
 log = structlog.get_logger()
 
-INDEX_VERSION = 11
+INDEX_VERSION = 14  # 12 multilang; 13–14 identifier noise (Roman/URL/OCR)
 
 # Filename grammar tokens (source-site / language folder markers), not corpus content.
 SOURCE_TOKENS = frozenset({"ch", "eb"})
@@ -218,7 +219,11 @@ class DocMeta:
     canonical: bool = True
     duplicate_of: str | None = None
     contained_in: str | None = None
-    relation: str = "canonical"  # canonical | duplicate | contained_in
+    relation: str = "canonical"  # canonical | duplicate | contained_in | edition_of
+    language: str = "unknown"  # ru | en | mixed | unknown
+    doc_kind: str = "unknown"  # fiction | nonfiction | technical | unknown
+    doc_version: str | None = None
+    product_key: str | None = None
 
 
 @dataclass
@@ -1020,6 +1025,9 @@ def entity_strength(
     max_df = max(2, int(0.15 * n_works))
     if df > max_df:
         return "drop"
+    # M3: language-agnostic technical identifiers — strong when rare
+    if kind in {"standard", "identifier", "acronym", "version"}:
+        return "strong" if df <= 3 else "weak"
     if kind == "place":
         return "strong" if df <= 3 else "weak"
     # E4: strong only when rare across works (df ≤ 3) after form merge
@@ -1044,12 +1052,22 @@ def layer_c_shared_entity(
     case_stats: dict[str, dict[str, int]] | None = None,
     pos_stats: dict[str, dict[str, int]] | None = None,
     params: GraphIndexParams | None = None,
+    doc_identifiers: dict[str, list[str]] | None = None,
+    identifier_kinds: dict[str, dict[str, str]] | None = None,
+    identifier_chunks: dict[str, dict[str, list[str]]] | None = None,
 ) -> list[Edge]:
-    """Shared entities grouped by lemma; require ≥1 strong; weight by groups."""
+    """Shared entities grouped by lemma; require ≥1 strong; weight by groups.
+
+    Language-agnostic identifiers (RFC/ISO/TLS/code) are merged in and may
+    produce cross-language edges with provenance.cross_lang=true.
+    """
     params = params or GraphIndexParams()
     doc_entity_chunks = doc_entity_chunks or {}
     case_stats = case_stats or {}
     pos_stats = pos_stats or {}
+    doc_identifiers = doc_identifiers or {}
+    identifier_kinds = identifier_kinds or {}
+    identifier_chunks = identifier_chunks or {}
     by_id = {d.document_id: d for d in docs}
     n_works = max(1, len({d.work_key for d in docs}))
     author_keys = {d.author_key for d in docs if d.author_key}
@@ -1059,9 +1077,12 @@ def layer_c_shared_entity(
     display: dict[str, str] = {}
     display_count: dict[str, Counter[str]] = defaultdict(Counter)
     kinds: dict[str, str] = {}
+    id_keys: set[str] = set()  # keys that are technical identifiers
 
     def _author_fio_keys(meta: DocMeta | None) -> set[str]:
         if not meta or not meta.author_key:
+            return set()
+        if not glang.literary_rules_enabled(meta.doc_kind or "unknown", meta.language or "unknown"):
             return set()
         table = dict_field("author_name_table").get(meta.author_key) or {}
         out: set[str] = set()
@@ -1091,25 +1112,39 @@ def layer_c_shared_entity(
         keys: set[str] = set()
         meta = by_id.get(doc_id)
         skip_keys = _author_fio_keys(meta) | _title_keys(meta)
-        for e in ents[: params.entity_top_n * 2]:
-            cleaned = clean_entity_surface(e)
-            if not cleaned:
+        use_literary = glang.literary_rules_enabled(
+            (meta.doc_kind if meta else "unknown") or "unknown",
+            (meta.language if meta else "unknown") or "unknown",
+        )
+        if use_literary:
+            for e in ents[: params.entity_top_n * 2]:
+                cleaned = clean_entity_surface(e)
+                if not cleaned:
+                    continue
+                if is_noise_entity_surface(cleaned, author_keys=author_keys):
+                    continue
+                first = cleaned.split()[0]
+                if drop_by_sentence_position(first, pos_stats=pos_stats, case_stats=case_stats):
+                    continue
+                k = _entity_key(cleaned)
+                if len(k) < 3 or k in EDITION_STOP or k in PLAY_STAGE_WORDS:
+                    continue
+                if k in _ENTITY_INTERJECTIONS:
+                    continue
+                if k in skip_keys:
+                    continue
+                keys.add(k)
+                display_count[k][cleaned] += 1
+                kinds[k] = entity_kind(cleaned, k)
+        # Always merge technical identifiers (language-agnostic)
+        for surface in doc_identifiers.get(doc_id) or []:
+            ik = glang.identifier_key(surface)
+            if len(ik) < 2:
                 continue
-            if is_noise_entity_surface(cleaned, author_keys=author_keys):
-                continue
-            first = cleaned.split()[0]
-            if drop_by_sentence_position(first, pos_stats=pos_stats, case_stats=case_stats):
-                continue
-            k = _entity_key(cleaned)
-            if len(k) < 3 or k in EDITION_STOP or k in PLAY_STAGE_WORDS:
-                continue
-            if k in _ENTITY_INTERJECTIONS:
-                continue
-            if k in skip_keys:
-                continue
-            keys.add(k)
-            display_count[k][cleaned] += 1
-            kinds[k] = entity_kind(cleaned, k)
+            keys.add(ik)
+            id_keys.add(ik)
+            display_count[ik][surface] += 1
+            kinds[ik] = (identifier_kinds.get(doc_id) or {}).get(surface) or "identifier"
         doc_keys[doc_id] = keys
         if meta:
             work_entities[meta.work_key] |= keys
@@ -1168,8 +1203,13 @@ def layer_c_shared_entity(
         same_author = bool(
             ma and mb and ma.author_key and mb.author_key and ma.author_key == mb.author_key
         )
-        # Cross-author: need ≥2 distinct strong entities
-        if not same_author and len(strong_common) < 2:
+        id_strong = {
+            e
+            for e in strong_common
+            if kinds.get(e) in {"standard", "identifier", "acronym", "version"}
+        }
+        # Cross-author: ≥2 strong literary entities, OR ≥1 strong technical identifier
+        if not same_author and len(strong_common) < 2 and not id_strong:
             continue
         w = sum(idf(e) for e in common)
         neigh[a].append((w, b, common))
@@ -1200,6 +1240,21 @@ def layer_c_shared_entity(
                     for cid in (doc_entity_chunks.get(did) or {}).get(ent, [])[:2]:
                         if cid not in chunk_ids:
                             chunk_ids.append(cid)
+                    for cid in (identifier_chunks.get(did) or {}).get(ent, [])[:2]:
+                        if cid not in chunk_ids:
+                            chunk_ids.append(cid)
+            ma, mb = by_id.get(key[0]), by_id.get(key[1])
+            cross_lang = bool(
+                ma
+                and mb
+                and ma.language
+                and mb.language
+                and ma.language != mb.language
+                and {ma.language, mb.language} <= {"ru", "en", "mixed"}
+            )
+            # also cross if one is mixed/ru and other en
+            if ma and mb and ma.language != mb.language:
+                cross_lang = True
             edges.append(
                 Edge(
                     source=key[0],
@@ -1215,6 +1270,7 @@ def layer_c_shared_entity(
                             display.get(e, e): strength.get(e, "weak") for e in sorted(common)[:10]
                         },
                         "chunk_ids": chunk_ids[:3],
+                        "cross_lang": cross_lang,
                     },
                 )
             )
@@ -1286,11 +1342,26 @@ def is_lex_proper_token(
     name_stems: set[str] | None = None,
     name_bases: set[str] | None = None,
     pos_stats: dict[str, dict[str, int]] | None = None,
+    lang: str = "ru",
 ) -> bool:
     """True for name-like / editorial / speech tokens to exclude from lex."""
     n = norm_ru(stem)
     if not n or len(n) < 4:
         return True
+    if lang == "en":
+        # English content is Latin; drop only EN stops / style / speech / stage.
+        from apps.api.services.graph_lexicon import lang_frozenset
+
+        key = n.lower()
+        en_drop = (
+            lang_frozenset("en", "lex_stopwords")
+            | lang_frozenset("en", "style_burst_hints")
+            | lang_frozenset("en", "speech_verbs")
+            | lang_frozenset("en", "play_stage_words")
+            | lang_frozenset("en", "editorial_stop_terms")
+        )
+        return key in en_drop
+    # Russian / mixed: Latin tokens are noise in literary corpora
     if re.search(r"[a-z]", n):
         return True
     if n in _DIMINUTIVE_NAMES or n in qi.AUTHOR_ALIASES:
@@ -1338,16 +1409,99 @@ def layer_d_lex_similar(
     counter: LexCandidateCounter | None = None,
     case_stats: dict[str, dict[str, int]] | None = None,
     pos_stats: dict[str, dict[str, int]] | None = None,
+    term_counts_by_lang: dict[str, dict[str, Counter[str] | dict[str, int]]] | None = None,
+    lang: str = "ru",
 ) -> tuple[list[Edge], dict[str, Any]]:
-    """Work-level lex similarity: sublinear TF-IDF, burstiness filter, mutual kNN."""
+    """Work-level lex similarity: sublinear TF-IDF, burstiness filter, mutual kNN.
+
+    When ``term_counts_by_lang`` is provided, IDF/vectors/edges are computed
+    separately per language (no cross-language lex edges).
+    """
     params = params or GraphIndexParams()
     case_stats = case_stats or {}
     pos_stats = pos_stats or {}
     by_id = {d.document_id: d for d in docs}
+    if term_counts_by_lang:
+        langs = sorted(
+            {
+                lg
+                for per in term_counts_by_lang.values()
+                for lg in (per or {})
+                if lg in {"ru", "en"}
+            }
+        )
+        if langs:
+            edges_all: list[Edge] = []
+            debug_all: dict[str, Any] = {
+                "bugfix": (
+                    "Per-language work vectors (tfidf∪residual); no cross-lang lex. "
+                    "Future cross-lang: local embeddings via Ollama (offline)."
+                ),
+                "by_lang": {},
+                "cross_lang_lex": False,
+                "cross_lang_note": (
+                    "Cross-language lex similarity is deferred; add later with local "
+                    "Ollama embeddings on GPU, never cloud upload."
+                ),
+            }
+            weak_total = 0
+            for lang in langs:
+                sub_counts: dict[str, Counter[str]] = {}
+                sub_docs: list[DocMeta] = []
+                for d in docs:
+                    raw = (term_counts_by_lang.get(d.document_id) or {}).get(lang) or {}
+                    c = Counter(raw)
+                    if not c:
+                        continue
+                    sub_counts[d.document_id] = c
+                    sub_docs.append(d)
+                if len(sub_docs) < 2:
+                    continue
+                e_lang, dbg = layer_d_lex_similar(
+                    docs=sub_docs,
+                    doc_term_counts=sub_counts,
+                    params=params,
+                    counter=counter,
+                    case_stats=case_stats if lang == "ru" else {},
+                    pos_stats=pos_stats if lang == "ru" else {},
+                    term_counts_by_lang=None,
+                    lang=lang,
+                )
+                for edge in e_lang:
+                    prov = dict(edge.provenance or {})
+                    prov["language"] = lang
+                    edge.provenance = prov
+                edges_all.extend(e_lang)
+                weak_total += int(dbg.get("weak_edges") or 0)
+                debug_all["by_lang"][lang] = {
+                    "edges": dbg.get("edges"),
+                    "threshold": dbg.get("threshold"),
+                    "kept_terms": dbg.get("kept_terms"),
+                    "n_works": dbg.get("n_works"),
+                    "weak_edges": dbg.get("weak_edges"),
+                    "burst_dropped_top30": dbg.get("burst_dropped_top30"),
+                    "burst_kept_top30": dbg.get("burst_kept_top30"),
+                }
+            debug_all["edges"] = len(edges_all)
+            debug_all["weak_edges"] = weak_total
+            # flatten burst lists for report
+            dropped: list = []
+            kept: list = []
+            for lg, blk in debug_all["by_lang"].items():
+                for row in blk.get("burst_dropped_top30") or []:
+                    dropped.append({**row, "language": lg})
+                for row in blk.get("burst_kept_top30") or []:
+                    kept.append({**row, "language": lg})
+            debug_all["burst_dropped_top30"] = dropped[:30]
+            debug_all["burst_kept_top30"] = kept[:30]
+            return edges_all, debug_all
+
     if len(doc_term_counts) < 1:
         return [], {"scores": [], "bugfix": "empty"}
 
-    name_stems, name_bases = collect_lex_name_exclusions(case_stats, pos_stats)
+    name_stems, name_bases = (
+        collect_lex_name_exclusions(case_stats, pos_stats) if lang != "en" else (set(), set())
+    )
 
     # Aggregate cleaned terms per work (canonical docs only expected)
     work_counts: dict[str, Counter[str]] = defaultdict(Counter)
@@ -1361,7 +1515,12 @@ def layer_d_lex_similar(
         work_rep.setdefault(wk, doc_id)
         for t, c in counts.items():
             if is_lex_proper_token(
-                t, case_stats, name_stems=name_stems, name_bases=name_bases, pos_stats=pos_stats
+                t,
+                case_stats,
+                name_stems=name_stems,
+                name_bases=name_bases,
+                pos_stats=pos_stats,
+                lang=lang,
             ):
                 continue
             work_counts[wk][t] += int(c)
@@ -2096,6 +2255,31 @@ def assemble_index(
 
     themes = sorted({d.theme for d in docs})
     authors = sorted({d.author_key for d in docs if d.author_key})
+    lang_dist = Counter(d.language or "unknown" for d in docs)
+    kind_dist = Counter(d.doc_kind or "unknown" for d in docs)
+    cross_lang_n = sum(
+        1
+        for e in edges
+        if e.type == "shared_entity" and (e.provenance or {}).get("cross_lang")
+    )
+    tech_id_examples: list[dict[str, Any]] = []
+    for e in edges:
+        if e.type != "shared_entity":
+            continue
+        kinds_map = (e.provenance or {}).get("entity_kinds") or {}
+        for lab, kind in kinds_map.items():
+            if kind in {"standard", "identifier", "acronym", "version"}:
+                tech_id_examples.append(
+                    {
+                        "entity": lab,
+                        "kind": kind,
+                        "cross_lang": bool((e.provenance or {}).get("cross_lang")),
+                        "source": e.source,
+                        "target": e.target,
+                    }
+                )
+        if len(tech_id_examples) >= 30:
+            break
     stats = {
         "documents": len(docs),
         "works": len(works),
@@ -2103,6 +2287,10 @@ def assemble_index(
         "authors": len(authors),
         "theme_list": themes,
         "author_list": authors,
+        "language_distribution": dict(lang_dist),
+        "doc_kind_distribution": dict(kind_dist),
+        "cross_lang_edges": cross_lang_n,
+        "technical_entity_examples": tech_id_examples[:20],
         "edge_counts_by_type": dict(edge_counts),
         "isolated_documents": len(isolated_content_ids),  # back-compat alias
         "isolated_content": len(isolated_content_ids),
@@ -2178,6 +2366,10 @@ def assemble_index(
                 "duplicate_of": d.duplicate_of,
                 "contained_in": d.contained_in,
                 "relation": d.relation,
+                "language": d.language,
+                "doc_kind": d.doc_kind,
+                "doc_version": d.doc_version,
+                "product_key": d.product_key,
             }
             for d in docs
         ],
@@ -2338,6 +2530,173 @@ def _apply_header_author(meta: DocMeta, hdr: dict[str, Any]) -> None:
         meta.work_key = work_key_for(pack=meta.pack, author_key=meta.author_key, title=meta.title)
 
 
+def _rewrite_technical_editions(
+    docs: list[DocMeta], dup_map: dict[str, dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """Technical docs with same work_key + different versions → edition_of (not duplicate)."""
+    by_work: dict[str, list[DocMeta]] = defaultdict(list)
+    for d in docs:
+        if (d.doc_kind or "") == "technical" and d.doc_version:
+            by_work[d.work_key].append(d)
+    out = {k: dict(v) for k, v in dup_map.items()}
+    for wk, members in by_work.items():
+        if len(members) < 2:
+            continue
+        # Prefer highest version string as canonical representative
+        ranked = sorted(members, key=lambda d: (d.doc_version or "", d.chunk_count), reverse=True)
+        parent = ranked[0]
+        for child in ranked[1:]:
+            info = out.get(child.document_id) or {
+                "canonical": True,
+                "duplicate_of": None,
+                "contained_in": None,
+                "sim": 0.0,
+                "coverage": 0.0,
+                "relation": "canonical",
+            }
+            # Don't override true containment
+            if info.get("contained_in"):
+                continue
+            info = dict(info)
+            info["canonical"] = False
+            info["duplicate_of"] = None
+            info["edition_of"] = parent.document_id
+            info["relation"] = "edition_of"
+            info["sim"] = float(info.get("sim") or 0.0)
+            out[child.document_id] = info
+            # Ensure parent stays canonical
+            pinfo = out.get(parent.document_id) or {}
+            pinfo = dict(pinfo)
+            pinfo["canonical"] = True
+            pinfo["duplicate_of"] = None
+            pinfo["edition_of"] = None
+            pinfo["relation"] = "canonical"
+            out[parent.document_id] = pinfo
+    return out
+
+
+def _edition_of_edges(docs: list[DocMeta], dup_map: dict[str, dict[str, Any]]) -> list[Edge]:
+    by_id = {d.document_id: d for d in docs}
+    edges: list[Edge] = []
+    for did, info in dup_map.items():
+        parent = info.get("edition_of")
+        if not parent or did not in by_id or parent not in by_id:
+            continue
+        child = by_id[did]
+        edges.append(
+            Edge(
+                source=parent,
+                target=did,
+                type="edition_of",
+                weight=1.0,
+                provenance={
+                    "child_version": child.doc_version,
+                    "parent_version": by_id[parent].doc_version,
+                    "work_key": child.work_key,
+                },
+            )
+        )
+    return edges
+
+
+def layer_tech_refers(
+    *,
+    docs: list[DocMeta],
+    chunk_iter: Iterable[tuple[str, str, str]],
+    params: GraphIndexParams | None = None,
+) -> list[Edge]:
+    """Technical refers: RFC/ISO/GOST/section refs; external ref:* if ≥2 citing docs."""
+    params = params or GraphIndexParams()
+    by_id = {d.document_id: d for d in docs}
+    # Build catalog of in-corpus titles/standards
+    title_index: dict[str, str] = {}
+    for d in docs:
+        title_index[norm_ru(d.title)] = d.document_id
+        for surface, _kind in glang.extract_identifiers(d.title or ""):
+            title_index[glang.identifier_key(surface)] = d.document_id
+
+    markers_ru = [norm_ru(x) for x in (tuple_field("tech_ref_markers") or ())]
+    from apps.api.services.graph_lexicon import lang_tuple
+
+    markers_en = [x.lower() for x in lang_tuple("en", "tech_ref_markers")]
+
+    # Collect citations: target_key → list of (src_doc, weight, provenance)
+    external_hits: dict[str, list[tuple[str, float, dict[str, Any]]]] = defaultdict(list)
+    edges: list[Edge] = []
+    per_doc: dict[str, list[Edge]] = defaultdict(list)
+
+    for doc_id, chunk_id, text in chunk_iter:
+        meta = by_id.get(doc_id)
+        if not meta:
+            continue
+        if (meta.doc_kind or "") not in {"technical", "nonfiction", "unknown"}:
+            continue
+        low = (text or "").lower()
+        # only scan chunks that look like they cite
+        if not any(m in low for m in markers_en + markers_ru) and not glang.extract_identifiers(text):
+            continue
+        for surface, kind in glang.extract_identifiers(text):
+            key = glang.identifier_key(surface)
+            target = title_index.get(key)
+            prov = {
+                "phrase": surface,
+                "match_form": "standard",
+                "kind": kind,
+                "chunk_ids": [chunk_id],
+                "zone": "body",
+            }
+            if target and target != doc_id:
+                per_doc[doc_id].append(
+                    Edge(
+                        source=doc_id,
+                        target=target,
+                        type="refers_to",
+                        weight=0.8,
+                        provenance=prov,
+                    )
+                )
+            else:
+                external_hits[key].append((doc_id, 0.5, prov))
+
+    # Emit internal edges (cap per doc)
+    for doc_id, lst in per_doc.items():
+        for e in lst[: params.refers_top_k]:
+            edges.append(e)
+
+    # External ref:* only if ≥2 distinct documents cite the same key
+    for key, hits in external_hits.items():
+        docs_hit = sorted({h[0] for h in hits})
+        if len(docs_hit) < 2:
+            continue
+        node = f"ref:{key}"
+        for src, w, prov in hits:
+            edges.append(
+                Edge(
+                    source=src,
+                    target=node,
+                    type="refers_to",
+                    weight=w,
+                    provenance={**prov, "external": True, "ref_node": node},
+                )
+            )
+    return edges
+
+
+def _apply_artifact_meta(meta: DocMeta, art: dict[str, Any]) -> None:
+    """Copy language/kind/author fields from a cached artifact onto DocMeta."""
+    if art.get("author_key") and not meta.author_key:
+        meta.author_key = art.get("author_key")
+        meta.author_ru = art.get("author_ru")
+        meta.author_source = art.get("author_source") or "ingest_header"
+        meta.work_key = work_key_for(pack=meta.pack, author_key=meta.author_key, title=meta.title)
+    if art.get("work_key"):
+        meta.work_key = str(art["work_key"])
+    meta.language = str(art.get("language") or meta.language or "unknown")
+    meta.doc_kind = str(art.get("doc_kind") or meta.doc_kind or "unknown")
+    meta.doc_version = art.get("doc_version") or meta.doc_version
+    meta.product_key = art.get("product_key") or meta.product_key
+
+
 def _build_doc_artifact(
     *,
     meta: DocMeta,
@@ -2350,10 +2709,15 @@ def _build_doc_artifact(
     entities: list[str] = []
     entity_chunks: dict[str, list[str]] = defaultdict(list)
     term_counts: Counter[str] = Counter()
+    term_counts_by_lang: dict[str, Counter[str]] = defaultdict(Counter)
     case_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"upper": 0, "lower": 0})
     pos_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"sent_start": 0, "mid": 0})
     chars_removed = 0
     examples: list[dict[str, str]] = []
+    chunk_langs: list[str] = []
+    identifiers: list[str] = []
+    identifier_kinds: dict[str, str] = {}
+    identifier_chunks: dict[str, list[str]] = defaultdict(list)
     raw_texts = [t for _, _, t in raw_chunks]
     chash = gcache.content_hash(
         version_id=version_id, filename=meta.filename, chunk_texts=raw_texts
@@ -2361,12 +2725,15 @@ def _build_doc_artifact(
     # A5: author from first-chunk text header (before clean), if still unknown
     if not meta.author_key and raw_chunks:
         first_raw = sorted(raw_chunks, key=lambda x: x[1])[0][2]
-        ak = gauth.detect_author_from_text_header(first_raw or "")
-        if ak:
-            meta.author_key = ak
-            meta.author_ru = _AUTHOR_RU_BY_KEY.get(ak)
-            meta.author_source = "text_header"
-            meta.work_key = work_key_for(pack=meta.pack, author_key=meta.author_key, title=meta.title)
+        # Literary author headers only for likely fiction / Russian
+        probe_lang = glang.detect_language(first_raw or "")
+        if glang.literary_rules_enabled("unknown", probe_lang):
+            ak = gauth.detect_author_from_text_header(first_raw or "")
+            if ak:
+                meta.author_key = ak
+                meta.author_ru = _AUTHOR_RU_BY_KEY.get(ak)
+                meta.author_source = "text_header"
+                meta.work_key = work_key_for(pack=meta.pack, author_key=meta.author_key, title=meta.title)
 
     for chunk_id, ord_n, text in raw_chunks:
         clean, hdr = clean_chunk_for_graph(
@@ -2383,28 +2750,61 @@ def _build_doc_artifact(
         chars_removed += removed
         if removed > 0 and len(examples) < 2:
             examples.append({"before": (text or "")[:220], "after": clean[:220]})
-        clean_chunks.append({"id": chunk_id, "ordinal": ord_n, "text": clean})
-        for m in re.finditer(r"[A-Za-zА-Яа-яЁё]{3,}", clean, flags=re.UNICODE):
-            w = m.group(0)
-            key = norm_ru(w)
-            if w[0].isupper():
-                case_stats[key]["upper"] += 1
-                if _is_sentence_start(clean, m.start()):
-                    pos_stats[key]["sent_start"] += 1
+        clang = glang.detect_language(clean)
+        chunk_langs.append(clang)
+        clean_chunks.append({"id": chunk_id, "ordinal": ord_n, "text": clean, "language": clang})
+        # Case/pos stats: literary name heuristics only for ru chunks
+        if clang in {"ru", "mixed", "unknown"}:
+            for m in re.finditer(r"[A-Za-zА-Яа-яЁё]{3,}", clean, flags=re.UNICODE):
+                w = m.group(0)
+                key = norm_ru(w)
+                if w[0].isupper():
+                    case_stats[key]["upper"] += 1
+                    if _is_sentence_start(clean, m.start()):
+                        pos_stats[key]["sent_start"] += 1
+                    else:
+                        pos_stats[key]["mid"] += 1
                 else:
-                    pos_stats[key]["mid"] += 1
-            else:
-                case_stats[key]["lower"] += 1
-        for e in extract_entity_candidates([clean], limit=params.entity_top_n):
-            cleaned = clean_entity_surface(e) or e
-            k = _entity_key(cleaned)
-            if cleaned not in entities:
-                entities.append(cleaned)
-            if chunk_id not in entity_chunks[k]:
-                entity_chunks[k].append(chunk_id)
-        for tok in tokenize_lex(clean):
-            term_counts[tok] += 1
+                    case_stats[key]["lower"] += 1
+        if clang in {"ru", "mixed", "unknown"}:
+            for e in extract_entity_candidates([clean], limit=params.entity_top_n):
+                cleaned = clean_entity_surface(e) or e
+                k = _entity_key(cleaned)
+                if cleaned not in entities:
+                    entities.append(cleaned)
+                if chunk_id not in entity_chunks[k]:
+                    entity_chunks[k].append(chunk_id)
+        for surface, kind in glang.extract_identifiers(clean):
+            ik = glang.identifier_key(surface)
+            if surface not in identifiers:
+                identifiers.append(surface)
+            identifier_kinds[surface] = kind
+            if chunk_id not in identifier_chunks[ik]:
+                identifier_chunks[ik].append(chunk_id)
+        # Lex tokens by chunk language (mixed → both pipelines lightly)
+        langs_for_tok = []
+        if clang == "mixed":
+            langs_for_tok = ["ru", "en"]
+        elif clang in {"ru", "en"}:
+            langs_for_tok = [clang]
+        else:
+            langs_for_tok = ["ru"]
+        for lg in langs_for_tok:
+            for tok in glang.tokenize_lex_lang(clean, lg):
+                term_counts_by_lang[lg][tok] += 1
+                term_counts[tok] += 1
     clean_text = "\n".join(ch["text"] for ch in clean_chunks)
+    language = glang.aggregate_doc_language(chunk_langs)
+    doc_kind = glang.detect_doc_kind(clean_text, language=language, filename=meta.filename)
+    base_title, doc_ver = glang.strip_doc_version(meta.title)
+    if doc_kind == "technical" and doc_ver:
+        meta.doc_version = doc_ver
+        # work_key without version so editions fold
+        meta.work_key = work_key_for(
+            pack=meta.pack, author_key=meta.author_key, title=base_title
+        )
+    meta.language = language
+    meta.doc_kind = doc_kind
     shingles = gdup.shingle_set(clean_text)
     word_count = len(gdup.tokenize_words(clean_text))
     minhash = list(gdup.minhash_signature(shingles))
@@ -2415,15 +2815,23 @@ def _build_doc_artifact(
         "version_id": version_id,
         "filename": meta.filename,
         "content_hash": chash,
+        "index_version": INDEX_VERSION,
         "author_key": meta.author_key,
         "author_ru": meta.author_ru,
         "author_source": meta.author_source,
         "title": meta.title,
         "work_key": meta.work_key,
+        "language": language,
+        "doc_kind": doc_kind,
+        "doc_version": meta.doc_version,
         "clean_chunks": clean_chunks,
         "entities": entities,
         "entity_chunks": dict(entity_chunks),
+        "identifiers": identifiers,
+        "identifier_kinds": identifier_kinds,
+        "identifier_chunks": dict(identifier_chunks),
         "term_counts": dict(term_counts),
+        "term_counts_by_lang": {k: dict(v) for k, v in term_counts_by_lang.items()},
         "case_stats": {k: dict(v) for k, v in case_stats.items()},
         "pos_stats": {k: dict(v) for k, v in pos_stats.items()},
         "chars_removed": chars_removed,
@@ -2602,16 +3010,16 @@ def build_index_for_tenant(
         ver = ver_by_doc[meta.document_id]
         cached_art = gcache.read_doc_artifact(tenant_id, meta.document_id)
         # Fast path: same active version_id → reuse artifact without loading chunks
-        if cached_art and str(cached_art.get("version_id") or "") == str(ver.id):
+        if (
+            cached_art
+            and str(cached_art.get("version_id") or "") == str(ver.id)
+            and cached_art.get("language")
+            and cached_art.get("term_counts_by_lang") is not None
+            and int(cached_art.get("index_version") or 0) == INDEX_VERSION
+        ):
             artifacts[meta.document_id] = cached_art
             lifecycle["cached"] += 1
-            if cached_art.get("author_key") and not meta.author_key:
-                meta.author_key = cached_art.get("author_key")
-                meta.author_ru = cached_art.get("author_ru")
-                meta.author_source = cached_art.get("author_source") or "ingest_header"
-                meta.work_key = work_key_for(
-                    pack=meta.pack, author_key=meta.author_key, title=meta.title
-                )
+            _apply_artifact_meta(meta, cached_art)
             continue
         raw_chunks = _chunks_for_version(db, tenant_id, ver.id)
         chash = gcache.content_hash(
@@ -2619,13 +3027,20 @@ def build_index_for_tenant(
             filename=meta.filename,
             chunk_texts=[t for _, _, t in raw_chunks],
         )
-        # Reuse when content_hash matches even if version_id field was missing
-        if cached_art and cached_art.get("content_hash") == chash:
+        # Reuse when content_hash matches AND multilang fields present
+        if (
+            cached_art
+            and cached_art.get("content_hash") == chash
+            and cached_art.get("language")
+            and cached_art.get("term_counts_by_lang") is not None
+            and int(cached_art.get("index_version") or 0) == INDEX_VERSION
+        ):
             cached_art = dict(cached_art)
             cached_art["version_id"] = str(ver.id)
             gcache.write_doc_artifact(tenant_id, meta.document_id, cached_art)
             artifacts[meta.document_id] = cached_art
             lifecycle["cached"] += 1
+            _apply_artifact_meta(meta, cached_art)
             continue
         art = _build_doc_artifact(
             meta=meta,
@@ -2695,6 +3110,10 @@ def build_index_for_tenant(
     doc_entities: dict[str, list[str]] = {}
     doc_entity_chunks: dict[str, dict[str, list[str]]] = {}
     doc_term_counts: dict[str, Counter[str]] = {}
+    term_counts_by_lang: dict[str, dict[str, Counter[str]]] = {}
+    doc_identifiers: dict[str, list[str]] = {}
+    identifier_kinds_by_doc: dict[str, dict[str, str]] = {}
+    identifier_chunks: dict[str, dict[str, list[str]]] = {}
     case_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"upper": 0, "lower": 0})
     pos_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"sent_start": 0, "mid": 0})
     chunk_rows: list[tuple[str, str, str]] = []
@@ -2703,9 +3122,17 @@ def build_index_for_tenant(
     chunk_total = 0
     for meta in docs:
         art = artifacts[meta.document_id]
+        _apply_artifact_meta(meta, art)
         doc_entities[meta.document_id] = list(art.get("entities") or [])
         doc_entity_chunks[meta.document_id] = dict(art.get("entity_chunks") or {})
         doc_term_counts[meta.document_id] = Counter(art.get("term_counts") or {})
+        by_lang_raw = art.get("term_counts_by_lang") or {}
+        term_counts_by_lang[meta.document_id] = {
+            lg: Counter(vals or {}) for lg, vals in by_lang_raw.items()
+        }
+        doc_identifiers[meta.document_id] = list(art.get("identifiers") or [])
+        identifier_kinds_by_doc[meta.document_id] = dict(art.get("identifier_kinds") or {})
+        identifier_chunks[meta.document_id] = dict(art.get("identifier_chunks") or {})
         for k, v in (art.get("case_stats") or {}).items():
             case_stats[k]["upper"] += int(v.get("upper") or 0)
             case_stats[k]["lower"] += int(v.get("lower") or 0)
@@ -2720,6 +3147,8 @@ def build_index_for_tenant(
             chunk_rows.append((meta.document_id, str(ch.get("id")), ch.get("text") or ""))
             chunk_total += 1
         meta.chunk_count = len(art.get("clean_chunks") or [])
+    # Optional doc_kind overrides (after artifact load)
+    override_applied.extend(govr.apply_doc_kind_overrides(docs))
 
     # E1: duplicates + contained_in (minhash/LSH); DF only on canonical
     texts_by_id = {
@@ -2738,6 +3167,7 @@ def build_index_for_tenant(
         if fp.get("minhash"):
             fingerprints[did] = fp
     dup_map = gdup.detect_relations(docs, texts_by_id, fingerprints=fingerprints)
+    dup_map = _rewrite_technical_editions(docs, dup_map)
     canon_ids = gdup.canonical_doc_ids(dup_map)
     for meta in docs:
         info = dup_map.get(meta.document_id) or {}
@@ -2745,6 +3175,10 @@ def build_index_for_tenant(
         meta.duplicate_of = info.get("duplicate_of")
         meta.contained_in = info.get("contained_in")
         meta.relation = str(info.get("relation") or "canonical")
+        if info.get("edition_of"):
+            meta.relation = "edition_of"
+            meta.duplicate_of = info.get("edition_of")
+            meta.canonical = False
 
     # Rebuild global stats from canonical docs only (no duplicates / contained)
     case_stats = defaultdict(lambda: {"upper": 0, "lower": 0})
@@ -2766,15 +3200,26 @@ def build_index_for_tenant(
     doc_entities_canon = {k: v for k, v in doc_entities.items() if k in canon_ids}
     doc_entity_chunks_canon = {k: v for k, v in doc_entity_chunks.items() if k in canon_ids}
     doc_term_counts_canon = {k: v for k, v in doc_term_counts.items() if k in canon_ids}
+    term_by_lang_canon = {k: v for k, v in term_counts_by_lang.items() if k in canon_ids}
+    doc_identifiers_canon = {k: v for k, v in doc_identifiers.items() if k in canon_ids}
+    id_kinds_canon = {k: v for k, v in identifier_kinds_by_doc.items() if k in canon_ids}
+    id_chunks_canon = {k: v for k, v in identifier_chunks.items() if k in canon_ids}
 
     edges: list[Edge] = []
     t_l = time.perf_counter()
     edges.extend(layer_a_edges(docs))
     edges.extend(gdup.contains_edges_from_map(dup_map, edge_cls=Edge))
+    edges.extend(_edition_of_edges(docs, dup_map))
     layer_ms["layer_a"] = int((time.perf_counter() - t_l) * 1000)
 
     t_l = time.perf_counter()
-    edges.extend(layer_mentions_author(docs=docs_canon, chunk_iter=chunk_rows_canon))
+    # Mentions_author: literary / Russian only
+    docs_lit = [
+        d
+        for d in docs_canon
+        if glang.literary_rules_enabled(d.doc_kind or "unknown", d.language or "unknown")
+    ]
+    edges.extend(layer_mentions_author(docs=docs_lit, chunk_iter=chunk_rows_canon))
     layer_ms["mentions_author"] = int((time.perf_counter() - t_l) * 1000)
 
     t_l = time.perf_counter()
@@ -2785,10 +3230,12 @@ def build_index_for_tenant(
         for d in docs
         if not (dup_map.get(d.document_id) or {}).get("contained_in")
         and not (dup_map.get(d.document_id) or {}).get("duplicate_of")
+        and not (dup_map.get(d.document_id) or {}).get("edition_of")
     }
     chunk_rows_refers = [r for r in chunk_rows if r[0] in source_ids]
     refers = layer_b_refers_to(docs=docs, chunk_iter=chunk_rows_refers, params=params)
     edges.extend(gdup.rewrite_refers_to_contains(refers, dup_map, edge_cls=Edge))
+    edges.extend(layer_tech_refers(docs=docs, chunk_iter=chunk_rows_refers, params=params))
     layer_ms["refers_to"] = int((time.perf_counter() - t_l) * 1000)
 
     t_l = time.perf_counter()
@@ -2800,6 +3247,9 @@ def build_index_for_tenant(
             case_stats={k: dict(v) for k, v in case_stats.items()},
             pos_stats={k: dict(v) for k, v in pos_stats.items()},
             params=params,
+            doc_identifiers=doc_identifiers_canon,
+            identifier_kinds=id_kinds_canon,
+            identifier_chunks=id_chunks_canon,
         )
     )
     layer_ms["shared_entity"] = int((time.perf_counter() - t_l) * 1000)
@@ -2812,6 +3262,7 @@ def build_index_for_tenant(
         counter=LexCandidateCounter(),
         case_stats={k: dict(v) for k, v in case_stats.items()},
         pos_stats={k: dict(v) for k, v in pos_stats.items()},
+        term_counts_by_lang=term_by_lang_canon,
     )
     edges.extend(lex_edges)
     layer_ms["lex_similar"] = int((time.perf_counter() - t_l) * 1000)

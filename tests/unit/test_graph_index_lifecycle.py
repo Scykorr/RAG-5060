@@ -153,9 +153,16 @@ def test_delete_doc_removes_from_work_edges():
 def test_lexicon_config_loads_offline():
     gl.reload_graph_lexicon()
     data = gl.load_graph_lexicon()
-    assert "genre_markers" in data
-    assert "play_stage_words" in data
+    # Nested multilang (1e-M) or legacy flat
+    if "ru" in data and isinstance(data["ru"], dict):
+        assert "genre_markers" in data["ru"]
+        assert "play_stage_words" in data["ru"]
+        assert "en" in data and "lex_stopwords" in data["en"]
+    else:
+        assert "genre_markers" in data
+        assert "play_stage_words" in data
     assert gl.frozenset_field("play_stage_words")
+    assert gl.lang_frozenset("en", "lex_stopwords")
 
 
 def test_params_hash_includes_lexicon_content(tmp_path, monkeypatch):

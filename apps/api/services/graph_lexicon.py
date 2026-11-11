@@ -1,8 +1,7 @@
 """Load editable language-only lexicon for the connectivity graph (offline).
 
-Corpus-specific authors/titles/frequencies are NEVER stored here — only general
-Russian literary language rules (edition markers, play stage directions, genre
-words, common toponym lemmas, etc.).
+Supports both legacy flat keys and nested ``{"ru": {...}, "en": {...}, "shared": {...}}``.
+Corpus-specific authors/titles/frequencies are NEVER stored here.
 """
 
 from __future__ import annotations
@@ -45,16 +44,48 @@ def reload_graph_lexicon() -> dict[str, Any]:
     return load_graph_lexicon()
 
 
-def frozenset_field(key: str) -> frozenset[str]:
-    raw = load_graph_lexicon().get(key) or []
+def lang_block(lang: str) -> dict[str, Any]:
+    """Return language (or shared) block; fall back to flat legacy keys for ru."""
+    data = load_graph_lexicon()
+    block = data.get(lang)
+    if isinstance(block, dict):
+        return block
+    if lang == "ru":
+        # Legacy flat lexicon: everything except nested containers
+        skip = {"ru", "en", "shared", "lang_detect", "comment"}
+        return {k: v for k, v in data.items() if k not in skip}
+    return {}
+
+
+def lang_frozenset(lang: str, key: str) -> frozenset[str]:
+    raw = lang_block(lang).get(key) or []
+    if not raw and lang == "ru":
+        raw = load_graph_lexicon().get(key) or []
     return frozenset(str(x).lower().replace("ё", "е") for x in raw)
 
 
-def tuple_field(key: str) -> tuple[str, ...]:
-    raw = load_graph_lexicon().get(key) or []
+def lang_tuple(lang: str, key: str) -> tuple[str, ...]:
+    raw = lang_block(lang).get(key) or []
+    if not raw and lang == "ru":
+        raw = load_graph_lexicon().get(key) or []
     return tuple(str(x) for x in raw)
 
 
-def dict_field(key: str) -> dict[str, Any]:
-    raw = load_graph_lexicon().get(key) or {}
+def lang_dict(lang: str, key: str) -> dict[str, Any]:
+    raw = lang_block(lang).get(key) or {}
+    if not raw and lang == "ru":
+        raw = load_graph_lexicon().get(key) or {}
     return raw if isinstance(raw, dict) else {}
+
+
+def frozenset_field(key: str) -> frozenset[str]:
+    """Back-compat: Russian (or flat) field."""
+    return lang_frozenset("ru", key)
+
+
+def tuple_field(key: str) -> tuple[str, ...]:
+    return lang_tuple("ru", key)
+
+
+def dict_field(key: str) -> dict[str, Any]:
+    return lang_dict("ru", key)
