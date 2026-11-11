@@ -95,18 +95,61 @@ def _tokens_with_spans(raw: str) -> list[tuple[str, int, int, str]]:
     return out
 
 
+_CASE_SUFFIXES = frozenset(
+    {
+        "",
+        "а",
+        "я",
+        "у",
+        "ю",
+        "е",
+        "ы",
+        "и",
+        "ой",
+        "ей",
+        "ом",
+        "ем",
+        "ам",
+        "ям",
+        "ах",
+        "ях",
+        "ою",
+        "ею",
+        "ым",
+        "им",
+        "ых",
+        "их",
+        "ую",
+        "юю",
+    }
+)
+
+
 def _token_match(text_tok: str, title_tok: str) -> bool:
+    """Case/light-inflection match. Иван ≠ Иванов; Иванова ≈ Иванов."""
     if text_tok == title_tok:
         return True
-    # Inflection: same stem, length close
-    st = stem_ru(text_tok)
-    tt = stem_ru(title_tok)
-    if len(tt) >= 3 and st == tt:
+    if len(title_tok) < 3 or len(text_tok) < 3:
+        return False
+    # text is title + case ending (Иванов → Иванова)
+    if text_tok.startswith(title_tok) and text_tok[len(title_tok) :] in _CASE_SUFFIXES:
         return True
-    if len(tt) >= 4 and (text_tok.startswith(tt) or title_tok.startswith(st)):
-        if abs(len(text_tok) - len(title_tok)) <= 4:
-            return True
-    return False
+    # text is shorter case form only when title itself ends with that ending
+    if title_tok.startswith(text_tok) and title_tok[len(text_tok) :] in _CASE_SUFFIXES:
+        return True
+    # shared long prefix + both differ by a case suffix only
+    n = min(len(text_tok), len(title_tok))
+    keep = max(4, n - 2)
+    if text_tok[:keep] != title_tok[:keep]:
+        return False
+    if abs(len(text_tok) - len(title_tok)) > 3:
+        return False
+    # Reject surname/base mismatches (иван* vs иванов*)
+    if title_tok.endswith(("ов", "ев", "ёв", "ин", "ын")) and not text_tok.startswith(title_tok[: max(4, len(title_tok) - 1)]):
+        return False
+    t_suf = title_tok[keep:]
+    x_suf = text_tok[keep:]
+    return t_suf in _CASE_SUFFIXES and x_suf in _CASE_SUFFIXES
 
 
 def _is_sentence_start(raw: str, idx: int) -> bool:
@@ -150,28 +193,64 @@ def _quote_equals_title(inner: str, title_tokens_n: list[str]) -> bool:
     return all(_token_match(a, b) for a, b in zip(toks, title_tokens_n))
 
 
+def commentary_cut(raw: str) -> int:
+    """Index in norm_ru(raw) where commentary section begins (or len)."""
+    body = norm_ru(raw or "")
+    cut = len(body)
+    for m in commentary_markers():
+        pos = body.find(m)
+        if 0 <= pos < cut:
+            cut = pos
+    return cut
+
+
+def detect_zone_fast(raw: str, idx: int, cut: int | None = None) -> str:
+    if cut is None:
+        return detect_zone(raw, idx)
+    line_start = (raw or "").rfind("\n", 0, idx) + 1
+    line = (raw or "")[line_start : idx + 40]
+    if re.match(r"^\s*(\*|\[\d+\]|\d+\))", line):
+        return "commentary"
+    body = norm_ru(raw or "")
+    if idx >= cut and cut < len(body):
+        return "commentary"
+    return "body"
+
+
 def find_title_hits(
     raw: str,
     title_surface: str,
+    *,
+    tokens: list[tuple[str, int, int, str]] | None = None,
+    quoted_spans: list[tuple[int, int, str]] | None = None,
+    zone_cut: int | None = None,
+    first_index: dict[str, list[int]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Find full-title hits with match_form classification inputs."""
+    """Find full-title hits with match_form classification inputs.
+
+    Optional precomputed ``tokens`` / ``quoted_spans`` / ``zone_cut`` / ``first_index``
+    avoid rescanning the same chunk for every title candidate.
+    """
     toks = title_tokens(title_surface)
     if not toks:
         return []
     multi = len(toks) >= 2
     hits: list[dict[str, Any]] = []
-    tokens = _tokens_with_spans(raw)
+    if tokens is None:
+        tokens = _tokens_with_spans(raw)
+    if quoted_spans is None:
+        quoted_spans = _exact_quoted_spans(raw)
+    if zone_cut is None:
+        zone_cut = commentary_cut(raw)
 
     # Exact quote matches first
-    for a, b, inner in _exact_quoted_spans(raw):
+    for a, b, inner in quoted_spans:
         if not _quote_equals_title(inner, toks):
             continue
-        # require capital letter somewhere in quoted title surface (first letter of content)
         inner_stripped = inner.lstrip()
         if not inner_stripped:
             continue
         if not inner_stripped[0].isupper() and not inner_stripped.isupper():
-            # allow all-caps; require at least one uppercase letter
             if not any(ch.isupper() for ch in inner_stripped):
                 continue
         hits.append(
@@ -180,31 +259,39 @@ def find_title_hits(
                 "end": b,
                 "match_form": "quoted",
                 "multiword": multi,
-                "zone": detect_zone(raw, a),
+                "zone": detect_zone_fast(raw, a, zone_cut),
             }
         )
 
-    # Full token-sequence matches (all title tokens in order)
+    # Full token-sequence matches — jump by first-token index when available
     n = len(toks)
-    for i in range(0, len(tokens) - n + 1):
+    if n == 0 or len(tokens) < n:
+        return hits
+    start_positions: list[int]
+    if first_index is not None:
+        keys = {toks[0], stem_ru(toks[0])}
+        start_positions = sorted({i for k in keys for i in (first_index.get(k) or [])})
+    else:
+        start_positions = list(range(0, len(tokens) - n + 1))
+    for i in start_positions:
+        if i + n > len(tokens):
+            continue
         window = tokens[i : i + n]
         if not all(_token_match(window[j][0], toks[j]) for j in range(n)):
             continue
         start, end = window[0][1], window[-1][2]
-        # skip if already covered by a quote hit
         if any(h["start"] <= start < h["end"] or start <= h["start"] < end for h in hits):
             continue
         first_surf = window[0][3]
         if not first_surf or not first_surf[0].isupper():
-            # lowercase sequence never counts
             continue
         hits.append(
             {
                 "start": start,
                 "end": end,
-                "match_form": None,  # classify later
+                "match_form": None,
                 "multiword": multi,
-                "zone": detect_zone(raw, start),
+                "zone": detect_zone_fast(raw, start, zone_cut),
                 "capitalized": not _is_sentence_start(raw, start),
                 "token_index": i,
             }

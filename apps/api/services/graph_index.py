@@ -47,7 +47,7 @@ from apps.api.services.text_entities import (
 
 log = structlog.get_logger()
 
-INDEX_VERSION = 8
+INDEX_VERSION = 9
 
 # Filename grammar tokens (source-site / language folder markers), not corpus content.
 SOURCE_TOKENS = frozenset({"ch", "eb"})
@@ -669,10 +669,14 @@ def layer_b_refers_to(
         phrases, lower_df, n_docs=len(docs), top_frac=0.20
     )
 
+    # Index by first token + its stem (inflected first words in text)
     by_first: dict[str, list[tuple[str, str, str, bool]]] = defaultdict(list)
     for item in phrases:
         first = item[0].split()[0] if item[0] else item[0]
         by_first[first].append(item)
+        st = stem_ru(first)
+        if st and st != first:
+            by_first[st].append(item)
 
     hits: dict[str, dict[str, dict[str, Any]]] = defaultdict(
         lambda: defaultdict(
@@ -693,15 +697,35 @@ def layer_b_refers_to(
         if not raw.strip():
             continue
         src_meta = by_id.get(doc_id)
-        tokens_present = {t[0] for t in grefer._tokens_with_spans(raw)}
+        tok_spans = grefer._tokens_with_spans(raw)
+        tokens_present = {t[0] for t in tok_spans}
+        first_index: dict[str, list[int]] = defaultdict(list)
+        for i, (n, _a, _b, _s) in enumerate(tok_spans):
+            first_index[n].append(i)
+            st = stem_ru(n)
+            if st != n:
+                first_index[st].append(i)
+        quoted_spans = grefer._exact_quoted_spans(raw)
+        zone_cut = grefer.commentary_cut(raw)
+        has_quotes = bool(quoted_spans)
+        genre_present = bool(tokens_present & set(grefer.genre_markers()))
+        # Only capitalized tokens can start a title hit (lowercase never counts)
+        cap_norms = {
+            t[0]
+            for t in tok_spans
+            if t[3] and t[3][0].isupper()
+        }
         candidates: list[tuple[str, str, str, bool]] = []
-        for tok in tokens_present:
+        seed_toks = set(cap_norms)
+        if has_quotes:
+            # quotes may contain titles whose first word isn't capitalized outside
+            for _a, _b, inner in quoted_spans:
+                seed_toks.update(grefer.title_tokens(inner)[:1])
+        for tok in seed_toks:
             candidates.extend(by_first.get(tok) or [])
-        for first, plist in by_first.items():
-            if len(first) >= 4 and any(
-                t.startswith(first[:4]) for t in tokens_present
-            ):
-                candidates.extend(plist)
+            st = stem_ru(tok)
+            if st != tok:
+                candidates.extend(by_first.get(st) or [])
         seen_c: set[tuple[str, str]] = set()
         uniq: list[tuple[str, str, str, bool]] = []
         for item in sorted(candidates, key=lambda x: -len(x[0])):
@@ -713,12 +737,22 @@ def layer_b_refers_to(
 
         matched_spans: list[tuple[int, int]] = []
         for phrase_n, target_id, surface, multi in uniq:
+            # One-word titles only accept quoted|genre — skip chunks with neither
+            if not multi and not has_quotes and not genre_present:
+                continue
             if target_id == doc_id:
                 continue
             tgt_meta = by_id.get(target_id)
             if same_work(src_meta, tgt_meta):
                 continue
-            found = grefer.find_title_hits(raw, surface)
+            found = grefer.find_title_hits(
+                raw,
+                surface,
+                tokens=tok_spans,
+                quoted_spans=quoted_spans if has_quotes else [],
+                zone_cut=zone_cut,
+                first_index=first_index,
+            )
             if not found:
                 continue
             same_author = bool(
@@ -2024,7 +2058,9 @@ def build_index_for_tenant(
             filename=meta.filename,
             chunk_texts=[t for _, _, t in raw_chunks],
         )
-        cached_art = None if build_mode == "full" else gcache.read_doc_artifact(tenant_id, meta.document_id)
+        # Reuse per-doc artifacts whenever content_hash matches (full rebuild still
+        # recomputes global stats/edges; only changed docs are re-scanned).
+        cached_art = gcache.read_doc_artifact(tenant_id, meta.document_id)
         if cached_art and cached_art.get("content_hash") == chash:
             artifacts[meta.document_id] = cached_art
             lifecycle["cached"] += 1

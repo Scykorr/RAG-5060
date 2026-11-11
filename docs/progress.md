@@ -1,5 +1,14 @@
 # Progress
 
+## 2026-11-11 — Graph connectivity 1d complete (report)
+
+- task_id: T-GRAPH-IDX-1D-A — verified (unit + corpus report)
+- Report: `artifacts/20261111-050958-graph-index/` vs baseline `20261110-133444` (v3)
+- INDEX_VERSION=9; refers 640→51; shared 673→328; lex 664→449; no_author 48→33 (text_header=15)
+- refers precision sample ≈90%; built_ms warm≈62s (cached=702); cold full≈98s
+- Lifecycle Part B already in 7f0937d; unit lifecycle 6 passed; CONNECTIVITY_LIFECYCLE.md present
+- Gandhi: absent on full corpus due to high-df shared stems after name drop (pair-only score≈0.60)
+
 ## 2026-11-10 — Graph connectivity 1d A6–A7 (duplicates + isolation report)
 
 - task_id: T-GRAPH-IDX-1D-A — in progress (A1–A7 done)
