@@ -1,3 +1,9 @@
+## 2026-11-11 — Graph 1e E1 fix (shingle hashes)
+
+- Full shingle hashes (n=5); compare to top-8 longest per work; eb→duplicate, fragments→contained_in
+- Report `artifacts/20261111-054754-graph-index/` (pre-fix); re-report pending
+- weak_floor default 0.12; unit duplicates green
+
 ## 2026-11-11 — Graph 1e E3–E8
 
 - E3 co_cited: drop >N / alphabetical / list-query; weight×0.5; isolated_*_no_cocited

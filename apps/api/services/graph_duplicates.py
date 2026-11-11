@@ -14,12 +14,14 @@ from typing import Any
 
 _TOKEN_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+", re.UNICODE)
 
-SHINGLE_N = 8
+SHINGLE_N = 5  # shorter shingles tolerate OCR/edition drift
 MINHASH_SIZE = 128
 LSH_BANDS = 16  # 16 × 8 = 128
 LSH_ROWS = MINHASH_SIZE // LSH_BANDS
-DUP_JACCARD = 0.80
+DUP_JACCARD = 0.72
 CONTAIN_COVERAGE = 0.80
+DUP_NEAR_EQUAL_RATIO = 0.55
+DUP_HIGH_CONTAIN = 0.90
 
 
 def tokenize_words(text: str) -> list[str]:
@@ -50,14 +52,28 @@ def minhash_signature(shingles: list[str] | set[str], *, size: int = MINHASH_SIZ
     return tuple(sig)
 
 
-def shingle_set(text: str, *, n: int = SHINGLE_N, max_keep: int = 4000) -> set[str]:
-    """Exact shingle strings; subsample deterministically if huge."""
+def shingle_hashes(text: str, *, n: int = SHINGLE_N, max_keep: int = 120_000) -> set[str]:
+    """MD5 of each n-shingle. Keep all hashes up to ``max_keep`` (no sparse subsample).
+
+    Sparse hash-order sampling destroyed containment of fragments inside novels.
+    """
     sh = tokenize_shingles(text, n=n)
+    if not sh:
+        return set()
     if len(sh) <= max_keep:
-        return set(sh)
-    hashed = sorted((hashlib.md5(s.encode("utf-8")).hexdigest(), s) for s in sh)
-    step = max(1, len(hashed) // max_keep)
-    return {s for _, s in hashed[::step][:max_keep]}
+        return {hashlib.md5(s.encode("utf-8")).hexdigest() for s in sh}
+    # If truly huge: keep head+tail+stride so local fragments still hit
+    head = sh[: max_keep // 3]
+    tail = sh[-(max_keep // 3) :]
+    mid = sh[max_keep // 3 : len(sh) - max_keep // 3]
+    step = max(1, len(mid) // max(1, max_keep - len(head) - len(tail)))
+    chosen = head + mid[::step] + tail
+    return {hashlib.md5(s.encode("utf-8")).hexdigest() for s in chosen[:max_keep]}
+
+
+def shingle_set(text: str, *, n: int = SHINGLE_N, max_keep: int = 120_000) -> set[str]:
+    """Alias: hash set used for Jaccard / containment."""
+    return shingle_hashes(text, n=n, max_keep=max_keep)
 
 
 def jaccard(a: set[str], b: set[str]) -> float:
@@ -188,16 +204,23 @@ def detect_relations(
                 for b in gids[i + 1 :]:
                     _score_pair(a, b)
 
-    # Same work_key always exhaustively up to 120 (Anna fragments)
+    # Same work_key: compare every doc to the longest containers (not full N²)
     by_work: dict[str, list[Any]] = defaultdict(list)
     for d in docs:
         by_work[getattr(d, "work_key", "") or "_"].append(d)
     for group in by_work.values():
-        if len(group) < 2 or len(group) > 120:
+        if len(group) < 2:
             continue
-        gids = [d.document_id for d in group]
-        for i, a in enumerate(gids):
-            for b in gids[i + 1 :]:
+        ranked = sorted(group, key=lambda d: -sizes.get(d.document_id, 0))
+        containers = [d.document_id for d in ranked[:8]]
+        for d in group:
+            a = d.document_id
+            for b in containers:
+                if a != b:
+                    _score_pair(a, b)
+        # near-equal editions among top containers
+        for i, a in enumerate(containers):
+            for b in containers[i + 1 :]:
                 _score_pair(a, b)
 
     out: dict[str, dict[str, Any]] = {
@@ -220,19 +243,21 @@ def detect_relations(
         sa_n, sb_n = sizes[a], sizes[b]
         ratio = (min(sa_n, sb_n) / max(sa_n, sb_n)) if max(sa_n, sb_n) else 0.0
         jac = sc["jaccard"]
-        # Near-equal length + high Jaccard → duplicate edition
-        if jac >= dup_threshold and ratio >= 0.55:
+        # Near-equal length editions: Jaccard or mutual high containment → duplicate
+        if ratio >= DUP_NEAR_EQUAL_RATIO and (
+            jac >= dup_threshold
+            or min(sc["cov_ab"], sc["cov_ba"]) >= DUP_HIGH_CONTAIN
+        ):
             if sa_n >= sb_n:
-                dup_edges.append((jac, b, a))
+                dup_edges.append((max(jac, sc["cov_ba"]), b, a))
             else:
-                dup_edges.append((jac, a, b))
+                dup_edges.append((max(jac, sc["cov_ab"]), a, b))
             continue
-        # Shorter mostly inside longer → contained_in (even if Jaccard looks high on samples)
+        # Shorter mostly inside longer → contained_in (one-way)
         if sc["cov_ab"] >= contain_threshold and sa_n < sb_n:
             contain_edges.append((sc["cov_ab"], a, b))
-        if sc["cov_ba"] >= contain_threshold and sb_n < sa_n:
+        elif sc["cov_ba"] >= contain_threshold and sb_n < sa_n:
             contain_edges.append((sc["cov_ba"], b, a))
-        # Similar-ish but not equal: still allow duplicate if Jaccard high
         elif jac >= dup_threshold and ratio >= 0.35:
             if sa_n >= sb_n:
                 dup_edges.append((jac, b, a))

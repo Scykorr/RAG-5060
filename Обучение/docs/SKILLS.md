@@ -77,7 +77,7 @@
 | S52 | UI через Windows-прокси :18080 → docker :28080 | F5 / ERR_CONNECTION_REFUSED | Держать `RAG5060.exe start` (не закрывать окно); docker publish 28080 | launcher/proxy.go |
 | S53 | Graph Obsidian-like на Cytoscape (не D3) | Вкладка графа / «сетка» узлов | Hide orphans; size∝degree; BFS depth; click→local; Анализ при 0 рёбер | graph.js |
 | S54 | Connectivity index offline + lifecycle | Сборка графа / reset / дозагрузка корпуса | Кэш `tenant+fp+version+params_hash` (**params_hash включает SHA1 `graph_lexicon.json`**); atomic write + `current/<tenant>.json`; lock-файл `graph/locks/<tenant>.lock` (timeout/dead pid); после ingestion `stale=true` → `POST /index/rebuild` или `GRAPH_AUTO_REBUILD=true`; invalidate только свой tenant; report: volume `rag5060_ragdata` | CONNECTIVITY_LIFECYCLE.md; A19 |
-| S55 | Connectivity quality: строгие refers/lex/ents/authors | Правки `graph_index` / ложные рёбра / отчёт | 1) refers: полное название, заглавная/кавычки, genre 0–2 токена, без стем-фамилий (`graph_refers`); 2) lex: имена по mid-cap≥0.7 до стемма + editorial/speech из `graph_lexicon.json`; 3) entities: лемма+strong≥1; 4) authors: `graph_authors` + `author_name_table`; 5) дубли shinле/canonical; 6) язык только в конфиге | `pytest tests/unit/test_graph_*.py`; report `artifacts/20261111-050958-graph-index/` |
+| S55 | Connectivity quality 1d/1e | Правки `graph_index` / ложные рёбра / отчёт | 1d gates + 1e: duplicate/contained_in/contains; work-lex+burst+mutual kNN+weak; co_cited filter; strong df≤3; work_mentions weight; refers question/ambiguous; overrides; noop | `pytest tests/unit/test_graph_*.py`; report vs `artifacts/20261111-050958-graph-index/` |
 
 ---
 

@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-BASELINE_RUN = "20261110-133444-graph-index"
+BASELINE_RUN = "20261111-050958-graph-index"
 
 LEX_GOOD = [
     ("Севастополь в декабре месяце", "Рубка леса"),
@@ -189,7 +189,7 @@ def main() -> int:
         deg_vals = sorted(deg.values())
         rng = random.Random(42)
         lines: list[str] = []
-        lines.append("# Graph connectivity index report (slice 1d)")
+        lines.append("# Graph connectivity index report (slice 1e)")
         lines.append("")
         lines.append(f"- run_id: `{run_id}`")
         lines.append(f"- baseline: `{BASELINE_RUN}`")
@@ -201,6 +201,7 @@ def main() -> int:
         lines.append(f"- build_mode: `{stats.get('build_mode')}`")
         lines.append(f"- lifecycle: `{stats.get('lifecycle')}`")
         lines.append(f"- duplicates: `{stats.get('duplicates')}`")
+        lines.append(f"- co_cited_filter: `{stats.get('co_cited_filter')}`")
         lines.append("")
         lines.append("## Totals")
         lines.append("")
@@ -216,8 +217,15 @@ def main() -> int:
             f"/ isolated_structural: **{stats.get('isolated_structural')}**"
         )
         lines.append(
+            f"- isolated_content_no_cocited: **{stats.get('isolated_content_no_cocited')}**"
+        )
+        lines.append(
             f"- isolated_works: **{stats.get('isolated_works')}** "
             f"(share={stats.get('isolated_work_share')})"
+        )
+        lines.append(
+            f"- isolated_works_no_cocited: **{stats.get('isolated_works_no_cocited')}** "
+            f"(share={stats.get('isolated_work_share_no_cocited')})"
         )
         lines.append("")
         lines.append("## Isolated content top-20 (by size)")
@@ -235,6 +243,31 @@ def main() -> int:
                 f"- {row.get('title')} · `{row.get('filename')}`\n"
                 f"  head: `{(row.get('head') or '')[:200]}`"
             )
+        lines.append("")
+        # E7 stub for hand-filled overrides
+        no_auth = stats.get("documents_without_author_preview") or []
+        stub = {
+            "authors_by_filename_prefix": {
+                str(r.get("filename") or "").rsplit(".", 1)[0]: None for r in no_auth
+            },
+            "authors_by_work_key": {},
+            "merge_works": [],
+        }
+        stub_path = out_dir / "overrides_stub_no_author.json"
+        stub_path.write_text(json.dumps(stub, ensure_ascii=False, indent=2), encoding="utf-8")
+        lines.append(f"- overrides stub: `{stub_path.name}` ({len(no_auth)} entries, author_key=null)")
+        lines.append("")
+
+        lex_dbg = stats.get("lex_debug") or {}
+        lines.append("## Lex burstiness / weak")
+        lines.append("")
+        lines.append(f"- weak_edges: **{lex_dbg.get('weak_edges')}** / edges: **{lex_dbg.get('edges')}**")
+        lines.append("- burst_dropped_top30:")
+        for row in (lex_dbg.get("burst_dropped_top30") or [])[:30]:
+            lines.append(f"  - {row}")
+        lines.append("- burst_kept_top30:")
+        for row in (lex_dbg.get("burst_kept_top30") or [])[:30]:
+            lines.append(f"  - {row}")
         lines.append("")
 
         tc = stats.get("text_clean") or {}
