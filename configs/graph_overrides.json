@@ -1,0 +1,7 @@
+{
+  "comment": "Optional manual author/work overrides. Edit by hand. author_source becomes override. Offline only.",
+  "authors_by_filename_prefix": {},
+  "authors_by_work_key": {},
+  "merge_works": [],
+  "split_works": []
+}

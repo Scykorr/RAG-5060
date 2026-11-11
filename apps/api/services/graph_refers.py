@@ -327,6 +327,22 @@ def _near_author_tokens(
     return False
 
 
+def question_title_starters() -> frozenset[str]:
+    return frozenset_field("question_title_starters") or frozenset(
+        {"кто", "что", "где", "куда", "когда", "почему", "зачем", "как", "чей", "чья", "чье", "чьё"}
+    )
+
+
+def foreign_marker_near(raw: str, start: int, end: int, window: int = 40) -> bool:
+    snip = (raw or "")[max(0, start - window) : end + window]
+    n = norm_ru(snip)
+    if re.search(r"\((франц|нем|англ|итал|лат|польск)", n):
+        return True
+    if re.search(r"\b(de l'|dell'|von |van |the )\b", snip, flags=re.I):
+        return True
+    return False
+
+
 def classify_hit(
     raw: str,
     hit: dict[str, Any],
@@ -334,8 +350,10 @@ def classify_hit(
     author_key: str | None,
     same_author: bool,
     frequent_title: bool,
+    person_name_title: bool = False,
+    question_title: bool = False,
 ) -> str | None:
-    """Apply A1 strong-form rules; return match_form or None."""
+    """Apply A1/E6 strong-form rules; return match_form or None."""
     if hit.get("match_form") == "quoted":
         form = "quoted"
     else:
@@ -349,7 +367,6 @@ def classify_hit(
         multi = bool(hit.get("multiword"))
 
         if genre_ok and (cap or True):
-            # genre requires title capitalized or quoted; we already require capital on sequence
             form = "genre_marker"
         elif near and (cap or hit.get("match_form") == "quoted"):
             form = "near_author"
@@ -361,6 +378,9 @@ def classify_hit(
         # One-word: only quoted or genre_marker
         if not multi and form not in ("quoted", "genre_marker"):
             return None
+        # E6: person-name one-word titles and question-starters → quoted only
+        if (person_name_title or question_title) and form != "quoted":
+            return None
         # Same-author works: only quoted/genre
         if same_author and form not in ("quoted", "genre_marker"):
             return None
@@ -369,7 +389,6 @@ def classify_hit(
             return None
 
     if form == "quoted":
-        # one-word quoted ok; same-author quoted ok
         return "quoted"
     return form
 

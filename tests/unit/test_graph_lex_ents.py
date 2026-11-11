@@ -98,6 +98,7 @@ def test_single_weak_name_no_shared_edge():
 
 
 def test_strong_surname_creates_edge():
+    # Cross-author needs ≥2 strong entities (E4)
     docs = [
         gi.parse_doc_meta(
             document_id="a",
@@ -111,12 +112,11 @@ def test_strong_surname_creates_edge():
     edges = gi.layer_c_shared_entity(
         docs=docs,
         doc_entities={
-            "a": ["Вронский", "Кити"],
+            "a": ["Вронский", "Смердяков"],
             "b": ["Вронский", "Смердяков"],
         },
         pos_stats={
             norm_ru("Вронский"): {"sent_start": 1, "mid": 15},
-            norm_ru("Кити"): {"sent_start": 1, "mid": 10},
             norm_ru("Смердяков"): {"sent_start": 1, "mid": 12},
         },
         params=gi.GraphIndexParams(shared_min_entities=1),
@@ -136,24 +136,23 @@ def test_anna_annoy_count_as_one_in_common():
     """Анна + Анной in one doc should be one lemma, not two shared."""
     docs = [
         gi.parse_doc_meta(document_id="a", filename="classic_0001_Tolstoy_X_aaaaaaaa.txt"),
-        gi.parse_doc_meta(document_id="b", filename="classic_0002_Gorky_Y_bbbbbbbb.txt"),
+        gi.parse_doc_meta(document_id="b", filename="classic_0002_Tolstoy_Y_bbbbbbbb.txt"),
     ]
-    # Force a strong entity too so an edge can form; Анна forms must collapse
+    # Same author: 1 strong enough; Анна forms must collapse
     edges = gi.layer_c_shared_entity(
         docs=docs,
         doc_entities={
-            "a": ["Анна", "Анной", "Иван Федорович"],
-            "b": ["Анна", "Иван Федорович"],
+            "a": ["Анна", "Анной", "Вронский"],
+            "b": ["Анна", "Вронский"],
         },
         pos_stats={
             norm_ru("Анна"): {"sent_start": 1, "mid": 20},
             norm_ru("Анной"): {"sent_start": 0, "mid": 10},
-            "иван": {"sent_start": 0, "mid": 5},
+            norm_ru("Вронский"): {"sent_start": 0, "mid": 8},
         },
         params=gi.GraphIndexParams(shared_min_entities=1),
     )
     assert edges
     ents = edges[0].provenance.get("entities") or []
-    # at most one Анна-label after lemma fold + display dedupe
-    anna_labels = [e for e in ents if "анна" in norm_ru(e) and "иван" not in norm_ru(e)]
+    anna_labels = [e for e in ents if "анна" in norm_ru(e) and "вронск" not in norm_ru(e)]
     assert len(anna_labels) <= 1

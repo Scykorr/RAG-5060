@@ -252,11 +252,20 @@ def clear_stale_flag(tenant_id: UUID | str) -> None:
 
 
 def params_hash(params_dict: dict[str, Any], *, lexicon_hash: str | None = None) -> str:
-    """Hash of build params + lexicon file content (invalidates on lexicon edit)."""
+    """Hash of build params + lexicon + overrides file content."""
     from apps.api.services.graph_lexicon import lexicon_content_hash
 
     payload = dict(params_dict)
     payload["lexicon_sha1"] = lexicon_hash or lexicon_content_hash()
+    try:
+        from apps.api.services.graph_overrides import load_overrides
+
+        ov = load_overrides()
+        payload["overrides_sha1"] = hashlib.sha1(
+            json.dumps(ov, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:12]
+    except Exception:  # noqa: BLE001
+        payload["overrides_sha1"] = "none"
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 

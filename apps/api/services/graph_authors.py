@@ -6,7 +6,7 @@ import re
 from typing import Any
 
 from apps.api.services import query_intent as qi
-from apps.api.services.graph_lexicon import dict_field
+from apps.api.services.graph_lexicon import dict_field, frozenset_field
 from apps.api.services.text_entities import norm_ru, stem_ru
 
 _TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё]+", re.UNICODE)
@@ -185,6 +185,8 @@ def find_author_mentions(raw: str) -> list[dict[str, Any]]:
                     }
                 )
 
+    ambiguous = frozenset_field("ambiguous_author_surnames")
+
     filtered: list[dict[str, Any]] = []
     for h in hits:
         if h.get("form") == "initials":
@@ -192,16 +194,27 @@ def find_author_mentions(raw: str) -> list[dict[str, Any]]:
             continue
         key = h["author_key"]
         pre = raw[: h["start"]].rstrip()
-        if re.search(r"(?:[A-ZА-ЯЁ]\.\s*)+$", pre):
+        surf_n = norm_ru(h.get("surface") or "")
+        has_initials = bool(re.search(r"(?:[A-ZА-ЯЁ]\.\s*)+$", pre))
+        if has_initials:
             filtered.append(h)
             continue
         mpre = re.search(r"([A-ZА-ЯЁ][a-zа-яёA-ZА-ЯЁ\-]{2,40})$", pre)
+        given_ok = False
         if mpre:
             given = norm_ru(mpre.group(1))
             # Capitalized token before surname that is not this author's name
             # → reject («Игнатий Некрасов»). Genre words etc. may also reject
             # rare false cases; initials form is handled separately.
             if not _first_name_ok(given, key) and len(given) >= 4:
+                continue
+            given_ok = _first_name_ok(given, key)
+        # Ambiguous adjective-surnames («Горький народ») need name/initials
+        if surf_n in ambiguous or any(surf_n.startswith(a[:4]) for a in ambiguous if len(a) >= 4):
+            if not given_ok and h.get("confidence") != "high":
+                # sentence-start capital alone is not enough
+                continue
+            if not given_ok:
                 continue
         filtered.append(h)
 

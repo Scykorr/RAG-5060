@@ -25,13 +25,14 @@ from sqlalchemy.orm import Session
 from apps.api.models import ChatMessage, ChatSession, Chunk, Document, DocumentVersion
 from apps.api.services import query_intent as qi
 from apps.api.services import graph_index_cache as gcache
-from apps.api.services.graph_lexicon import frozenset_field, tuple_field
+from apps.api.services.graph_lexicon import dict_field, frozenset_field, tuple_field
 from apps.api.services.quality_state import corpus_fingerprint
 from apps.api.services.storage import data_root
 from apps.api.services.graph_text_clean import clean_chunk_for_graph
 from apps.api.services import graph_refers as grefer
 from apps.api.services import graph_authors as gauth
 from apps.api.services import graph_duplicates as gdup
+from apps.api.services import graph_overrides as govr
 from apps.api.services.text_entities import (
     EDITION_STOP,
     ENTITY_DENY,
@@ -684,6 +685,16 @@ def layer_b_refers_to(
         phrases, lower_df, n_docs=len(docs), top_frac=0.20
     )
 
+    # Ambiguous titles: same norm used by ≥2 authors
+    title_authors: dict[str, set[str]] = defaultdict(set)
+    title_by_author: dict[tuple[str, str], str] = {}
+    for phrase_n, did, _surf, _multi in phrases:
+        meta = by_id.get(did)
+        if meta and meta.author_key:
+            title_authors[phrase_n].add(meta.author_key)
+            title_by_author[(phrase_n, meta.author_key)] = did
+    title_author_count = {k: len(v) for k, v in title_authors.items()}
+
     # Index by first token + its stem (inflected first words in text)
     by_first: dict[str, list[tuple[str, str, str, bool]]] = defaultdict(list)
     for item in phrases:
@@ -778,6 +789,20 @@ def layer_b_refers_to(
                 and src_meta.author_key == tgt_meta.author_key
             )
             freq = phrase_n in frequent
+            title_toks = grefer.title_tokens(surface)
+            q_starters = grefer.question_title_starters()
+            question_title = bool(title_toks and title_toks[0] in q_starters)
+            person_name_title = (not multi) and bool(
+                is_name_surface_form(surface, case_stats={}, pos_stats={})
+                or (surface[:1].isupper() and len(title_toks) == 1 and _SURNAME_RE.search(norm_ru(surface)))
+                or (surface[:1].isupper() and len(norm_ru(surface)) <= 8 and norm_ru(surface) in _DIMINUTIVE_NAMES)
+            )
+            # Prefer same-author target when title is ambiguous across authors
+            ambiguous = title_author_count.get(phrase_n, 0) >= 2
+            if ambiguous and src_meta and src_meta.author_key:
+                own = title_by_author.get((phrase_n, src_meta.author_key))
+                if own and own != target_id:
+                    continue
             accepted = False
             best = None
             for hit in found:
@@ -792,6 +817,8 @@ def layer_b_refers_to(
                     author_key=tgt_meta.author_key if tgt_meta else None,
                     same_author=same_author,
                     frequent_title=freq,
+                    person_name_title=person_name_title,
+                    question_title=question_title,
                 )
                 if form:
                     hit = dict(hit)
@@ -804,10 +831,26 @@ def layer_b_refers_to(
             matched_spans.append((best["start"], best["end"]))
             zone = best.get("zone") or grefer.detect_zone(raw, best["start"])
             w = 0.3 if zone == "commentary" else 1.0
+            conf = "high"
+            if grefer.foreign_marker_near(raw, best["start"], best["end"]):
+                conf = "low"
+                w *= 0.3
+            if ambiguous and not same_author and best.get("match_form") != "quoted":
+                # other author's title without target author nearby
+                tokens = grefer._tokens_with_spans(raw)
+                if not grefer._near_author_tokens(
+                    tokens, best["start"], best["end"], tgt_meta.author_key if tgt_meta else None
+                ):
+                    conf = "low"
+                    w *= 0.3
             bucket = hits[doc_id][target_id]
             if chunk_id not in bucket["chunks"]:
                 bucket["chunks"].append(chunk_id)
                 bucket["weight_sum"] += w
+            if conf == "low":
+                bucket["confidence"] = "low"
+            elif not bucket.get("confidence"):
+                bucket["confidence"] = conf
             if not bucket["phrase"] or (multi and not bucket["multi"]):
                 bucket["phrase"] = surface
                 bucket["multi"] = bool(multi)
@@ -839,6 +882,7 @@ def layer_b_refers_to(
                         "multiword": bool(info["multi"]),
                         "match_form": info["match_form"],
                         "zone": info.get("zone") or "body",
+                        "confidence": info.get("confidence") or "high",
                     },
                 )
             )
@@ -972,16 +1016,17 @@ def entity_strength(
         return "drop"
     if kind == "place":
         return "strong" if df <= 3 else "weak"
+    # E4: strong only when rare across works (df ≤ 3) after form merge
+    if df > 3:
+        return "weak"
     if len(parts) >= 2:
-        # multiword name / ФИО
+        # multiword name / ФИО — still weak if common; strong only if rare
         return "strong"
-    # single token — check surface (before aggressive lemma stem) for surname endings
     last = parts[-1] if parts else n
-    if df <= 3 and (_SURNAME_RE.search(last) or _SURNAME_RE.search(key)):
+    if _SURNAME_RE.search(last) or _SURNAME_RE.search(key):
         return "strong"
     if df <= 1 and len(key) >= 4:
-        return "strong"  # unique proper
-    # lone given name without patronymic/surname
+        return "strong"
     return "weak"
 
 
@@ -1009,9 +1054,37 @@ def layer_c_shared_entity(
     display_count: dict[str, Counter[str]] = defaultdict(Counter)
     kinds: dict[str, str] = {}
 
+    def _author_fio_keys(meta: DocMeta | None) -> set[str]:
+        if not meta or not meta.author_key:
+            return set()
+        table = dict_field("author_name_table").get(meta.author_key) or {}
+        out: set[str] = set()
+        for bucket in ("first", "patronymic", "surnames"):
+            for x in table.get(bucket) or []:
+                out.add(_entity_key(str(x)))
+        # common FIO compounds for this author
+        firsts = [norm_ru(x) for x in (table.get("first") or [])]
+        pats = [norm_ru(x) for x in (table.get("patronymic") or [])]
+        for f in firsts:
+            for p in pats:
+                out.add(_entity_key(f"{f} {p}"))
+        out.add(_entity_key(meta.author_key))
+        if meta.author_ru:
+            out.add(_entity_key(meta.author_ru))
+        return {x for x in out if x}
+
+    def _title_keys(meta: DocMeta | None) -> set[str]:
+        if not meta:
+            return set()
+        out = {_entity_key(meta.title)}
+        for part in re.findall(r"[A-Za-zА-Яа-яЁё]{3,}", meta.title or ""):
+            out.add(_entity_key(part))
+        return {x for x in out if x}
+
     for doc_id, ents in doc_entities.items():
         keys: set[str] = set()
         meta = by_id.get(doc_id)
+        skip_keys = _author_fio_keys(meta) | _title_keys(meta)
         for e in ents[: params.entity_top_n * 2]:
             cleaned = clean_entity_surface(e)
             if not cleaned:
@@ -1025,6 +1098,8 @@ def layer_c_shared_entity(
             if len(k) < 3 or k in EDITION_STOP or k in PLAY_STAGE_WORDS:
                 continue
             if k in _ENTITY_INTERJECTIONS:
+                continue
+            if k in skip_keys:
                 continue
             keys.add(k)
             display_count[k][cleaned] += 1
@@ -1082,6 +1157,13 @@ def layer_c_shared_entity(
     for (a, b), common in pair_common.items():
         strong_common = {e for e in common if strength.get(e) == "strong"}
         if not strong_common:
+            continue
+        ma, mb = by_id.get(a), by_id.get(b)
+        same_author = bool(
+            ma and mb and ma.author_key and mb.author_key and ma.author_key == mb.author_key
+        )
+        # Cross-author: need ≥2 distinct strong entities
+        if not same_author and len(strong_common) < 2:
             continue
         w = sum(idf(e) for e in common)
         neigh[a].append((w, b, common))
@@ -1516,20 +1598,83 @@ def extract_doc_ids_from_citations(citations: Any) -> list[str]:
     return out
 
 
+def _list_query_markers() -> tuple[str, ...]:
+    return tuple_field("list_query_markers") or (
+        "перечисли",
+        "перечислите",
+        "какие произведения",
+        "какой список",
+        "список",
+        "назови все",
+        "назовите все",
+        "все произведения",
+    )
+
+
+def is_list_query(text: str | None) -> bool:
+    n = norm_ru(text or "")
+    return any(m in n for m in _list_query_markers())
+
+
+def citations_look_alphabetical(labels: list[str]) -> bool:
+    """True if ≥4 labels are already sorted by filename/title (list-answer artifact)."""
+    labs = [str(x).strip() for x in labels if str(x).strip()]
+    if len(labs) < 4:
+        return False
+    low = [norm_ru(x) for x in labs]
+    return low == sorted(low) or labs == sorted(labs)
+
+
 def layer_e_co_cited(
-    citation_lists: Iterable[tuple[list[str], bool]],
+    citation_lists: Iterable[Any],
     *,
     include_eval: bool = False,
-) -> list[Edge]:
-    """citation_lists: (doc_ids, is_eval)."""
+    max_sources: int = 6,
+    weight_scale: float = 0.5,
+) -> tuple[list[Edge], dict[str, Any]]:
+    """citation_lists items: (doc_ids, is_eval) or dict with ids/labels/user_text/is_eval."""
     live: Counter[tuple[str, str]] = Counter()
     ev: Counter[tuple[str, str]] = Counter()
-    for cites, is_eval in citation_lists:
-        ids = sorted({str(x) for x in cites if x})
+    dropped = {"too_many": 0, "alphabetical": 0, "list_query": 0, "accepted": 0}
+
+    for item in citation_lists:
+        labels: list[str] = []
+        user_text = ""
+        is_eval = False
+        cites: list[str] = []
+        if isinstance(item, dict):
+            cites = [str(x) for x in (item.get("ids") or item.get("doc_ids") or []) if x]
+            labels = [str(x) for x in (item.get("labels") or []) if x]
+            user_text = str(item.get("user_text") or item.get("question") or "")
+            is_eval = bool(item.get("is_eval"))
+        elif isinstance(item, (tuple, list)) and len(item) >= 2:
+            cites = list(item[0] or [])
+            is_eval = bool(item[1])
+            if len(item) >= 3 and isinstance(item[2], dict):
+                labels = list(item[2].get("labels") or [])
+                user_text = str(item[2].get("user_text") or "")
+        else:
+            continue
+        ids = list(dict.fromkeys(str(x) for x in cites if x))
+        if len(ids) < 2:
+            continue
+        if len(ids) > max_sources:
+            dropped["too_many"] += 1
+            continue
+        if is_list_query(user_text):
+            dropped["list_query"] += 1
+            continue
+        if citations_look_alphabetical(labels or ids):
+            dropped["alphabetical"] += 1
+            continue
+        dropped["accepted"] += 1
+        # pair without forcing alphabetical sort of ids (preserve answer order noise out)
         bucket = ev if is_eval else live
-        for i in range(len(ids)):
-            for j in range(i + 1, len(ids)):
-                bucket[(ids[i], ids[j])] += 1
+        ordered = sorted(ids)
+        for i in range(len(ordered)):
+            for j in range(i + 1, len(ordered)):
+                bucket[(ordered[i], ordered[j])] += 1
+
     edges: list[Edge] = []
     for (a, b), w in live.items():
         edges.append(
@@ -1537,8 +1682,12 @@ def layer_e_co_cited(
                 source=a,
                 target=b,
                 type="co_cited",
-                weight=float(w),
-                provenance={"co_citation_answers": w, "channel": "live"},
+                weight=float(w) * float(weight_scale),
+                provenance={
+                    "co_citation_answers": w,
+                    "channel": "live",
+                    "weight_scale": weight_scale,
+                },
             )
         )
     if include_eval:
@@ -1548,11 +1697,11 @@ def layer_e_co_cited(
                     source=a,
                     target=b,
                     type="co_cited_eval",
-                    weight=float(w) * 0.5,
+                    weight=float(w) * 0.5 * float(weight_scale),
                     provenance={"co_citation_answers": w, "channel": "eval"},
                 )
             )
-    return edges
+    return edges, dropped
 
 
 def aggregate_work_edges(
@@ -1581,7 +1730,8 @@ def aggregate_work_edges(
             key = (sa.work_key, e.target)
             slot = author_acc.setdefault(key, {"weight": 0.0, "examples": [], "chunks": 0})
             slot["weight"] += float(e.weight)
-            slot["chunks"] += int(e.weight)
+            cids = (e.provenance or {}).get("chunk_ids") or []
+            slot["chunks"] += len(cids) if cids else (1 if e.weight else 0)
             if len(slot["examples"]) < 5:
                 slot["examples"].append(
                     {
@@ -1653,10 +1803,11 @@ def aggregate_work_edges(
                 source=f"work:{wk}",
                 target=author_node,
                 type="work_mentions_author",
-                weight=float(slot["chunks"]),
+                weight=round(float(slot["weight"]), 4),
                 provenance={
                     "examples": slot["examples"],
-                    "chunk_mentions": slot["chunks"],
+                    "chunk_mentions": int(slot["chunks"]),
+                    "weight_sum": round(float(slot["weight"]), 4),
                 },
             )
         )
@@ -1686,14 +1837,25 @@ def assemble_index(
         "co_cited_eval",
         "mentions_author",
     }
+    content_types_no_cocited = {
+        "refers_to",
+        "shared_entity",
+        "lex_similar",
+        "mentions_author",
+    }
     structural_types = {"wrote", "in_theme", "part_of", "work_meta", "contains"}
     content_linked: set[str] = set()
+    content_linked_no_cc: set[str] = set()
     structural_linked: set[str] = set()
     for e in edges:
         if e.type in content_types:
             content_linked.add(e.source)
             if not str(e.target).startswith("author:"):
                 content_linked.add(e.target)
+        if e.type in content_types_no_cocited:
+            content_linked_no_cc.add(e.source)
+            if not str(e.target).startswith("author:"):
+                content_linked_no_cc.add(e.target)
         if e.type in structural_types or e.type in content_types or e.type.startswith("work_"):
             if not str(e.source).startswith("author:"):
                 structural_linked.add(e.source.removeprefix("work:"))
@@ -1707,6 +1869,9 @@ def assemble_index(
 
     by_id = {d.document_id: d for d in docs}
     isolated_content_ids = [d.document_id for d in docs if d.document_id not in content_linked]
+    isolated_content_no_cc_ids = [
+        d.document_id for d in docs if d.document_id not in content_linked_no_cc
+    ]
     isolated_structural_ids = [
         d.document_id
         for d in docs
@@ -1740,19 +1905,28 @@ def assemble_index(
 
     works = {d.work_key: d for d in docs}
     work_linked: set[str] = set()
+    work_linked_no_cc: set[str] = set()
     for e in edges:
         if e.type.startswith("work_") and e.type != "work_meta":
-            work_linked.add(e.source.removeprefix("work:"))
+            endpoints = {e.source.removeprefix("work:")}
             if not str(e.target).startswith("author:"):
-                work_linked.add(e.target.removeprefix("work:"))
+                endpoints.add(e.target.removeprefix("work:"))
+            work_linked |= endpoints
+            if e.type not in ("work_co_cited", "work_co_cited_eval"):
+                work_linked_no_cc |= endpoints
         if e.type in ("refers_to", "shared_entity", "lex_similar", "co_cited", "co_cited_eval"):
             sa = by_id.get(e.source)
             sb = by_id.get(e.target)
             if sa:
                 work_linked.add(sa.work_key)
+                if e.type not in ("co_cited", "co_cited_eval"):
+                    work_linked_no_cc.add(sa.work_key)
             if sb:
                 work_linked.add(sb.work_key)
+                if e.type not in ("co_cited", "co_cited_eval"):
+                    work_linked_no_cc.add(sb.work_key)
     isolated_works = [wk for wk in works if wk not in work_linked]
+    isolated_works_no_cc = [wk for wk in works if wk not in work_linked_no_cc]
     no_author = [d for d in docs if not d.author_key]
     frag_docs = [d.document_id for d in docs if d.fragment_no is not None]
     work_frag: Counter[str] = Counter(d.work_key for d in docs)
@@ -1781,11 +1955,16 @@ def assemble_index(
         "edge_counts_by_type": dict(edge_counts),
         "isolated_documents": len(isolated_content_ids),  # back-compat alias
         "isolated_content": len(isolated_content_ids),
+        "isolated_content_no_cocited": len(isolated_content_no_cc_ids),
         "isolated_structural": len(isolated_structural_ids),
         "isolated_content_top20": isolated_content_top,
         "isolated_document_ids_sample": isolated_content_ids[:20],
         "isolated_works": len(isolated_works),
+        "isolated_works_no_cocited": len(isolated_works_no_cc),
         "isolated_work_share": round(len(isolated_works) / max(1, len(works)), 4),
+        "isolated_work_share_no_cocited": round(
+            len(isolated_works_no_cc) / max(1, len(works)), 4
+        ),
         "fragment_documents": len(frag_docs),
         "documents_without_author": len(no_author),
         "documents_without_author_sample": [d.document_id for d in no_author[:20]],
@@ -2157,6 +2336,43 @@ def build_index_for_tenant(
             log.info("graph_index_cache_hit", tenant_id=str(tenant_id), fingerprint=fp)
             return cached
 
+    # E8 noop: unchanged corpus + params → return current index in ~1s (even if force)
+    ptr = gcache.read_current_pointer(tenant_id) or {}
+    if (
+        ptr.get("fingerprint") == fp
+        and ptr.get("params_hash") == ph
+        and not ptr.get("stale")
+        and ptr.get("index_file")
+    ):
+        prev = read_index(gcache.graph_dir() / str(ptr["index_file"]))
+        if prev and prev.get("version") == INDEX_VERSION and prev.get("params_hash") in (None, ph):
+            prev = dict(prev)
+            prev["built_ms"] = int((time.perf_counter() - t0) * 1000)
+            st = dict(prev.get("stats") or {})
+            st["build_mode"] = "noop"
+            st["lifecycle"] = {
+                "added": 0,
+                "changed": 0,
+                "removed": 0,
+                "cached": int(st.get("documents") or len(prev.get("documents") or [])),
+            }
+            st["stale"] = False
+            prev["stats"] = st
+            gcache.write_build_status(
+                tenant_id,
+                {
+                    "status": "ready",
+                    "mode": "noop",
+                    "fingerprint": fp,
+                    "params_hash": ph,
+                    "built_ms": prev["built_ms"],
+                    "stale": False,
+                    "index_file": ptr.get("index_file"),
+                },
+            )
+            log.info("graph_index_noop", tenant_id=str(tenant_id), fingerprint=fp)
+            return prev
+
     rows = _active_documents(db, tenant_id)
     if mode in ("full", "incremental"):
         build_mode = mode
@@ -2200,6 +2416,9 @@ def build_index_for_tenant(
         docs.append(meta)
         ver_by_doc[meta.document_id] = ver
     resolve_work_keys(docs)
+    override_applied = govr.apply_overrides(docs)
+    if override_applied:
+        resolve_work_keys(docs)
 
     layer_ms: dict[str, int] = {}
     lifecycle = {"added": 0, "changed": 0, "removed": 0, "cached": 0}
@@ -2360,18 +2579,61 @@ def build_index_for_tenant(
     layer_ms["lex_similar"] = int((time.perf_counter() - t_l) * 1000)
 
     t_l = time.perf_counter()
-    cite_lists: list[tuple[list[str], bool]] = []
+    cite_lists: list[dict[str, Any]] = []
     msgs = (
-        db.query(ChatMessage.citations, ChatSession.title)
+        db.query(ChatMessage.id, ChatMessage.citations, ChatMessage.session_id, ChatSession.title)
         .join(ChatSession, ChatSession.id == ChatMessage.session_id)
         .filter(ChatMessage.tenant_id == tenant_id, ChatMessage.role == "assistant")
         .all()
     )
-    for citations, title in msgs:
+    # optional preceding user text per session (best-effort)
+    user_by_session: dict[str, str] = {}
+    try:
+        umsgs = (
+            db.query(ChatMessage.session_id, ChatMessage.content)
+            .filter(ChatMessage.tenant_id == tenant_id, ChatMessage.role == "user")
+            .order_by(ChatMessage.created_at.desc())
+            .limit(500)
+            .all()
+        )
+        for sid, content in umsgs:
+            sk = str(sid)
+            if sk not in user_by_session:
+                user_by_session[sk] = content or ""
+    except Exception:  # noqa: BLE001
+        user_by_session = {}
+    for _mid, citations, session_id, title in msgs:
         ids = extract_doc_ids_from_citations(citations)
-        if len(ids) >= 2:
-            cite_lists.append((ids, is_eval_chat_session(title)))
-    edges.extend(layer_e_co_cited(cite_lists, include_eval=params.include_eval_cocited))
+        if len(ids) < 2:
+            continue
+        labels: list[str] = []
+        if isinstance(citations, list):
+            for item in citations:
+                if isinstance(item, dict):
+                    labels.append(
+                        str(
+                            item.get("filename")
+                            or item.get("title")
+                            or item.get("original_name")
+                            or item.get("document_id")
+                            or ""
+                        )
+                    )
+        cite_lists.append(
+            {
+                "ids": ids,
+                "labels": labels,
+                "user_text": user_by_session.get(str(session_id), ""),
+                "is_eval": is_eval_chat_session(title),
+            }
+        )
+    co_edges, co_dropped = layer_e_co_cited(
+        cite_lists,
+        include_eval=params.include_eval_cocited,
+        max_sources=params.co_cited_max_sources,
+        weight_scale=params.co_cited_weight_scale,
+    )
+    edges.extend(co_edges)
     edges.extend(aggregate_work_edges(docs, edges, top_k=params.work_neighbor_top_k))
     layer_ms["co_cited_and_work_agg"] = int((time.perf_counter() - t_l) * 1000)
 
@@ -2385,6 +2647,8 @@ def build_index_for_tenant(
         built_ms=built_ms,
         extra_stats={
             "lex_debug": lex_debug,
+            "co_cited_filter": co_dropped,
+            "overrides_applied": override_applied[:40],
             "duplicates": gdup.relation_stats(dup_map),
             "documents_without_author_preview": [
                 {

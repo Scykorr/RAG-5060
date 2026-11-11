@@ -1,3 +1,12 @@
+## 2026-11-11 — Graph 1e E3–E8
+
+- E3 co_cited: drop >N / alphabetical / list-query; weight×0.5; isolated_*_no_cocited
+- E4 shared_entity: strong only df≤3; exclude author FIO/title; cross-author ≥2 strong
+- E5 work_mentions_author weight fix; ambiguous Gorky needs name/initials
+- E6 refers: question/person titles quoted-only; ambiguous/foreign → confidence=low ×0.3
+- E7 configs/graph_overrides.json; E8 noop rebuild when fp+params unchanged
+- pytest graph unit: 76 passed
+
 ## 2026-11-11 — Graph 1e E2 (work-level lex)
 
 - Work vectors: 1+log tf, IDF, df∈[2,30%], burstiness, mutual kNN, weak floor

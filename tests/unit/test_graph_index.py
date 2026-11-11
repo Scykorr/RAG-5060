@@ -190,13 +190,13 @@ def test_co_cited_live_vs_eval():
     assert gi.is_eval_chat_session("intent-smoke")
     assert gi.is_eval_chat_session("ping")
     assert not gi.is_eval_chat_session("сколько произведений Чехова в хранилище?")
-    edges = gi.layer_e_co_cited(
+    edges, _ = gi.layer_e_co_cited(
         [(["d1", "d2"], False), (["d1", "d2"], True), (["d3", "d4"], True)],
         include_eval=False,
     )
     assert any(e.type == "co_cited" and set((e.source, e.target)) == {"d1", "d2"} for e in edges)
     assert not any(e.type == "co_cited_eval" for e in edges)
-    edges2 = gi.layer_e_co_cited(
+    edges2, _ = gi.layer_e_co_cited(
         [(["d3", "d4"], True)],
         include_eval=True,
     )
