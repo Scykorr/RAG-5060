@@ -49,7 +49,7 @@ from apps.api.services.text_entities import (
 
 log = structlog.get_logger()
 
-INDEX_VERSION = 14  # 12 multilang; 13–14 identifier noise (Roman/URL/OCR)
+INDEX_VERSION = 16  # slice-2 step0: refers/entity/lang/stage/shingles + fp-heal
 
 # Filename grammar tokens (source-site / language folder markers), not corpus content.
 SOURCE_TOKENS = frozenset({"ch", "eb"})
@@ -803,10 +803,17 @@ def layer_b_refers_to(
             title_toks = grefer.title_tokens(surface)
             q_starters = grefer.question_title_starters()
             question_title = bool(title_toks and title_toks[0] in q_starters)
-            person_name_title = (not multi) and bool(
-                is_name_surface_form(surface, case_stats={}, pos_stats={})
-                or (surface[:1].isupper() and len(title_toks) == 1 and _SURNAME_RE.search(norm_ru(surface)))
-                or (surface[:1].isupper() and len(norm_ru(surface)) <= 8 and norm_ru(surface) in _DIMINUTIVE_NAMES)
+            person_name_title = grefer.is_person_like_title(surface) or (
+                (not multi)
+                and bool(
+                    is_name_surface_form(surface, case_stats={}, pos_stats={})
+                    or (surface[:1].isupper() and len(title_toks) == 1 and _SURNAME_RE.search(norm_ru(surface)))
+                    or (
+                        surface[:1].isupper()
+                        and len(norm_ru(surface)) <= 8
+                        and norm_ru(surface) in _DIMINUTIVE_NAMES
+                    )
+                )
             )
             # Prefer same-author target when title is ambiguous across authors
             ambiguous = title_author_count.get(phrase_n, 0) >= 2
@@ -816,10 +823,22 @@ def layer_b_refers_to(
                     continue
             accepted = False
             best = None
+            longer_titles = [
+                surf for pn, _did, surf, mw in phrases if mw and pn.startswith(phrase_n + " ")
+            ]
             for hit in found:
                 if any(
                     not (hit["end"] <= a or hit["start"] >= b)
                     for a, b in matched_spans
+                ):
+                    continue
+                if grefer.longer_title_continues(raw, hit, surface, longer_titles):
+                    continue
+                if grefer.competing_name_near(
+                    raw,
+                    hit["start"],
+                    hit["end"],
+                    target_author=tgt_meta.author_key if tgt_meta else None,
                 ):
                     continue
                 form = grefer.classify_hit(
@@ -846,8 +865,8 @@ def layer_b_refers_to(
             if grefer.foreign_marker_near(raw, best["start"], best["end"]):
                 conf = "low"
                 w *= 0.3
-            if ambiguous and not same_author and best.get("match_form") != "quoted":
-                # other author's title without target author nearby
+            # Ambiguous title (Метель): same-author preferred above; cross-author → low
+            if ambiguous and not same_author:
                 tokens = grefer._tokens_with_spans(raw)
                 if not grefer._near_author_tokens(
                     tokens, best["start"], best["end"], tgt_meta.author_key if tgt_meta else None
@@ -957,11 +976,53 @@ def entity_kind(surface: str, key: str) -> str:
     return "entity"
 
 
+_DE_FR_COMMON = frozenset(
+    {
+        "kinder",
+        "mutter",
+        "vater",
+        "zeit",
+        "saal",
+        "haus",
+        "frau",
+        "herr",
+        "liebe",
+        "leben",
+        "welt",
+        "mann",
+        "nacht",
+        "tag",
+        "guerre",
+        "amour",
+        "femme",
+        "homme",
+        "temps",
+        "monde",
+        "dieu",
+        "roi",
+        "prince",
+        "comte",
+        "madame",
+        "monsieur",
+        "enfant",
+        "maison",
+        "salle",
+        "mère",
+        "père",
+        "fille",
+        "garçon",
+    }
+)
+
+
 def is_noise_entity_surface(surface: str, *, author_keys: set[str]) -> bool:
     s = (surface or "").strip()
     if not s:
         return True
     if re.fullmatch(r"[IVXLCDM]+", s):
+        return True
+    # German/French capitalized common nouns are not entities
+    if re.fullmatch(r"[A-Za-zÀ-ÿÄÖÜäöüß\-]+", s) and norm_ru(s) in _DE_FR_COMMON:
         return True
     n = norm_ru(s)
     if n in PLAY_STAGE_WORDS or n in EDITION_STOP:
@@ -1014,7 +1075,11 @@ def entity_strength(
     n_works: int,
     kind: str,
 ) -> str:
-    """Return strong | weak | drop for a grouped entity."""
+    """Return strong | weak | drop for a grouped entity.
+
+    E4/step2-0: df on canonical works; single name/surname alone always weak;
+    strong only when rare (df ≤ 3) and not a bare person form.
+    """
     n = norm_ru(surface)
     parts = n.split()
     df = int(work_df.get(key, 0))
@@ -1033,11 +1098,18 @@ def entity_strength(
     # E4: strong only when rare across works (df ≤ 3) after form merge
     if df > 3:
         return "weak"
-    if len(parts) >= 2:
-        # multiword name / ФИО — still weak if common; strong only if rare
-        return "strong"
     last = parts[-1] if parts else n
-    if _SURNAME_RE.search(last) or _SURNAME_RE.search(key):
+    # Given name alone → always weak
+    if len(parts) == 1 and not (_SURNAME_RE.search(last) or _SURNAME_RE.search(key)):
+        return "weak"
+    # FIO / name+patronymic → weak (Иван Федорович); cannot be the sole bridge
+    if len(parts) >= 2 and (
+        _PATRONYMIC_RE.search(parts[-1])
+        or parts[-1].endswith(("ович", "евич", "овна", "евна", "ична", "инична"))
+    ):
+        return "weak"
+    # Rare surname or multiword non-patronymic → strong (cross-author still needs ≥2)
+    if df <= 3 and (_SURNAME_RE.search(last) or _SURNAME_RE.search(key) or len(parts) >= 2):
         return "strong"
     if df <= 1 and len(key) >= 4:
         return "strong"
@@ -1146,7 +1218,8 @@ def layer_c_shared_entity(
             display_count[ik][surface] += 1
             kinds[ik] = (identifier_kinds.get(doc_id) or {}).get(surface) or "identifier"
         doc_keys[doc_id] = keys
-        if meta:
+        # DF only on canonical works (after work_key merge / dup fold)
+        if meta and getattr(meta, "canonical", True) and not getattr(meta, "contained_in", None) and not getattr(meta, "duplicate_of", None):
             work_entities[meta.work_key] |= keys
 
     for k, ctr in display_count.items():
@@ -1156,6 +1229,7 @@ def layer_c_shared_entity(
     for ents in work_entities.values():
         for e in ents:
             work_df[e] += 1
+    n_works = max(1, len(work_entities))
 
     strength: dict[str, str] = {}
     for k in list(work_df.keys()):
@@ -1209,7 +1283,8 @@ def layer_c_shared_entity(
             if kinds.get(e) in {"standard", "identifier", "acronym", "version"}
         }
         # Cross-author: ≥2 strong literary entities, OR ≥1 strong technical identifier
-        if not same_author and len(strong_common) < 2 and not id_strong:
+        lit_strong = strong_common - id_strong
+        if not same_author and len(lit_strong) < 2 and not id_strong:
             continue
         w = sum(idf(e) for e in common)
         neigh[a].append((w, b, common))
@@ -1411,11 +1486,13 @@ def layer_d_lex_similar(
     pos_stats: dict[str, dict[str, int]] | None = None,
     term_counts_by_lang: dict[str, dict[str, Counter[str] | dict[str, int]]] | None = None,
     lang: str = "ru",
+    anchor_work_keys: set[str] | None = None,
 ) -> tuple[list[Edge], dict[str, Any]]:
     """Work-level lex similarity: sublinear TF-IDF, burstiness filter, mutual kNN.
 
     When ``term_counts_by_lang`` is provided, IDF/vectors/edges are computed
     separately per language (no cross-language lex edges).
+    ``anchor_work_keys``: if set, only emit pairs touching these works (incremental).
     """
     params = params or GraphIndexParams()
     case_stats = case_stats or {}
@@ -1466,6 +1543,7 @@ def layer_d_lex_similar(
                     pos_stats=pos_stats if lang == "ru" else {},
                     term_counts_by_lang=None,
                     lang=lang,
+                    anchor_work_keys=anchor_work_keys,
                 )
                 for edge in e_lang:
                     prov = dict(edge.provenance or {})
@@ -1607,13 +1685,18 @@ def layer_d_lex_similar(
         return score, terms
 
     pair_best: dict[tuple[str, str], tuple[float, list[str]]] = {}
-    for t, members in inv.items():
-        mem = sorted(set(members))
-        if len(mem) > 160:
-            continue
-        for i in range(len(mem)):
-            for j in range(i + 1, len(mem)):
-                a, b = mem[i], mem[j]
+    anchors = {w for w in (anchor_work_keys or set()) if w in signatures}
+
+    def _want_pair(a: str, b: str) -> bool:
+        if not anchors:
+            return True
+        return a in anchors or b in anchors
+
+    if anchors:
+        # Incremental: score each anchor against all other signatures (O(|A|*|W|)).
+        others = sorted(set(signatures) - anchors)
+        for a in sorted(anchors):
+            for b in others:
                 if counter is not None:
                     counter.comparisons += 1
                 got = _score_pair(a, b)
@@ -1624,23 +1707,53 @@ def layer_d_lex_similar(
                 prev = pair_best.get(key)
                 if not prev or score > prev[0]:
                     pair_best[key] = (score, terms)
-    # Same-author: also score pairs that share residual terms even if inv skipped
-    by_auth_w: dict[str, list[str]] = defaultdict(list)
-    for d in docs:
-        if d.author_key and d.work_key in signatures:
-            by_auth_w[str(d.author_key)].append(d.work_key)
-    for wks in by_auth_w.values():
-        uniq = sorted(set(wks))
-        for i, a in enumerate(uniq):
-            for b in uniq[i + 1 :]:
-                key = (a, b) if a < b else (b, a)
-                if key in pair_best:
+            for b in sorted(anchors):
+                if b <= a:
                     continue
                 if counter is not None:
                     counter.comparisons += 1
                 got = _score_pair(a, b)
                 if got:
-                    pair_best[key] = got
+                    pair_best[(a, b) if a < b else (b, a)] = got
+    else:
+        for t, members in inv.items():
+            mem = sorted(set(members))
+            if len(mem) > 160:
+                continue
+            for i in range(len(mem)):
+                for j in range(i + 1, len(mem)):
+                    a, b = mem[i], mem[j]
+                    if not _want_pair(a, b):
+                        continue
+                    if counter is not None:
+                        counter.comparisons += 1
+                    got = _score_pair(a, b)
+                    if not got:
+                        continue
+                    score, terms = got
+                    key = (a, b) if a < b else (b, a)
+                    prev = pair_best.get(key)
+                    if not prev or score > prev[0]:
+                        pair_best[key] = (score, terms)
+        # Same-author: also score pairs that share residual terms even if inv skipped
+        by_auth_w: dict[str, list[str]] = defaultdict(list)
+        for d in docs:
+            if d.author_key and d.work_key in signatures:
+                by_auth_w[str(d.author_key)].append(d.work_key)
+        for wks in by_auth_w.values():
+            uniq = sorted(set(wks))
+            for i, a in enumerate(uniq):
+                for b in uniq[i + 1 :]:
+                    if not _want_pair(a, b):
+                        continue
+                    key = (a, b) if a < b else (b, a)
+                    if key in pair_best:
+                        continue
+                    if counter is not None:
+                        counter.comparisons += 1
+                    got = _score_pair(a, b)
+                    if got:
+                        pair_best[key] = got
 
     scores = sorted(s for s, _ in pair_best.values())
     thresh = params.lex_min_score
@@ -1836,6 +1949,20 @@ def layer_d_lex_similar(
                 "selected": key in selected,
             }
         )
+    same_author_n = 0
+    term_prov: Counter[str] = Counter()
+    for e in edges:
+        pa, pb = by_id.get(e.source), by_id.get(e.target)
+        if (
+            pa
+            and pb
+            and pa.author_key
+            and pb.author_key
+            and pa.author_key == pb.author_key
+        ):
+            same_author_n += 1
+        for t in (e.provenance or {}).get("terms") or []:
+            term_prov[str(t)] += 1
     debug = {
         "bugfix": (
             "Work-level dual signatures (tfidf∪residual), burstiness, "
@@ -1865,6 +1992,11 @@ def layer_d_lex_similar(
         "kept_terms": len(kept_terms),
         "dropped_burst_n": len(dropped_burst),
         "watch_scores": watch_scores,
+        "same_author_edges": same_author_n,
+        "same_author_share": round(same_author_n / max(1, len(edges)), 4),
+        "top_provenance_terms": [
+            {"term": t, "n": c} for t, c in term_prov.most_common(30)
+        ],
     }
     return edges, debug
 
@@ -2170,6 +2302,19 @@ def assemble_index(
                     structural_linked.add(e.target)
 
     by_id = {d.document_id: d for d in docs}
+    # Duplicates / contained_in inherit container links for isolation metric
+    for d in docs:
+        parent = d.duplicate_of or d.contained_in
+        if not parent:
+            continue
+        if d.document_id in content_linked:
+            content_linked.add(parent)
+        if d.document_id in content_linked_no_cc:
+            content_linked_no_cc.add(parent)
+        if parent in content_linked:
+            content_linked.add(d.document_id)
+        if parent in content_linked_no_cc:
+            content_linked_no_cc.add(d.document_id)
     # Isolation metrics are about canonical works/docs (duplicates/contained fold away)
     canon_docs = [d for d in docs if d.canonical and not d.contained_in and not d.duplicate_of]
     isolated_content_ids = [
@@ -2262,6 +2407,23 @@ def assemble_index(
         for e in edges
         if e.type == "shared_entity" and (e.provenance or {}).get("cross_lang")
     )
+    lex_edges = [e for e in edges if e.type == "lex_similar"]
+    lex_same_n = 0
+    lex_term_prov: Counter[str] = Counter()
+    for e in lex_edges:
+        pa, pb = by_id.get(e.source), by_id.get(e.target)
+        if pa and pb and pa.author_key and pb.author_key and pa.author_key == pb.author_key:
+            lex_same_n += 1
+        for t in (e.provenance or {}).get("terms") or []:
+            lex_term_prov[str(t)] += 1
+    isolated_work_list = [
+        {
+            "work_key": wk,
+            "title": works[wk].title,
+            "author_key": works[wk].author_key,
+        }
+        for wk in sorted(isolated_works)[:5]
+    ]
     tech_id_examples: list[dict[str, Any]] = []
     for e in edges:
         if e.type != "shared_entity":
@@ -2304,6 +2466,12 @@ def assemble_index(
         "isolated_work_share_no_cocited": round(
             len(isolated_works_no_cc) / max(1, len(works)), 4
         ),
+        "isolated_works_list": isolated_work_list,
+        "lex_same_author_edges": lex_same_n,
+        "lex_same_author_share": round(lex_same_n / max(1, len(lex_edges)), 4),
+        "lex_top_provenance_terms": [
+            {"term": t, "n": c} for t, c in lex_term_prov.most_common(30)
+        ],
         "fragment_documents": len(frag_docs),
         "documents_without_author": len(no_author),
         "documents_without_author_sample": [d.document_id for d in no_author[:20]],
@@ -2370,6 +2538,7 @@ def assemble_index(
                 "doc_kind": d.doc_kind,
                 "doc_version": d.doc_version,
                 "product_key": d.product_key,
+                "content_hash": None,
             }
             for d in docs
         ],
@@ -2781,12 +2950,19 @@ def _build_doc_artifact(
             identifier_kinds[surface] = kind
             if chunk_id not in identifier_chunks[ik]:
                 identifier_chunks[ik].append(chunk_id)
-        # Lex tokens by chunk language (mixed → both pipelines lightly)
-        langs_for_tok = []
+        # Lex tokens by chunk language.
+        # mixed: Cyrillic → ru; Latin islands → en only if they detect as English
+        # (fr/de islands must not enter en-lex).
+        langs_for_tok: list[str] = []
         if clang == "mixed":
-            langs_for_tok = ["ru", "en"]
+            langs_for_tok = ["ru"]
+            lat_only = "".join(ch if ch.isascii() and ch.isalpha() or ch.isspace() else " " for ch in clean)
+            if glang.detect_language(lat_only) == "en":
+                langs_for_tok.append("en")
         elif clang in {"ru", "en"}:
             langs_for_tok = [clang]
+        elif clang == "other":
+            langs_for_tok = []  # fr/de not in en-lex
         else:
             langs_for_tok = ["ru"]
         for lg in langs_for_tok:
@@ -2808,8 +2984,10 @@ def _build_doc_artifact(
     shingles = gdup.shingle_set(clean_text)
     word_count = len(gdup.tokenize_words(clean_text))
     minhash = list(gdup.minhash_signature(shingles))
-    # Store full shingle ids only for short docs (containment reuse without rehash).
-    shingle_payload: list[int] | None = sorted(shingles) if len(shingles) <= 12_000 else None
+    # Persist shingles for dup/containment reuse (skip only truly huge outliers).
+    shingle_payload: list[int] | None = (
+        sorted(shingles) if shingles and len(shingles) <= 120_000 else None
+    )
     return {
         "document_id": meta.document_id,
         "version_id": version_id,
@@ -2893,39 +3071,23 @@ def build_index_for_tenant(
     fp = corpus_fingerprint(db, tenant_id)
     ph = gcache.params_hash(params.to_dict())
     path = index_path(tenant_id, fp, params_hash_value=ph)
-    if not force:
-        cached = read_index(path)
-        if (
-            cached
-            and cached.get("fingerprint") == fp
-            and cached.get("version") == INDEX_VERSION
-            and cached.get("params_hash") in (None, ph)
-        ):
-            cached = dict(cached)
-            cached["built_ms"] = int((time.perf_counter() - t0) * 1000)
-            st = dict(cached.get("stats") or {})
-            st["build_mode"] = "noop"
-            st["stale"] = False
-            cached["stats"] = st
-            log.info(
-                "graph_index_cache_hit",
-                tenant_id=str(tenant_id),
-                fingerprint=fp,
-                built_ms=cached["built_ms"],
-            )
-            return cached
-
-    # E8 noop: unchanged corpus + params → return current index in ~1s (even if force)
+    # E8 early noop: pointer + corpus fp + params (before any artifact scan).
     ptr = gcache.read_current_pointer(tenant_id) or {}
-    if (
-        ptr.get("fingerprint") == fp
+    ptr_fp = ptr.get("fingerprint")
+    ptr_ok = (
+        isinstance(ptr_fp, str)
+        and ptr_fp == fp
         and ptr.get("params_hash") == ph
         and not ptr.get("stale")
-        and ptr.get("index_file")
-    ):
+        and bool(ptr.get("index_file"))
+        and int(ptr.get("version") or 0) == INDEX_VERSION
+    )
+    # Pointer hit is valid even with force=True (E8: unchanged corpus → noop).
+    if ptr_ok:
         prev = read_index(gcache.graph_dir() / str(ptr["index_file"]))
         if prev and prev.get("version") == INDEX_VERSION and prev.get("params_hash") in (None, ph):
             prev = dict(prev)
+            prev["fingerprint"] = fp
             prev["built_ms"] = int((time.perf_counter() - t0) * 1000)
             st = dict(prev.get("stats") or {})
             st["build_mode"] = "noop"
@@ -2949,8 +3111,52 @@ def build_index_for_tenant(
                     "index_file": ptr.get("index_file"),
                 },
             )
-            log.info("graph_index_noop", tenant_id=str(tenant_id), fingerprint=fp)
+            log.info(
+                "graph_index_noop",
+                tenant_id=str(tenant_id),
+                fingerprint=fp,
+                built_ms=prev["built_ms"],
+                path="pointer",
+            )
             return prev
+
+    if not force and not ptr.get("stale"):
+        cached = read_index(path)
+        if (
+            cached
+            and cached.get("version") == INDEX_VERSION
+            and cached.get("params_hash") in (None, ph)
+            and (
+                cached.get("fingerprint") == fp
+                or (isinstance(cached.get("fingerprint"), dict) and path.exists())
+            )
+        ):
+            # Heal legacy indexes that stored doc-fp dict under "fingerprint".
+            cached = dict(cached)
+            cached["fingerprint"] = fp
+            cached["built_ms"] = int((time.perf_counter() - t0) * 1000)
+            st = dict(cached.get("stats") or {})
+            st["build_mode"] = "noop"
+            st["stale"] = False
+            cached["stats"] = st
+            gcache.write_current_pointer(
+                tenant_id,
+                {
+                    "index_file": path.name,
+                    "fingerprint": fp,
+                    "params_hash": ph,
+                    "version": INDEX_VERSION,
+                    "stale": False,
+                    "built_at": cached.get("built_at"),
+                },
+            )
+            log.info(
+                "graph_index_cache_hit",
+                tenant_id=str(tenant_id),
+                fingerprint=fp,
+                built_ms=cached["built_ms"],
+            )
+            return cached
 
     rows = _active_documents(db, tenant_id)
     if mode in ("full", "incremental"):
@@ -3001,6 +3207,7 @@ def build_index_for_tenant(
 
     layer_ms: dict[str, int] = {}
     lifecycle = {"added": 0, "changed": 0, "removed": 0, "cached": 0}
+    dirty_ids: set[str] = set()
     t_scan = time.perf_counter()
     artifacts: dict[str, dict[str, Any]] = {}
     keep_ids = {d.document_id for d in docs}
@@ -3050,34 +3257,56 @@ def build_index_for_tenant(
         )
         gcache.write_doc_artifact(tenant_id, meta.document_id, art)
         artifacts[meta.document_id] = art
+        dirty_ids.add(meta.document_id)
         if cached_art:
             lifecycle["changed"] += 1
         else:
             lifecycle["added"] += 1
     layer_ms["scan_clean"] = int((time.perf_counter() - t_scan) * 1000)
 
-    # E8: unchanged corpus + params → reuse published index (skip global layers)
-    if (
-        not force
-        and lifecycle["added"] == 0
-        and lifecycle["changed"] == 0
-        and lifecycle["removed"] == 0
-    ):
+    # E8: content unchanged → reuse published index (skip global layers).
+    # Compare per-doc content_hash so artifact cache rebuilds of identical text
+    # still count as noop (needed for +N bench and warm-cache paths).
+    if not force:
         ptr2 = gcache.read_current_pointer(tenant_id) or {}
         prev2 = None
         if ptr2.get("index_file"):
             prev2 = read_index(gcache.graph_dir() / str(ptr2["index_file"]))
         if not prev2:
             prev2 = read_index(path)
-        # Artifact scan already proved content unchanged; require version+params only.
+        cur_hashes = {
+            did: str(art.get("content_hash") or "")
+            for did, art in artifacts.items()
+        }
+        prev_hashes = {
+            str(d.get("document_id")): str(d.get("content_hash") or "")
+            for d in (prev2 or {}).get("documents") or []
+        }
+        hashes_match = (
+            bool(prev_hashes)
+            and set(cur_hashes) == set(prev_hashes)
+            and all(cur_hashes[k] == prev_hashes[k] and cur_hashes[k] for k in cur_hashes)
+        )
+        lifecycle_clean = (
+            lifecycle["added"] == 0
+            and lifecycle["changed"] == 0
+            and lifecycle["removed"] == 0
+        )
         if (
             prev2
             and prev2.get("version") == INDEX_VERSION
             and prev2.get("params_hash") in (None, ph)
+            and (lifecycle_clean or hashes_match)
         ):
             prev2 = dict(prev2)
             prev2["built_ms"] = int((time.perf_counter() - t0) * 1000)
             prev2["fingerprint"] = fp
+            # Heal missing content_hash on legacy indexes
+            if not hashes_match and lifecycle_clean:
+                for d in prev2.get("documents") or []:
+                    did = str(d.get("document_id"))
+                    if did in cur_hashes:
+                        d["content_hash"] = cur_hashes[did]
             st = dict(prev2.get("stats") or {})
             st["build_mode"] = "noop"
             st["lifecycle"] = dict(lifecycle)
@@ -3090,8 +3319,8 @@ def build_index_for_tenant(
                 tenant_id=str(tenant_id),
                 built_ms=prev2["built_ms"],
                 cached=lifecycle["cached"],
-                ptr_ph=ptr2.get("params_hash"),
-                ph=ph,
+                hashes_match=hashes_match,
+                lifecycle_clean=lifecycle_clean,
             )
             return prev2
         log.info(
@@ -3101,7 +3330,8 @@ def build_index_for_tenant(
             prev_ver=None if not prev2 else prev2.get("version"),
             prev_ph=None if not prev2 else prev2.get("params_hash"),
             ph=ph,
-            ptr=ptr2,
+            hashes_match=hashes_match,
+            lifecycle=lifecycle,
         )
 
     resolve_work_keys(docs)
@@ -3157,15 +3387,16 @@ def build_index_for_tenant(
     }
     fingerprints: dict[str, dict[str, Any]] = {}
     for did, art in artifacts.items():
-        fp: dict[str, Any] = {}
+        # IMPORTANT: do not name this `fp` — that shadows corpus_fingerprint.
+        doc_fp: dict[str, Any] = {}
         if art.get("word_count") is not None:
-            fp["word_count"] = int(art["word_count"])
+            doc_fp["word_count"] = int(art["word_count"])
         if isinstance(art.get("minhash"), list) and art["minhash"]:
-            fp["minhash"] = art["minhash"]
+            doc_fp["minhash"] = art["minhash"]
         if isinstance(art.get("shingles"), list) and art["shingles"]:
-            fp["shingles"] = art["shingles"]
-        if fp.get("minhash"):
-            fingerprints[did] = fp
+            doc_fp["shingles"] = art["shingles"]
+        if doc_fp.get("minhash"):
+            fingerprints[did] = doc_fp
     dup_map = gdup.detect_relations(docs, texts_by_id, fingerprints=fingerprints)
     dup_map = _rewrite_technical_editions(docs, dup_map)
     canon_ids = gdup.canonical_doc_ids(dup_map)
@@ -3206,25 +3437,89 @@ def build_index_for_tenant(
     id_chunks_canon = {k: v for k, v in identifier_chunks.items() if k in canon_ids}
 
     edges: list[Edge] = []
+    lex_debug: dict[str, Any] = {}
+    # Keep only document-level content edges; work_* are re-aggregated below.
+    CONTENT_EDGE_TYPES = {
+        "mentions_author",
+        "refers_to",
+        "shared_entity",
+        "lex_similar",
+        "co_cited",
+        "co_cited_eval",
+    }
+    # Small delta: keep prior content edges for untouched docs; recompute only dirty.
+    incr_prev = None
+    if (
+        not force
+        and dirty_ids
+        and len(dirty_ids) <= 20
+        and lifecycle["removed"] == 0
+    ):
+        ptr_i = gcache.read_current_pointer(tenant_id) or {}
+        if ptr_i.get("index_file"):
+            incr_prev = read_index(gcache.graph_dir() / str(ptr_i["index_file"]))
+        if not incr_prev:
+            incr_prev = read_index(path)
+        if not (
+            incr_prev
+            and incr_prev.get("version") == INDEX_VERSION
+            and incr_prev.get("params_hash") in (None, ph)
+            and incr_prev.get("edges")
+        ):
+            incr_prev = None
+
     t_l = time.perf_counter()
     edges.extend(layer_a_edges(docs))
     edges.extend(gdup.contains_edges_from_map(dup_map, edge_cls=Edge))
     edges.extend(_edition_of_edges(docs, dup_map))
     layer_ms["layer_a"] = int((time.perf_counter() - t_l) * 1000)
 
+    dirty_works = {
+        d.work_key for d in docs if d.document_id in dirty_ids and d.work_key
+    }
+    dirty_nodes = set(dirty_ids) | {f"work:{wk}" for wk in dirty_works if wk}
+    # also mark work_key bare ids used as edge endpoints
+    dirty_nodes |= set(dirty_works)
+
+    if incr_prev:
+        kept = 0
+        for raw in incr_prev.get("edges") or []:
+            et = str(raw.get("type") or "")
+            if et not in CONTENT_EDGE_TYPES:
+                continue
+            s, t = str(raw.get("source")), str(raw.get("target"))
+            if s in dirty_nodes or t in dirty_nodes:
+                continue
+            edges.append(
+                Edge(
+                    source=s,
+                    target=t,
+                    type=et,
+                    weight=float(raw.get("weight") or 0),
+                    provenance=dict(raw.get("provenance") or {}),
+                    weak=bool(raw.get("weak")),
+                )
+            )
+            kept += 1
+        layer_ms["incremental_kept"] = kept
+
+    docs_for_content = (
+        [d for d in docs_canon if d.document_id in dirty_ids] if incr_prev else docs_canon
+    )
+    chunk_rows_content = (
+        [r for r in chunk_rows_canon if r[0] in dirty_ids] if incr_prev else chunk_rows_canon
+    )
+
     t_l = time.perf_counter()
-    # Mentions_author: literary / Russian only
     docs_lit = [
         d
-        for d in docs_canon
+        for d in docs_for_content
         if glang.literary_rules_enabled(d.doc_kind or "unknown", d.language or "unknown")
     ]
-    edges.extend(layer_mentions_author(docs=docs_lit, chunk_iter=chunk_rows_canon))
+    edges.extend(layer_mentions_author(docs=docs_lit, chunk_iter=chunk_rows_content))
     layer_ms["mentions_author"] = int((time.perf_counter() - t_l) * 1000)
 
     t_l = time.perf_counter()
-    # Title catalog = all docs (nested works visible); sources = non-contained only.
-    # Container→nested refers_to rewritten to structural contains.
     source_ids = {
         d.document_id
         for d in docs
@@ -3232,6 +3527,8 @@ def build_index_for_tenant(
         and not (dup_map.get(d.document_id) or {}).get("duplicate_of")
         and not (dup_map.get(d.document_id) or {}).get("edition_of")
     }
+    if incr_prev:
+        source_ids &= dirty_ids
     chunk_rows_refers = [r for r in chunk_rows if r[0] in source_ids]
     refers = layer_b_refers_to(docs=docs, chunk_iter=chunk_rows_refers, params=params)
     edges.extend(gdup.rewrite_refers_to_contains(refers, dup_map, edge_cls=Edge))
@@ -3239,19 +3536,20 @@ def build_index_for_tenant(
     layer_ms["refers_to"] = int((time.perf_counter() - t_l) * 1000)
 
     t_l = time.perf_counter()
-    edges.extend(
-        layer_c_shared_entity(
-            docs=docs_canon,
-            doc_entities=doc_entities_canon,
-            doc_entity_chunks=doc_entity_chunks_canon,
-            case_stats={k: dict(v) for k, v in case_stats.items()},
-            pos_stats={k: dict(v) for k, v in pos_stats.items()},
-            params=params,
-            doc_identifiers=doc_identifiers_canon,
-            identifier_kinds=id_kinds_canon,
-            identifier_chunks=id_chunks_canon,
-        )
+    se_edges = layer_c_shared_entity(
+        docs=docs_canon,
+        doc_entities=doc_entities_canon,
+        doc_entity_chunks=doc_entity_chunks_canon,
+        case_stats={k: dict(v) for k, v in case_stats.items()},
+        pos_stats={k: dict(v) for k, v in pos_stats.items()},
+        params=params,
+        doc_identifiers=doc_identifiers_canon,
+        identifier_kinds=id_kinds_canon,
+        identifier_chunks=id_chunks_canon,
     )
+    if incr_prev:
+        se_edges = [e for e in se_edges if e.source in dirty_ids or e.target in dirty_ids]
+    edges.extend(se_edges)
     layer_ms["shared_entity"] = int((time.perf_counter() - t_l) * 1000)
 
     t_l = time.perf_counter()
@@ -3263,9 +3561,13 @@ def build_index_for_tenant(
         case_stats={k: dict(v) for k, v in case_stats.items()},
         pos_stats={k: dict(v) for k, v in pos_stats.items()},
         term_counts_by_lang=term_by_lang_canon,
+        anchor_work_keys=dirty_works if incr_prev else None,
     )
     edges.extend(lex_edges)
     layer_ms["lex_similar"] = int((time.perf_counter() - t_l) * 1000)
+    if incr_prev:
+        layer_ms["incremental"] = 1
+        build_mode = "incremental_delta"
 
     t_l = time.perf_counter()
     cite_lists: list[dict[str, Any]] = []
@@ -3362,6 +3664,10 @@ def build_index_for_tenant(
         },
     )
     payload["params_hash"] = ph
+    for drow in payload.get("documents") or []:
+        did = str(drow.get("document_id") or "")
+        art = artifacts.get(did) or {}
+        drow["content_hash"] = art.get("content_hash")
     return _publish_index(
         tenant_id=tenant_id,
         path=path,

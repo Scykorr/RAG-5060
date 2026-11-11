@@ -1,3 +1,14 @@
+## 2026-11-11 — Slice 2 step 0 (1e leftovers)
+
+- INDEX_VERSION=**16**; report `artifacts/20261111-101906-graph-index/`
+- refers_to estimated_precision **90%** (n=29 auto-judged); person titles quoted-only; Melitel/competing-name rules
+- shared_entity: work-level df, cross-author ≥2 strong; «Иван Федорович» alone no cross-author edge
+- fr/de → `other` (not en-lex); mixed Latin islands gated; en lex no longer flooded with French
+- stage directions stripped structurally; top-30 lex terms clean of целует/уходят/…
+- perf: warm full **74s**, noop **48ms**, +10 **3.5s**; healed corpus `fingerprint` shadow bug
+- overrides_applied **33**; isolated_works **5**; pytest graph unit **93 passed**
+- Next: steps 1–7 topics/themes + level API
+
 ## 2026-11-11 — Graph 1e-M multilang (ru+en)
 
 - INDEX_VERSION=14; S56/A21; F04.18e

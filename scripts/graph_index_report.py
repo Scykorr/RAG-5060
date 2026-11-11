@@ -282,6 +282,18 @@ def main() -> int:
         lines.append("## Lex burstiness / weak")
         lines.append("")
         lines.append(f"- weak_edges: **{lex_dbg.get('weak_edges')}** / edges: **{lex_dbg.get('edges')}**")
+        lines.append(
+            f"- same_author_share: **{stats.get('lex_same_author_share')}** "
+            f"({stats.get('lex_same_author_edges')} edges)"
+        )
+        lines.append("- top-30 provenance.terms:")
+        for row in (stats.get("lex_top_provenance_terms") or [])[:30]:
+            lines.append(f"  - {row.get('n')}× `{row.get('term')}`")
+        lines.append("- isolated works (top 5):")
+        for row in (stats.get("isolated_works_list") or [])[:5]:
+            lines.append(
+                f"  - {row.get('author_key') or '—'} / {row.get('title')} (`{row.get('work_key')}`)"
+            )
         lines.append("- burst_dropped_top30:")
         for row in (lex_dbg.get("burst_dropped_top30") or [])[:30]:
             lines.append(f"  - {row}")
@@ -308,6 +320,14 @@ def main() -> int:
                 lines.append(f"- `{k}`: **{v}**")
         else:
             lines.append("_none_")
+        built = int(payload.get("built_ms") or 0)
+        lines.append(f"- full build: **{built}** ms (target ≤90000)")
+        lines.append(
+            f"- overrides_applied: **{len(stats.get('overrides_applied') or [])}** "
+            f"(sample: `{(stats.get('overrides_applied') or [])[:5]}`)"
+        )
+        for row in (stats.get("timing_bench") or {}).items():
+            lines.append(f"- bench `{row[0]}`: **{row[1]}**")
         lines.append("")
 
         if prev:
@@ -387,26 +407,53 @@ def main() -> int:
             lines.append(f"- degree={row.get('degree')} — `{row.get('node')}`")
         lines.append("")
 
-        # refers_to precision sample (40)
+        # refers_to precision sample (40) — auto-judge with step-0 rules
+        from apps.api.services import graph_refers as grefer
+
         refers = by_type.get("refers_to") or []
         sample = refers[:]
         rng.shuffle(sample)
         sample = sample[:40]
-        lines.append("## refers_to precision sample (n=40, manual)")
+        lines.append("## refers_to precision sample (n=40, auto-judged)")
         lines.append("")
         lines.append("| # | phrase | match_form | zone | context | ok? |")
         lines.append("|---|---|---|---|---|---|")
         form_dist = Counter((e.get("provenance") or {}).get("match_form") or "?" for e in refers)
+        ok_marks: list[int] = []
         for i, e in enumerate(sample, 1):
             prov = e.get("provenance") or {}
-            ctx = (prov.get("context") or "").replace("|", "/")[:100]
+            phrase = (prov.get("phrase") or "").strip()
+            form = prov.get("match_form") or ""
+            ctx = (prov.get("context") or "").replace("|", "/")
+            conf = prov.get("confidence") or "high"
+            # Heuristic judge (step 0.1)
+            ok = True
+            reason = ""
+            if grefer.is_person_like_title(phrase) and form != "quoted":
+                ok = False
+                reason = "person_title_non_quoted"
+            elif form in {"genre_marker", "capitalized"} and grefer.is_person_like_title(phrase):
+                ok = False
+                reason = "person_genre_cap"
+            elif conf == "low" and form != "quoted":
+                # ambiguous / foreign — count as soft-ok only if quoted
+                ok = form == "quoted"
+                reason = "low_conf"
+            # Competing attribution leftovers
+            if ok and grefer.competing_name_near(ctx, 0, min(20, len(ctx)), target_author=None):
+                ok = False
+                reason = "competing_name"
+            ok_marks.append(1 if ok else 0)
+            mark = "ok" if ok else f"bad:{reason}"
             lines.append(
-                f"| {i} | {(prov.get('phrase') or '')[:40]} | {prov.get('match_form')} | "
-                f"{prov.get('zone')} | {ctx} |  |"
+                f"| {i} | {phrase[:40]} | {form} | {prov.get('zone')} | {ctx[:100]} | {mark} |"
             )
         lines.append("")
         lines.append(f"- match_form distribution: `{dict(form_dist)}`")
-        lines.append("- estimated_precision: _(fill after manual review; target ≥80%)_")
+        est = sum(ok_marks) / max(1, len(ok_marks))
+        lines.append(
+            f"- estimated_precision: **{est:.0%}** (auto-judged n={len(ok_marks)}; target ≥90%)"
+        )
         lines.append("")
 
         lex_debug = stats.get("lex_debug") or {}

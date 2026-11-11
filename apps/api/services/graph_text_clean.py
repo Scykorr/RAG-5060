@@ -82,6 +82,36 @@ _EDITION_MARKERS = (
 
 _URL_RE = re.compile(r"https?://|www\.", flags=re.I)
 _BOM_RE = re.compile(r"^\ufeff+")
+# Play stage directions: (целует её) inside dialogue; NAME IN CAPS. direction.
+_PAREN_STAGE_RE = re.compile(r"\([^)]{2,80}\)")
+_CAPS_SPEAKER_RE = re.compile(
+    r"(?m)^[\t ]*([A-ZА-ЯЁ][A-ZА-ЯЁ\-]{1,30}(?:\s+[A-ZА-ЯЁ][A-ZА-ЯЁ\-]{1,30}){0,2})\.\s+([^\n]{0,120})",
+)
+
+
+def strip_stage_directions(text: str) -> str:
+    """Remove structural play remakes from lex/entity text (not word lists).
+
+    1) Parenthetical asides inside replicas: ``(целует её)``, ``(уходит)``.
+    2) Lines ``ИМЯ ПЕРСОНАЖА. действие…`` — drop the direction after the name.
+    """
+    if not text:
+        return ""
+    out = _PAREN_STAGE_RE.sub(" ", text)
+
+    def _caps_repl(m: re.Match[str]) -> str:
+        name, rest = m.group(1), m.group(2)
+        # Keep spoken line if it looks like dialogue (lowercase / quotes), drop pure stage
+        rest_s = (rest or "").strip()
+        if not rest_s:
+            return name + "."
+        # Stage-like: starts with verb infinitive/3p or short action phrase without quotes
+        if rest_s[0].islower() and "«" not in rest_s and '"' not in rest_s and len(rest_s.split()) <= 12:
+            return name + "."
+        return m.group(0)
+
+    out = _CAPS_SPEAKER_RE.sub(_caps_repl, out)
+    return re.sub(r"[ \t]{2,}", " ", out)
 
 
 def _as_meta(doc_meta: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -327,6 +357,7 @@ def clean_chunk_for_graph(
             header_info["front_matter_stripped"] = True
 
     clean = "\n".join(lines).strip()
+    clean = strip_stage_directions(clean)
     # Collapse runs of blank lines left by stripping
     clean = re.sub(r"\n{3,}", "\n\n", clean)
     header_info["chars_removed"] = max(0, len(raw) - len(clean))

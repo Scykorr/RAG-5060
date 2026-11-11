@@ -12,7 +12,7 @@ from typing import Any, Literal
 
 from apps.api.services import graph_lexicon as glex
 
-Lang = Literal["ru", "en", "mixed", "unknown"]
+Lang = Literal["ru", "en", "mixed", "other", "unknown"]
 DocKind = Literal["fiction", "nonfiction", "technical", "unknown"]
 
 _CYR = re.compile(r"[А-Яа-яЁё]")
@@ -259,7 +259,10 @@ def letter_script_ratio(text: str) -> tuple[float, float, int]:
 
 
 def detect_language(text: str) -> Lang:
-    """Heuristic language: ru / en / mixed / unknown."""
+    """Heuristic language: ru / en / mixed / other / unknown.
+
+    Latin script alone is not English — fr/de (and other Latin) → ``other``.
+    """
     text = text or ""
     cyr, lat, n = letter_script_ratio(text)
     if n < 12:
@@ -267,23 +270,63 @@ def detect_language(text: str) -> Lang:
     words = [w.lower() for w in _WORD.findall(text)]
     ru_fw = _detect_words("ru")
     en_fw = _detect_words("en")
+    fr_fw = _detect_words("fr")
+    de_fw = _detect_words("de")
     ru_hits = sum(1 for w in words if w in ru_fw)
     en_hits = sum(1 for w in words if w in en_fw)
+    fr_hits = sum(1 for w in words if w in fr_fw)
+    de_hits = sum(1 for w in words if w in de_fw)
     id_n = len(extract_identifiers(text))
     codeish = bool(_CODEISH.search(text))
     # Mixed: both scripts present with meaningful mass, or RU prose + code/ids
     if cyr >= 0.20 and lat >= 0.20:
+        # French/German dialogue islands inside Russian → still mixed at doc level;
+        # chunk-level callers see per-chunk lang.
         return "mixed"
     if cyr >= 0.40 and lat >= 0.08 and (codeish or id_n >= 2 or en_hits >= 2):
         return "mixed"
     if cyr >= 0.55 or (cyr >= 0.35 and ru_hits >= en_hits):
         return "ru"
-    if lat >= 0.55 or (lat >= 0.35 and en_hits > ru_hits):
-        return "en"
+    if lat >= 0.35:
+        # Distinctive markers beat raw function-word overlap (de/la/un collide).
+        fr_mark = sum(
+            1
+            for w in words
+            if w in {"dans", "pour", "avec", "cette", "comme", "mais", "nous", "vous", "elle", "est", "que", "qui", "pas", "aux", "une", "les", "des", "mon", "son", "lui", "tout", "guerre", "homme", "femme"}
+        )
+        de_mark = sum(
+            1
+            for w in words
+            if w in {"nicht", "auch", "oder", "aber", "wenn", "noch", "schon", "meine", "dein", "und", "ich", "sie", "der", "die", "das", "ein", "eine", "mit", "auf"}
+        )
+        en_mark = sum(
+            1
+            for w in words
+            if w in {"the", "and", "with", "that", "this", "from", "have", "was", "are", "which", "for", "not", "you", "they"}
+        )
+        if fr_mark >= 2 and fr_mark >= en_mark:
+            return "other"
+        if de_mark >= 2 and de_mark >= en_mark:
+            return "other"
+        # Prefer fr/de over en when their function words dominate
+        if fr_hits >= 2 and fr_hits >= en_hits and fr_hits >= de_hits:
+            return "other"
+        if de_hits >= 2 and de_hits >= en_hits:
+            return "other"
+        if en_mark >= 2 and en_mark > fr_mark and en_mark > de_mark:
+            return "en"
+        if en_hits > fr_hits and en_hits > de_hits and (en_hits >= 2 or lat >= 0.55):
+            return "en"
+        if fr_hits + de_hits > en_hits:
+            return "other"
+        if en_hits >= 1 and lat >= 0.55 and fr_mark == 0 and de_mark == 0:
+            return "en"
+        if lat >= 0.55:
+            return "other"
     if cyr > lat and cyr >= 0.25:
         return "ru"
     if lat > cyr and lat >= 0.25:
-        return "en"
+        return "other" if en_hits == 0 else "en"
     return "unknown"
 
 
@@ -467,15 +510,20 @@ def aggregate_doc_language(chunk_langs: list[str]) -> Lang:
     if not chunk_langs:
         return "unknown"
     c = Counter(chunk_langs)
-    # ignore unknown in majority
+    # ignore unknown / other in majority for primary lang; other alone stays other
     useful = Counter({k: v for k, v in c.items() if k not in {"unknown"}})
     if not useful:
         return "unknown"
-    if len(useful) >= 2 and min(useful.values()) >= 1:
-        # both ru and en present
-        if "ru" in useful and "en" in useful:
+    content = Counter({k: v for k, v in useful.items() if k != "other"})
+    if "ru" in content and "en" in content:
+        return "mixed"
+    if content:
+        top = content.most_common(1)[0][0]
+        # RU novel with French islands → still ru (or mixed if latin mass high)
+        if top == "ru" and useful.get("other", 0) >= max(2, int(0.15 * sum(useful.values()))):
             return "mixed"
-    return useful.most_common(1)[0][0]  # type: ignore[return-value]
+        return top  # type: ignore[return-value]
+    return "other"
 
 
 def literary_rules_enabled(doc_kind: str, language: str) -> bool:

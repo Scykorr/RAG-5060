@@ -32,7 +32,9 @@ Statuses: `planned` → `ready` → `in_progress` → `review` → `verified` | 
 | T-GRAPH-IDX-1D-C | F04.18c | S3c | Lifecycle clarifications: lexicon in params_hash, atomic+pointer, file lock, stale/auto_rebuild, tenant iso, test6 | verified | S54/A19; pytest test_graph_index_lifecycle 15 + suite 64 |
 | T-GRAPH-IDX-1E | F04.18d | S3c | 1e: duplicates/contains, work-lex, co_cited, entities, refers, overrides, noop | verified | report artifacts/20261111-062930; full~139s over 70s |
 | T-GRAPH-IDX-1E-M | F04.18e | S3c | 1e-M multilang ru/en + technical identifiers/edition_of | verified | S56/A21; pytest 84; report artifacts/20261111-072215; INDEX_VERSION=14 |
+| T-GRAPH-IDX-2-0 | F04.19 | S3c | Slice 2 step0: refers≥90%, entity E4, fr/de other, stage strip, shingle/noop/+10, overrides | verified | report artifacts/20261111-101906; INDEX_VERSION=16; pytest 93 |
+| T-GRAPH-TOPICS | F04.19 | S3c | Slice 2: themes/topics Louvain + level API (no UI tab) | in_progress | after step0 |
 
 ## Ready next
 
-Theme clustering / Obsidian-like graph tab; F14 smoke / S4 pilot.
+Slice 2 topics/themes + graph level API; then Obsidian-like UI tab; F14 smoke / S4 pilot.

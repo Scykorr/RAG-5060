@@ -40,20 +40,26 @@ def apply_overrides(docs: list[Any]) -> list[dict[str, Any]]:
     for d in docs:
         fn = getattr(d, "filename", "") or ""
         wk = getattr(d, "work_key", "") or ""
-        new_ak = None
+        matched = False
+        new_ak: str | None = None
         rule = None
         for pref, ak in by_prefix.items():
             if pref and fn.startswith(str(pref)):
-                new_ak = str(ak)
+                matched = True
+                new_ak = None if ak is None else str(ak)
                 rule = {"type": "filename_prefix", "prefix": pref}
                 break
-        if new_ak is None and wk in by_work:
-            new_ak = str(by_work[wk])
+        if not matched and wk in by_work:
+            matched = True
+            ak = by_work[wk]
+            new_ak = None if ak is None else str(ak)
             rule = {"type": "work_key", "work_key": wk}
-        if not new_ak or not rule:
+        if not matched or not rule:
             continue
-        d.author_key = new_ak
+        # null override → clear author (e.g. sample docs)
+        d.author_key = new_ak or None
         d.author_source = "override"
+        d.author_ru = None if not new_ak else getattr(d, "author_ru", None)
         # recompute work_key with new author
         from apps.api.services.graph_index import work_key_for
 

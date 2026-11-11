@@ -343,6 +343,112 @@ def foreign_marker_near(raw: str, start: int, end: int, window: int = 40) -> boo
     return False
 
 
+def is_person_like_title(title: str) -> bool:
+    """True for given-name titles and short historical-person titles (Борис Годунов).
+
+    Ordinary one-word work titles (Накануне, Шинель, Метель) are False.
+    """
+    toks = title_tokens(title)
+    if not toks:
+        return False
+    if len(toks) == 1:
+        t = toks[0]
+        # Surnames as titles (редко) — still person-like for match_form gating
+        if re.search(r"(ов|ев|ёв|ин|ын|ский|цкий)$", t) and len(t) >= 4:
+            return True
+        # Given names / diminutives: short, а/я/ю ending (Елена, Володя); not soft-sign nouns
+        if len(t) <= 7 and t[-1:] in "аяю" and not t.endswith(
+            ("ие", "ия", "ое", "ые", "нье", "тие", "ство")
+        ):
+            return True
+        return False
+    if len(toks) > 3:
+        return False
+    # All tokens look like name parts (no genre / function words)
+    if any(t in genre_markers() or t in STOP for t in toks):
+        return False
+    # First+patronymic or First+Surname historical titles
+    if toks[-1].endswith(("ович", "евич", "овна", "евна", "ична")):
+        return True
+    if re.search(r"(ов|ев|ёв|ин|ын|ский|цкий)$", toks[-1]):
+        return True
+    # Two capitalized name-like tokens (Борис Годунов)
+    return all(len(t) >= 3 and t[0].isalpha() for t in toks) and len(toks) == 2
+
+
+def longer_title_continues(
+    raw: str,
+    hit: dict[str, Any],
+    title_surface: str,
+    longer_titles: list[str],
+) -> bool:
+    """True if hit is a prefix of a longer catalog title that continues in the text."""
+    base = title_tokens(title_surface)
+    if not base:
+        return False
+    after = (raw or "")[hit["end"] : hit["end"] + 80]
+    after_toks = [norm_ru(t) for t in _TOKEN_RE.findall(after)]
+    if not after_toks:
+        return False
+    # Skip chapter marks like III
+    if re.fullmatch(r"[ivxlcdm]+|\d+", after_toks[0] or "", flags=re.I):
+        after_toks = after_toks[1:]
+    for longer in longer_titles:
+        lt = title_tokens(longer)
+        if len(lt) <= len(base):
+            continue
+        if lt[: len(base)] != base:
+            continue
+        rest = lt[len(base) :]
+        if len(after_toks) < len(rest):
+            continue
+        if all(_token_match(after_toks[i], rest[i]) for i in range(len(rest))):
+            return True
+    return False
+
+
+def competing_name_near(
+    raw: str,
+    start: int,
+    end: int,
+    *,
+    target_author: str | None,
+    window: int = 80,
+) -> bool:
+    """True if another person attributes the work nearby (not the target author).
+
+    Catches «поэма Пекарского», «Мирандола написал диалог "Ведьма"».
+    Does not fire on ordinary prose names in the same paragraph.
+    """
+    snip = (raw or "")[max(0, start - window) : end + window]
+    nsnip = norm_ru(snip)
+    # Explicit attribution patterns
+    if re.search(
+        r"(поэм[аыу]|рассказ[аыу]?|диалог[аыу]?|роман[аыу]?|пьес[аыуе]|стих\w*)\s+"
+        r"[а-яёa-z\-]{4,}(ого|ому|ым|им|ой|ей|а|у)?",
+        nsnip,
+    ):
+        # Exclude when the genitive matches target author
+        if target_author:
+            forms = {norm_ru(s) for s, k in qi.AUTHOR_ALIASES.items() if k == target_author}
+            forms.add(norm_ru(target_author))
+            if any(f and f in nsnip for f in forms if len(f) >= 4):
+                return False
+        return True
+    if re.search(
+        r"[а-яёa-z]{4,}(а|я)?\s+(написа\w+|сочинил\w+|создал\w+)\s+\w*\s*"
+        r"[«\"“]?$",
+        nsnip[: max(0, start - max(0, start - window)) + 1] + nsnip,
+        flags=re.I,
+    ):
+        return True
+    # «X написал … "Title"»
+    before = (raw or "")[max(0, start - window) : start]
+    if re.search(r"[A-ZА-ЯЁ][A-Za-zА-Яа-яЁё\-]{3,}\s+написа\w+", before):
+        return True
+    return False
+
+
 def classify_hit(
     raw: str,
     hit: dict[str, Any],
@@ -354,21 +460,30 @@ def classify_hit(
     question_title: bool = False,
 ) -> str | None:
     """Apply A1/E6 strong-form rules; return match_form or None."""
+    tokens = _tokens_with_spans(raw)
+    before = _tokens_before(tokens, hit["start"], 2)
+    markers = genre_markers()
+    genre_ok = any(b in markers for b in before)
+    near = _near_author_tokens(tokens, hit["start"], hit["end"], author_key)
+    multi = bool(hit.get("multiword"))
+    zone = hit.get("zone") or "body"
+
     if hit.get("match_form") == "quoted":
+        # Person-like one-word names in quotes are often vocatives; require genre / author / commentary
+        if person_name_title and not multi:
+            if not (genre_ok or near or zone == "commentary"):
+                return None
         form = "quoted"
     else:
+        # Person-like titles (Елена, Борис Годунов): quoted only — no genre/capitalized
+        if person_name_title or question_title:
+            return None
         form = None
-        tokens = _tokens_with_spans(raw)
-        before = _tokens_before(tokens, hit["start"], 2)
-        markers = genre_markers()
-        genre_ok = any(b in markers for b in before)
         cap = bool(hit.get("capitalized"))
-        near = _near_author_tokens(tokens, hit["start"], hit["end"], author_key)
-        multi = bool(hit.get("multiword"))
 
         if genre_ok and (cap or True):
             form = "genre_marker"
-        elif near and (cap or hit.get("match_form") == "quoted"):
+        elif near and cap:
             form = "near_author"
         elif multi and cap and not frequent_title and not same_author:
             form = "capitalized"
@@ -378,9 +493,6 @@ def classify_hit(
         # One-word: only quoted or genre_marker
         if not multi and form not in ("quoted", "genre_marker"):
             return None
-        # E6: person-name one-word titles and question-starters → quoted only
-        if (person_name_title or question_title) and form != "quoted":
-            return None
         # Same-author works: only quoted/genre
         if same_author and form not in ("quoted", "genre_marker"):
             return None
@@ -388,8 +500,6 @@ def classify_hit(
         if frequent_title and form not in ("quoted", "genre_marker"):
             return None
 
-    if form == "quoted":
-        return "quoted"
     return form
 
 
