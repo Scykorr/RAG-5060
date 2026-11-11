@@ -378,6 +378,7 @@ def connectivity_index_stats(
         "built_at": cached.get("built_at"),
         "built_ms": cached.get("built_ms"),
         "params_hash": cached.get("params_hash"),
+        "stale": bool(cached.get("stale") or stats.get("stale")),
         "build_mode": stats.get("build_mode"),
         "lifecycle": stats.get("lifecycle"),
         "layer_ms": stats.get("layer_ms"),

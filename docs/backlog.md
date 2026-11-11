@@ -29,6 +29,7 @@ Statuses: `planned` → `ready` → `in_progress` → `review` → `verified` | 
 | T-GRAPH-IDX-1C | F04.18 | S3c | Index cleanup 1c: text clean, mentions_author, strong refers, entities, lex, work merge | verified | report artifacts/20261110-133444-graph-index |
 | T-GRAPH-IDX-1D | F04.18 | S3c | Offline lifecycle: per-doc cache, incremental≈full, background rebuild, reset invalidate | verified | S54/A19; unit 32 passed |
 | T-GRAPH-IDX-1D-A | F04.18b | S3c | Quality 1d: strict refers/lex/ents/authors/dupes + report; lifecycle verify | verified | S55/A20; report artifacts/20261111-050958; INDEX_VERSION=9 |
+| T-GRAPH-IDX-1D-C | F04.18c | S3c | Lifecycle clarifications: lexicon in params_hash, atomic+pointer, file lock, stale/auto_rebuild, tenant iso, test6 | verified | S54/A19; pytest test_graph_index_lifecycle 15 + suite 64 |
 
 ## Ready next
 

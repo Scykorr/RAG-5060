@@ -239,3 +239,14 @@
 - prevent: S54; не монтировать пустой host path как DATA_ROOT
 - links: `scripts/_run-1d-report.sh`
 - status: fixed
+
+## 2026-11-11 — параллельная сборка / мёртвый in-memory lock
+- id: E-20261111-graph-build-lock
+- symptom: два rebuild подряд или после crash API — гонка/залипший «running»
+- reproduce: два `POST /api/graph/index/rebuild`; или kill процесса на mid-build
+- root_cause: single-flight только в памяти процесса
+- fix: lock-файл `data_root()/graph/locks/<tenant>.lock` + timeout/dead-pid; atomic publish + `current/<tenant>.json`; fail не двигает pointer
+- replay: `pytest tests/unit/test_graph_index_lifecycle.py::test_file_lock_single_flight_and_dead_clear` + `test_atomic_publish_keeps_previous_on_failed_pointer`
+- prevent: S54, A19; `GRAPH_AUTO_REBUILD` по умолчанию false
+- links: `graph_index_cache.py`, CONNECTIVITY_LIFECYCLE.md
+- status: fixed

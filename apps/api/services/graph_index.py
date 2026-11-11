@@ -1783,10 +1783,8 @@ def invalidate_tenant(tenant_id: UUID | str) -> dict[str, int]:
 
 
 def write_index_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    """Atomic index write: tmp + rename. Failed builds must not call this."""
+    gcache.write_json_atomic(path, payload, indent=2)
 
 
 def read_index(path: Path) -> dict[str, Any] | None:
@@ -1798,15 +1796,56 @@ def read_index(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def _annotate_stale(cached: dict[str, Any], tenant_id: UUID | str) -> dict[str, Any]:
+    ptr = gcache.read_current_pointer(tenant_id) or {}
+    stale = bool(ptr.get("stale"))
+    stats = dict(cached.get("stats") or {})
+    stats["stale"] = stale
+    if stale:
+        stats["stale_reason"] = ptr.get("stale_reason")
+    cached = dict(cached)
+    cached["stats"] = stats
+    cached["stale"] = stale
+    return cached
+
+
 def load_cached_index(db: Session, tenant_id: UUID, *, params: GraphIndexParams | None = None) -> dict[str, Any] | None:
+    """Return exact cache hit, or last-good pointer if rebuild failed / corpus pending.
+
+    Failed builds never overwrite the pointer, so API keeps serving the previous intact index
+    (with stats.stale=true when corpus changed).
+    """
     params = params or GraphIndexParams()
     fp = corpus_fingerprint(db, tenant_id)
     ph = gcache.params_hash(params.to_dict())
-    cached = read_index(index_path(tenant_id, fp, params_hash_value=ph))
-    if cached and cached.get("fingerprint") == fp and cached.get("version") == INDEX_VERSION:
-        if cached.get("params_hash") in (None, ph):
-            return cached
+    exact = read_index(index_path(tenant_id, fp, params_hash_value=ph))
+    if (
+        exact
+        and exact.get("fingerprint") == fp
+        and exact.get("version") == INDEX_VERSION
+        and exact.get("params_hash") in (None, ph)
+    ):
+        return _annotate_stale(exact, tenant_id)
+
+    ptr = gcache.read_current_pointer(tenant_id) or {}
+    prev_name = ptr.get("index_file")
+    if prev_name:
+        prev = read_index(gcache.graph_dir() / str(prev_name))
+        if prev and prev.get("version") == INDEX_VERSION:
+            return _annotate_stale(prev, tenant_id)
     return None
+
+
+def on_corpus_changed(tenant_id: UUID, *, reason: str = "corpus_changed") -> dict[str, Any]:
+    """Mark connectivity index stale; optionally schedule rebuild (GRAPH_AUTO_REBUILD)."""
+    ptr = gcache.mark_index_stale(tenant_id, reason=reason)
+    from apps.api.services.graph.settings import get_graph_limits
+
+    auto = bool(get_graph_limits().auto_rebuild)
+    out: dict[str, Any] = {"stale": True, "reason": reason, "auto_rebuild": auto, "pointer": ptr}
+    if auto:
+        out["rebuild"] = schedule_rebuild(tenant_id, force=True, mode="auto")
+    return out
 
 
 def _active_documents(db: Session, tenant_id: UUID) -> list[tuple[Document, DocumentVersion]]:
@@ -2021,13 +2060,17 @@ def build_index_for_tenant(
             mode=build_mode,
             params_hash_value=ph,
         )
-        write_index_atomic(path, payload)
-        purge_old_indexes(tenant_id, path)
-        gcache.write_build_status(
-            tenant_id,
-            {"status": "ready", "mode": build_mode, "fingerprint": fp, "documents": 0},
+        return _publish_index(
+            tenant_id=tenant_id,
+            path=path,
+            payload=payload,
+            fingerprint=fp,
+            params_hash_value=ph,
+            build_mode=build_mode,
+            lifecycle={"added": 0, "changed": 0, "removed": 0, "cached": 0},
+            layer_ms={},
+            chunk_total=0,
         )
-        return payload
 
     docs: list[DocMeta] = []
     ver_by_doc: dict[str, DocumentVersion] = {}
@@ -2246,34 +2289,75 @@ def build_index_for_tenant(
         },
     )
     payload["params_hash"] = ph
+    return _publish_index(
+        tenant_id=tenant_id,
+        path=path,
+        payload=payload,
+        fingerprint=fp,
+        params_hash_value=ph,
+        build_mode=build_mode,
+        lifecycle=lifecycle,
+        layer_ms=layer_ms,
+        chunk_total=chunk_total,
+    )
+
+
+def _publish_index(
+    *,
+    tenant_id: UUID | str,
+    path: Path,
+    payload: dict[str, Any],
+    fingerprint: str,
+    params_hash_value: str,
+    build_mode: str,
+    lifecycle: dict[str, Any],
+    layer_ms: dict[str, Any],
+    chunk_total: int,
+) -> dict[str, Any]:
+    """Atomic publish of a complete index; never called mid-build."""
     write_index_atomic(path, payload)
+    gcache.write_current_pointer(
+        tenant_id,
+        {
+            "index_file": path.name,
+            "fingerprint": fingerprint,
+            "params_hash": params_hash_value,
+            "version": INDEX_VERSION,
+            "stale": False,
+            "built_at": payload.get("built_at"),
+        },
+    )
+    gcache.clear_stale_flag(tenant_id)
     removed = purge_old_indexes(tenant_id, path)
-    stats = payload["stats"]
+    stats = payload.setdefault("stats", {})
+    stats["stale"] = False
     gcache.write_build_status(
         tenant_id,
         {
             "status": "ready",
             "mode": build_mode,
-            "fingerprint": fp,
-            "params_hash": ph,
-            "built_ms": built_ms,
-            "documents": stats["documents"],
+            "fingerprint": fingerprint,
+            "params_hash": params_hash_value,
+            "built_ms": payload.get("built_ms"),
+            "documents": stats.get("documents"),
             "lifecycle": lifecycle,
             "layer_ms": layer_ms,
+            "stale": False,
+            "index_file": path.name,
         },
     )
     log.info(
         "graph_index_built",
         tenant_id=str(tenant_id),
-        fingerprint=fp,
-        built_ms=built_ms,
+        fingerprint=fingerprint,
+        built_ms=payload.get("built_ms"),
         mode=build_mode,
-        documents=stats["documents"],
-        works=stats["works"],
+        documents=stats.get("documents"),
+        works=stats.get("works"),
         chunks=chunk_total,
-        edge_counts=stats["edge_counts_by_type"],
-        isolated_docs=stats["isolated_documents"],
-        isolated_works=stats["isolated_works"],
+        edge_counts=stats.get("edge_counts_by_type"),
+        isolated_docs=stats.get("isolated_documents"),
+        isolated_works=stats.get("isolated_works"),
         purged_old=removed,
         lifecycle=lifecycle,
     )
@@ -2286,20 +2370,26 @@ def schedule_rebuild(
     force: bool = True,
     mode: str | None = None,
 ) -> dict[str, Any]:
-    """Enqueue background rebuild; single-flight per tenant. Does not block."""
+    """Enqueue background rebuild; one build per tenant via file lock + in-memory flag."""
     tid = str(tenant_id)
-    if gcache.is_build_running(tid):
+    mem = gcache.tenant_lock(tid)
+    if not mem.acquire(blocking=False):
         st = gcache.read_build_status(tid) or {}
         return {"status": "already_running", "build": st}
-    lock = gcache.tenant_lock(tid)
-    if not lock.acquire(blocking=False):
+    if not gcache.acquire_build_lock(tid):
+        mem.release()
         st = gcache.read_build_status(tid) or {}
         return {"status": "already_running", "build": st}
 
     gcache.set_build_running(tid, True)
     gcache.write_build_status(
         tid,
-        {"status": "running", "mode": mode or "auto", "started_at": datetime.now(timezone.utc).isoformat()},
+        {
+            "status": "running",
+            "mode": mode or "auto",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "stale": True,
+        },
     )
 
     def _worker() -> None:
@@ -2310,13 +2400,24 @@ def schedule_rebuild(
                 build_index_for_tenant(db, tenant_id, force=force, mode=mode)
         except Exception as exc:  # noqa: BLE001
             log.exception("graph_index_rebuild_failed", tenant_id=tid, error=type(exc).__name__)
+            # Keep previous current pointer / index intact.
             gcache.write_build_status(
                 tid,
-                {"status": "error", "error": type(exc).__name__, "message": str(exc)[:300]},
+                {
+                    "status": "error",
+                    "error": type(exc).__name__,
+                    "message": str(exc)[:300],
+                    "stale": True,
+                },
             )
+            gcache.mark_index_stale(tid, reason=f"build_error:{type(exc).__name__}")
         finally:
             gcache.set_build_running(tid, False)
-            lock.release()
+            gcache.release_build_lock(tid)
+            try:
+                mem.release()
+            except RuntimeError:
+                pass
 
     threading.Thread(target=_worker, daemon=True, name=f"graph-index-{tid[:8]}").start()
     return {"status": "started", "mode": mode or "auto"}

@@ -1,5 +1,11 @@
 # Progress
 
+## 2026-11-11 — Lifecycle clarifications (F04.18c)
+
+- params_hash includes `graph_lexicon.json` SHA1; atomic index + `current/<tenant>.json` (fail keeps previous)
+- File lock `graph/locks/<tenant>.lock` + dead/timeout clear; stale after ingestion; `GRAPH_AUTO_REBUILD` (default false)
+- Test 6 edition/volume + tenant isolation; CONNECTIVITY_LIFECYCLE.md updated; pytest graph unit 64 passed
+
 ## 2026-11-11 — Knowledge sync after 1d (S48/S51)
 
 - S55 + A20; ERRORS E-20261111-{refers-partial-lower,lex-proper-names,report-dataroot}

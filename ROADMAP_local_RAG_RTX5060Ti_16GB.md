@@ -272,6 +272,7 @@ Haystack Apache-2.0 допустим как последующая библио�
 - [x] F04.18. P2 (slice 1): offline connectivity index by active chunks (filename/refers/shared_entity/lex/co_cited) + `/api/graph/index/*` + report; no Qdrant; thresholds TBD from report.
 - [x] F04.18a. P2 (slice 1b/1c): text_clean + lifecycle (doc_cache, params_hash, full|incremental, schedule_rebuild); `docs/graph/CONNECTIVITY_LIFECYCLE.md`; A19/S54.
 - [x] F04.18b. P2 (slice 1d): quality — strict refers_to, lex mid-cap names, entity lemma strong/weak, mentions_author zones, text_header author, edition shinles/canonical, isolation metrics; INDEX_VERSION=9; report `artifacts/20261111-050958-graph-index/` (refers 640→51, precision≈90%); A20/S55.
+- [x] F04.18c. P2 (lifecycle clarifications): params_hash∋lexicon SHA1; atomic publish + current pointer; per-tenant file lock; stale after ingestion + `GRAPH_AUTO_REBUILD`; tenant-scoped invalidate; acceptance test 6 (edition/volume).
 - [ ] F04.19. Запускать Label Studio и массовую авторазметку отдельным профилем/сеансом; измерить дополнительную RAM. Не добавлять их поверх уже выделенных 20 ГБ WSL без пересчёта бюджета. LLM-разметка использует общую очередь GPU и уступает chat.
 
 **Приёмка:** имеется схема и инструкция, проверенная выборка, версионный экспорт/импорт, прослеживаемость исправлений; автоматически предложенные метки отличимы от проверенных. Бесплатные инструменты не заменяют предметные правила и экспертную ответственность.

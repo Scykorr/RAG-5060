@@ -24,9 +24,10 @@ class GraphLimits:
     evidence_snippet_chars: int = 280
     representative_chunks: int = 4
     algorithm_version: str = "1"
+    auto_rebuild: bool = False
 
 
 def get_graph_limits() -> GraphLimits:
     # Keep env surface small; hard limits stay in code for MVP safety.
-    _ = get_settings()
-    return GraphLimits()
+    s = get_settings()
+    return GraphLimits(auto_rebuild=bool(getattr(s, "graph_auto_rebuild", False)))

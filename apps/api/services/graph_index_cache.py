@@ -2,12 +2,15 @@
 
 Offline only. Doc caches live under data_root()/graph/doc_cache/<tenant>/.
 Build status: data_root()/graph/build_status/<tenant>.json
+Current (last-good) pointer: data_root()/graph/current/<tenant>.json
+Lock file: data_root()/graph/locks/<tenant>.lock
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -18,6 +21,8 @@ from uuid import UUID
 from apps.api.services.storage import data_root
 
 KEEP_INDEX_FILES = 3
+LOCK_TIMEOUT_SEC = 30 * 60  # 30 minutes
+LOCK_STALE_SEC = LOCK_TIMEOUT_SEC
 
 _status_lock = threading.Lock()
 _tenant_locks: dict[str, threading.Lock] = {}
@@ -42,7 +47,20 @@ def build_status_path(tenant_id: UUID | str) -> Path:
     return d / f"{tenant_id}.json"
 
 
+def current_pointer_path(tenant_id: UUID | str) -> Path:
+    d = graph_dir() / "current"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{tenant_id}.json"
+
+
+def lock_path(tenant_id: UUID | str) -> Path:
+    d = graph_dir() / "locks"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{tenant_id}.lock"
+
+
 def tenant_lock(tenant_id: UUID | str) -> threading.Lock:
+    """In-process mutex (complements file lock across workers/restarts)."""
     key = str(tenant_id)
     with _status_lock:
         if key not in _tenant_locks:
@@ -52,7 +70,10 @@ def tenant_lock(tenant_id: UUID | str) -> threading.Lock:
 
 def is_build_running(tenant_id: UUID | str) -> bool:
     with _status_lock:
-        return bool(_running.get(str(tenant_id)))
+        if bool(_running.get(str(tenant_id))):
+            return True
+    # file lock may outlive process flag after crash recovery checks
+    return lock_held(tenant_id)
 
 
 def set_build_running(tenant_id: UUID | str, running: bool) -> None:
@@ -60,13 +81,125 @@ def set_build_running(tenant_id: UUID | str, running: bool) -> None:
         _running[str(tenant_id)] = running
 
 
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_lock(tenant_id: UUID | str) -> dict[str, Any] | None:
+    path = lock_path(tenant_id)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def lock_held(tenant_id: UUID | str, *, timeout_sec: float = LOCK_TIMEOUT_SEC) -> bool:
+    data = _read_lock(tenant_id)
+    if not data:
+        return False
+    pid = int(data.get("pid") or 0)
+    started_at = data.get("started_at")
+    age = timeout_sec + 1
+    if started_at:
+        try:
+            started_dt = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+            age = (datetime.now(timezone.utc) - started_dt).total_seconds()
+        except ValueError:
+            age = timeout_sec + 1
+    if age > timeout_sec:
+        return False
+    if pid and not _pid_alive(pid):
+        return False
+    return True
+
+
+def clear_dead_lock(tenant_id: UUID | str, *, timeout_sec: float = LOCK_TIMEOUT_SEC) -> bool:
+    """Remove lock if missing/expired/dead pid. Returns True if lock file cleared."""
+    path = lock_path(tenant_id)
+    if not path.exists():
+        return True
+    if lock_held(tenant_id, timeout_sec=timeout_sec):
+        return False
+    try:
+        path.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def acquire_build_lock(
+    tenant_id: UUID | str,
+    *,
+    timeout_sec: float = LOCK_TIMEOUT_SEC,
+) -> bool:
+    """Exclusive per-tenant file lock under data_root()/graph/locks/."""
+    tid = str(tenant_id)
+    clear_dead_lock(tid, timeout_sec=timeout_sec)
+    path = lock_path(tid)
+    if path.exists() and lock_held(tid, timeout_sec=timeout_sec):
+        return False
+    payload = {
+        "tenant_id": tid,
+        "pid": os.getpid(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "started_mono": time.monotonic(),
+        "timeout_sec": timeout_sec,
+    }
+    tmp = path.with_suffix(".lock.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        # exclusive create race: if exists after clear, refuse
+        if path.exists() and lock_held(tid, timeout_sec=timeout_sec):
+            tmp.unlink(missing_ok=True)
+            return False
+        tmp.replace(path)
+        return True
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
+def release_build_lock(tenant_id: UUID | str) -> None:
+    path = lock_path(tenant_id)
+    data = _read_lock(tenant_id)
+    if data and int(data.get("pid") or 0) not in (0, os.getpid()):
+        # do not remove another live owner's lock
+        if lock_held(tenant_id):
+            return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any] | list[Any], *, indent: int | None = 2) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    text = json.dumps(payload, ensure_ascii=False, indent=indent)
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
 def write_build_status(tenant_id: UUID | str, payload: dict[str, Any]) -> None:
     path = build_status_path(tenant_id)
-    tmp = path.with_suffix(".tmp")
     data = dict(payload)
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    write_json_atomic(path, data)
 
 
 def read_build_status(tenant_id: UUID | str) -> dict[str, Any] | None:
@@ -79,8 +212,52 @@ def read_build_status(tenant_id: UUID | str) -> dict[str, Any] | None:
         return None
 
 
-def params_hash(params_dict: dict[str, Any]) -> str:
-    raw = json.dumps(params_dict, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+def write_current_pointer(tenant_id: UUID | str, payload: dict[str, Any]) -> None:
+    write_json_atomic(current_pointer_path(tenant_id), payload)
+
+
+def read_current_pointer(tenant_id: UUID | str) -> dict[str, Any] | None:
+    path = current_pointer_path(tenant_id)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def mark_index_stale(tenant_id: UUID | str, *, reason: str = "corpus_changed") -> dict[str, Any]:
+    """Flag last-good index as stale after ingestion; do not delete it."""
+    ptr = read_current_pointer(tenant_id) or {}
+    ptr["stale"] = True
+    ptr["stale_reason"] = reason[:200]
+    ptr["stale_at"] = datetime.now(timezone.utc).isoformat()
+    write_current_pointer(tenant_id, ptr)
+    st = read_build_status(tenant_id) or {}
+    st["stale"] = True
+    st["stale_reason"] = reason[:200]
+    if st.get("status") not in ("running",):
+        st["status"] = st.get("status") or "stale"
+    write_build_status(tenant_id, st)
+    return ptr
+
+
+def clear_stale_flag(tenant_id: UUID | str) -> None:
+    ptr = read_current_pointer(tenant_id) or {}
+    if ptr:
+        ptr["stale"] = False
+        ptr.pop("stale_reason", None)
+        ptr.pop("stale_at", None)
+        write_current_pointer(tenant_id, ptr)
+
+
+def params_hash(params_dict: dict[str, Any], *, lexicon_hash: str | None = None) -> str:
+    """Hash of build params + lexicon file content (invalidates on lexicon edit)."""
+    from apps.api.services.graph_lexicon import lexicon_content_hash
+
+    payload = dict(params_dict)
+    payload["lexicon_sha1"] = lexicon_hash or lexicon_content_hash()
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 
@@ -108,10 +285,7 @@ def read_doc_artifact(tenant_id: UUID | str, document_id: str) -> dict[str, Any]
 
 
 def write_doc_artifact(tenant_id: UUID | str, document_id: str, payload: dict[str, Any]) -> None:
-    path = doc_artifact_path(tenant_id, document_id)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
+    write_json_atomic(doc_artifact_path(tenant_id, document_id), payload, indent=None)
 
 
 def purge_doc_artifacts(tenant_id: UUID | str, keep_ids: set[str]) -> int:
@@ -128,7 +302,7 @@ def purge_doc_artifacts(tenant_id: UUID | str, keep_ids: set[str]) -> int:
 
 
 def invalidate_tenant_graph(tenant_id: UUID | str) -> dict[str, int]:
-    """Drop indexes, doc caches, build status for tenant (reset-rag / empty)."""
+    """Drop indexes, doc caches, build status, pointer, lock for ONE tenant only."""
     tid = str(tenant_id)
     removed_idx = 0
     for p in graph_dir().glob(f"{tid}_*_index.json"):
@@ -146,18 +320,19 @@ def invalidate_tenant_graph(tenant_id: UUID | str) -> dict[str, int]:
                 removed_docs += 1
             except OSError:
                 pass
-    sp = build_status_path(tid)
-    if sp.exists():
-        try:
-            sp.unlink()
-        except OSError:
-            pass
+    for helper in (build_status_path(tid), current_pointer_path(tid), lock_path(tid)):
+        if helper.exists():
+            try:
+                helper.unlink()
+            except OSError:
+                pass
     write_build_status(
         tid,
         {
             "status": "idle",
             "mode": None,
             "message": "invalidated",
+            "stale": False,
         },
     )
     return {"indexes_removed": removed_idx, "doc_artifacts_removed": removed_docs}
@@ -183,7 +358,10 @@ def purge_old_indexes(
     *,
     keep_n: int = KEEP_INDEX_FILES,
 ) -> int:
-    """Always keep ``keep_path``; additionally keep up to ``keep_n-1`` newest others."""
+    """Always keep ``keep_path``; additionally keep up to ``keep_n-1`` newest others.
+
+    Only touches files for this tenant_id prefix.
+    """
     tid = str(tenant_id)
     keep_res = keep_path.resolve()
     files = sorted(

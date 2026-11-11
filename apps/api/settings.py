@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     ollama_context_length: int = Field(default=4096, validation_alias="OLLAMA_CONTEXT_LENGTH")
     compose_profile: str = Field(default="core", validation_alias="COMPOSE_PROFILE")
     offline_mode: bool = Field(default=True, validation_alias="OFFLINE_MODE")
+    # Connectivity index: after ingestion mark stale; rebuild only if true (else POST /index/rebuild).
+    graph_auto_rebuild: bool = Field(default=False, validation_alias="GRAPH_AUTO_REBUILD")
 
     @property
     def database_url_sync(self) -> str:

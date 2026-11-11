@@ -37,6 +37,12 @@ def notify_corpus_changed(tenant_id: uuid.UUID, *, reason: str = "corpus_changed
             last = qstate._get(s, "quality_corpus_fingerprint", "")
             qstate.mark_stale(s, reason=reason)
             s.commit()
+            try:
+                from apps.api.services import graph_index as gidx
+
+                gidx.on_corpus_changed(tenant_id, reason=reason)
+            except Exception:  # noqa: BLE001
+                pass
             if not qstate.auto_improve_enabled(s):
                 return
             if last and last == fp and qstate._get(s, "quality_status", "") == "ok":
