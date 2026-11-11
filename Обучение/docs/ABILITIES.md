@@ -51,6 +51,7 @@
 | A19 | Connectivity index: full replace + incremental top-up offline | yes | reset-rag → rebuild empty; import → stale; rebuild manual/auto; add edition/volume → work/canonical/author; delete → edges gone; fail build → previous index | `pytest tests/unit/test_graph_index_lifecycle.py` (params_hash/lexicon, lock, stale, tenant isolation, test6 edition) | S54 |
 | A20 | Connectivity quality 1d/1e | yes | Rebuild → duplicates/contains, work-lex regression (Gandhi/безумие/Воскресение↔Карамазовы), bad clean, co_cited not alpha, entity strong rare, work_mentions>0, noop≤2s | `pytest tests/unit/test_graph_*.py` (84); report `artifacts/20261111-062930-graph-index/` vs `20261111-050958` (INDEX_VERSION=11→13 multilang); isolated_works 1.3%; noop≈1.9s | S54, S55 |
 | A21 | Multilang + technical connectivity | yes | ru/en/mixed detect; EN lex without stop/style edges; RU↔EN via shared_entity cross_lang (RFC/TLS); Spec v1.2/v1.3 → edition_of; no patronymic on EN | `pytest tests/unit/test_graph_multilang.py` (8) + full `test_graph_*.py` (84); fixtures `tests/fixtures/graph_multilang/`; report `artifacts/20261111-072215-graph-index/` INDEX_VERSION=14 | S56 |
+| A22 | Theme/topic levels (no UI) | yes | Rebuild индекса пишет topics; `GET /api/graph/overview?view=levels`; same_author_factor 0.6; half-rule author purity | `pytest tests/unit/test_graph_topics.py tests/unit/test_graph_topics_api.py` (17); report `artifacts/20261111-104731-topics/` — 19 topics, 4 themes, unthemed 1.6%, pure100 share 0.4706 | S57 |
 
 ## Контекст для смены документов (replay корпуса)
 

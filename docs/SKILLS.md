@@ -79,6 +79,7 @@
 | S54 | Connectivity index offline + lifecycle | Сборка графа / reset / дозагрузка корпуса | Кэш `tenant+fp+version+params_hash` (**params_hash включает SHA1 `graph_lexicon.json`**); atomic write + `current/<tenant>.json`; lock-файл `graph/locks/<tenant>.lock` (timeout/dead pid); после ingestion `stale=true` → `POST /index/rebuild` или `GRAPH_AUTO_REBUILD=true`; invalidate только свой tenant; report: volume `rag5060_ragdata` | CONNECTIVITY_LIFECYCLE.md; A19 |
 | S55 | Connectivity quality 1d/1e | Правки `graph_index` / ложные рёбра / отчёт | 1d gates + 1e: duplicate/contained_in/contains; work-lex dual sig (tfidf∪residual)+burst+mutual/same-author soft kNN+weak; `lex_cross_theme_stems` for cross-author; co_cited filter; strong df≤3; overrides; noop; isolation on canonical | `pytest tests/unit/test_graph_*.py`; report vs `artifacts/20261111-050958-graph-index/` |
 | S56 | Multilang connectivity (ru/en) | Техдок/EN корпус / mixed RU+code; не только литература | 1) `graph_lang.detect_language` + `detect_doc_kind` → artifact; 2) lexicon `configs/graph_lexicon.json` nested `{ru,en,shared}`; stem/IDF/lex **per lang** (`layer_d` `lang=` — EN Latin не drop); 3) identifiers RFC/ISO/TLS → `shared_entity` + `cross_lang`; 4) literary (ИО/жанр) только если `literary_rules_enabled`; technical: `edition_of`, tech refers | `pytest tests/unit/test_graph_multilang.py`; fixtures `tests/fixtures/graph_multilang/`; A21 |
+| S57 | Themes/topics поверх connectivity index | После rebuild индекса / level API, без UI-вкладки | 1) Louvain stdlib (`graph_louvain`, seed из `configs/graph_topics.json`); рёбра только lex/refers/shared_entity/contains; `same_author_factor=0.6`; `in_theme` = collection, не тема; 2) id стабильны при Jaccard≥0.5, incremental если изменение ≤20%; reset удаляет `graph/topics/<tenant>.json`; 3) подписи c-TF-IDF: имена собственные выкидываются, показ surface не stem, overrides последними; Ollama опционален и при падении остаётся term label; 4) `GET /api/graph/overview?view=levels`, `/themes/{id}`, `/topics/{id}`, `/local/{id}`, `/search`, `/nodes/{id}`; не-UUID `/edges/{id}`; `POST /rebuild?scope=index\|topics\|all` | `pytest tests/unit/test_graph_topics.py tests/unit/test_graph_topics_api.py`; report `artifacts/20261111-104731-topics/`; A22 |
 
 ---
 
@@ -91,7 +92,7 @@
 | Корпус / prefix / reset | S06, S11, S21, S27, S28, S30–S32, S54 |
 | Intent / catalog | S33, S34 |
 | Login / WSL / UI port | S37–S45, S47, S49, S52 |
-| Graph Explorer | S50, S53, S54, S55, S56 |
+| Graph Explorer | S50, S53, S54, S55, S56, S57 |
 | Offline / deps | S29, S46, S54 |
-| Graph | S35, S36, S50, S54, S55, S56 |
+| Graph | S35, S36, S50, S54, S55, S56, S57 |
 | Ритуал агента | S23, S48, S51 |

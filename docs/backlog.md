@@ -33,8 +33,8 @@ Statuses: `planned` → `ready` → `in_progress` → `review` → `verified` | 
 | T-GRAPH-IDX-1E | F04.18d | S3c | 1e: duplicates/contains, work-lex, co_cited, entities, refers, overrides, noop | verified | report artifacts/20261111-062930; full~139s over 70s |
 | T-GRAPH-IDX-1E-M | F04.18e | S3c | 1e-M multilang ru/en + technical identifiers/edition_of | verified | S56/A21; pytest 84; report artifacts/20261111-072215; INDEX_VERSION=14 |
 | T-GRAPH-IDX-2-0 | F04.19 | S3c | Slice 2 step0: refers≥90%, entity E4, fr/de other, stage strip, shingle/noop/+10, overrides | verified | report artifacts/20261111-101906; INDEX_VERSION=16; pytest 93 |
-| T-GRAPH-TOPICS | F04.19 | S3c | Slice 2: themes/topics Louvain + level API (no UI tab) | in_progress | after step0 |
+| T-GRAPH-TOPICS | F04.19 | S3c | Slice 2: themes/topics Louvain + level API (no UI tab) | verified | S57/A22; report artifacts/20261111-104731-topics; 19 topics, 4 themes, pure100 0.4706; pytest 17 |
 
 ## Ready next
 
-Slice 2 topics/themes + graph level API; then Obsidian-like UI tab; F14 smoke / S4 pilot.
+Obsidian-like UI tab on the level API; F14 smoke / S4 pilot. Chekhov theme is still an author folder (speech labels).

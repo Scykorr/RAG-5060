@@ -1,3 +1,14 @@
+## 2026-11-11 — Slice 2 steps 1–7 (themes/topics)
+
+- INDEX_VERSION stays **16** (collection is an alias of `in_theme`; no index rebuild)
+- `same_author_factor` **0.6**; lex 0.45 / refers 1.9 / shared_entity 1.8; topic_resolution 2.6; theme_resolution 1.0
+- Report `artifacts/20261111-104731-topics/`: works **371**, topics **19**, themes **4**, «Без темы» **6** (1.6%)
+- Author purity: content topics 17, 100% pure **8** (share **0.4706**), mean 0.9095, half-rule **pass**
+- Stability: hold out 25% (92 works) keeps the remaining works' topic ids at **100%**; +5 works stay incremental
+- Topics build **11.1s** after a warm index (noop load 3.0s); `pytest tests/unit/test_graph_topics*.py` **17 passed**
+- S57/A22. API: `GET /api/graph/overview?view=levels`, `/themes/{id}`, `/topics/{id}`, `/local/{id}`, `/search`, `/nodes/{id}`; non-UUID `/edges/{id}`; `POST /rebuild?scope=index|topics|all`
+- Labels are mixed. War, poetry, and faith read as themes («адъютант, пехотных — Набег»; «хладный, забвенье, вдохновенье»; «учения, религиозного — Царство Божие»). The Chekhov theme is still an author folder (purity 1.0, speech «нешто, тово»). The large multi-author prose theme is labeled with style words («дескать»), not a subject.
+
 ## 2026-11-11 — Slice 2 step 0 (1e leftovers)
 
 - INDEX_VERSION=**16**; report `artifacts/20261111-101906-graph-index/`
