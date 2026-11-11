@@ -1,3 +1,12 @@
+## 2026-11-11 — Graph 1e report status
+
+- Report: `artifacts/20261111-055631-graph-index/` vs `20261111-050958`
+- duplicates 28 + contained_in 97 (contains=99); co_cited filtered (accepted=0)
+- isolated_works_no_cocited share=0.38 (target ≤0.10) — **failed**; weak_edges 2/183 OK
+- regression good: Gandhi / О безумии still absent; bad clean
+- built_ms≈504s (**failed** ≤70s) — shingle hashing cost; noop unit OK
+- pytest graph unit: 76 passed
+
 ## 2026-11-11 — Graph 1e E1 fix (shingle hashes)
 
 - Full shingle hashes (n=5); compare to top-8 longest per work; eb→duplicate, fragments→contained_in

@@ -60,9 +60,9 @@ DEFAULT_SHARED_MIN = 2
 DEFAULT_SHARED_TOP_K = 8
 DEFAULT_LEX_TOP_M = 200
 DEFAULT_LEX_TOP_K = 5
-DEFAULT_LEX_MIN_SCORE = 0.08
-DEFAULT_LEX_WEAK_FLOOR = 0.12
-DEFAULT_LEX_BURST_MAX_RATIO = 0.90
+DEFAULT_LEX_MIN_SCORE = 0.05
+DEFAULT_LEX_WEAK_FLOOR = 0.05
+DEFAULT_LEX_BURST_MAX_RATIO = 0.95
 DEFAULT_REFERS_TOP_K = 10
 DEFAULT_REFERS_HUB_FRAC = 0.10
 DEFAULT_ENTITY_MAX_WORK_FRAC = 0.15
@@ -1868,9 +1868,13 @@ def assemble_index(
                     structural_linked.add(e.target)
 
     by_id = {d.document_id: d for d in docs}
-    isolated_content_ids = [d.document_id for d in docs if d.document_id not in content_linked]
+    # Isolation metrics are about canonical works/docs (duplicates/contained fold away)
+    canon_docs = [d for d in docs if d.canonical and not d.contained_in and not d.duplicate_of]
+    isolated_content_ids = [
+        d.document_id for d in canon_docs if d.document_id not in content_linked
+    ]
     isolated_content_no_cc_ids = [
-        d.document_id for d in docs if d.document_id not in content_linked_no_cc
+        d.document_id for d in canon_docs if d.document_id not in content_linked_no_cc
     ]
     isolated_structural_ids = [
         d.document_id
@@ -1903,7 +1907,11 @@ def assemble_index(
         key=lambda r: (-int(r["chunk_count"] or 0), r["document_id"]),
     )[:20]
 
-    works = {d.work_key: d for d in docs}
+    works = {d.work_key: d for d in canon_docs}
+    # also keep all work keys that have a canonical member
+    for d in docs:
+        if d.canonical and not d.contained_in and not d.duplicate_of:
+            works.setdefault(d.work_key, d)
     work_linked: set[str] = set()
     work_linked_no_cc: set[str] = set()
     for e in edges:
