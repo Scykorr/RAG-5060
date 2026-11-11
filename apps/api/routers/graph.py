@@ -5,7 +5,8 @@ from __future__ import annotations
 import uuid
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -36,9 +37,16 @@ def graph_status(
 
 @router.get("/overview")
 def graph_overview(
+    request: Request,
     user: Annotated[AuthUser, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
+    view: str = Query(default=""),
+    limit: int | None = Query(default=None),
+    collection: str = "",
 ):
+    """Explorer totals, or level view of themes when ``view=levels``."""
+    if view in {"levels", "themes"}:
+        return _level_overview(request, user, limit=limit, collection=collection)
     return GraphService(db, user).overview()
 
 
@@ -121,11 +129,16 @@ def document_relations(
 
 @router.get("/edges/{edge_id}")
 def get_edge(
-    edge_id: uuid.UUID,
+    edge_id: str,
+    request: Request,
     user: Annotated[AuthUser, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
 ):
-    out = GraphService(db, user).get_edge(edge_id)
+    try:
+        uid = uuid.UUID(edge_id)
+    except ValueError:
+        return _level_edge(request, user, edge_id)
+    out = GraphService(db, user).get_edge(uid)
     if not out:
         _err("GRAPH_EDGE_NOT_FOUND_OR_FORBIDDEN", "Связь недоступна")
     return out
@@ -406,3 +419,170 @@ def connectivity_index_document(
     out = gidx.neighbors_for_document(cached, str(document_id), limit=limit)
     out["status"] = "ok"
     return out
+
+
+# --- Level API: theme → topic → work (read-only except rebuild) ---
+
+
+def _topics_payload(user: AuthUser) -> dict:
+    from apps.api.services import graph_topics as gtopics
+
+    payload = gtopics.load_topics(user.tenant_id)
+    if not payload:
+        _err("GRAPH_TOPICS_MISSING", "Темы ещё не построены", status=404)
+    return payload
+
+
+def _level_json(request: Request, body: dict):
+    from apps.api.services.graph_topics import etag_of
+
+    tag = etag_of(body)
+    if request.headers.get("if-none-match") == tag:
+        return Response(status_code=304, headers={"ETag": tag})
+    return JSONResponse(body, headers={"ETag": tag})
+
+
+def _level_overview(
+    request: Request,
+    user: AuthUser,
+    *,
+    limit: int | None,
+    collection: str,
+):
+    from apps.api.services.graph_topics import view_overview
+
+    payload = _topics_payload(user)
+    return _level_json(
+        request,
+        view_overview(payload, limit=limit, collection=collection or None),
+    )
+
+
+@router.get("/themes/{theme_id}")
+def graph_theme(
+    theme_id: str,
+    request: Request,
+    user: Annotated[AuthUser, Depends(get_current_user)],
+    limit: int | None = Query(default=None),
+):
+    from apps.api.services.graph_topics import view_theme
+
+    body = view_theme(_topics_payload(user), theme_id, limit=limit)
+    if not body:
+        _err("GRAPH_NODE_NOT_FOUND_OR_FORBIDDEN", "Тематика недоступна")
+    return _level_json(request, body)
+
+
+@router.get("/topics/{topic_id}")
+def graph_topic(
+    topic_id: str,
+    request: Request,
+    user: Annotated[AuthUser, Depends(get_current_user)],
+    limit: int | None = Query(default=None),
+):
+    from apps.api.services.graph_topics import view_topic
+
+    body = view_topic(_topics_payload(user), topic_id, limit=limit)
+    if not body:
+        _err("GRAPH_NODE_NOT_FOUND_OR_FORBIDDEN", "Тема недоступна")
+    return _level_json(request, body)
+
+
+@router.get("/local/{node_id}")
+def graph_local(
+    node_id: str,
+    request: Request,
+    user: Annotated[AuthUser, Depends(get_current_user)],
+    depth: int = Query(default=1, ge=1, le=3),
+    types: str = "",
+    limit: int | None = Query(default=None),
+):
+    from apps.api.services.graph_topics import view_local
+
+    wanted = [part.strip() for part in types.split(",") if part.strip()]
+    body = view_local(
+        _topics_payload(user),
+        node_id,
+        depth=depth,
+        types=wanted or None,
+        limit=limit,
+    )
+    if not body:
+        _err("GRAPH_NODE_NOT_FOUND_OR_FORBIDDEN", "Узел недоступен")
+    return _level_json(request, body)
+
+
+@router.get("/search")
+def graph_search(
+    request: Request,
+    user: Annotated[AuthUser, Depends(get_current_user)],
+    q: str = "",
+    limit: int | None = Query(default=None),
+):
+    from apps.api.services.graph_topics import view_search
+
+    return _level_json(request, view_search(_topics_payload(user), q, limit=limit))
+
+
+@router.get("/nodes/{node_id}")
+def graph_node_card(
+    node_id: str,
+    request: Request,
+    user: Annotated[AuthUser, Depends(get_current_user)],
+    limit: int | None = Query(default=None),
+):
+    from apps.api.services.graph_topics import view_node
+
+    body = view_node(_topics_payload(user), node_id, limit=limit)
+    if not body:
+        _err("GRAPH_NODE_NOT_FOUND_OR_FORBIDDEN", "Узел недоступен")
+    return _level_json(request, body)
+
+
+def _level_edge(request: Request, user: AuthUser, edge_id: str):
+    from apps.api.services.graph_topics import view_edge
+
+    body = view_edge(_topics_payload(user), edge_id)
+    if not body:
+        _err("GRAPH_EDGE_NOT_FOUND_OR_FORBIDDEN", "Связь недоступна")
+    return _level_json(request, body)
+
+
+@router.post("/rebuild")
+def rebuild_graph_scope(
+    user: Annotated[AuthUser, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+    scope: Literal["index", "topics", "all"] = Query(default="all"),
+    sync: bool = Query(default=False),
+):
+    """Rebuild connectivity index, topics, or both. Topics follow an index rebuild."""
+    from apps.api.services import graph_index as gidx
+    from apps.api.services import graph_topics as gtopics
+
+    if scope in {"index", "all"} and not sync:
+        started = gidx.schedule_rebuild(user.tenant_id, force=True, mode="full")
+        return {**started, "scope": scope}
+    if scope == "topics" and not sync:
+        import threading
+
+        def _worker() -> None:
+            index = gtopics.read_published_index(user.tenant_id, None)
+            if index:
+                gtopics.build_after_index(user.tenant_id, index, force=True, lock=True)
+
+        threading.Thread(target=_worker, daemon=True, name="graph-topics").start()
+        return {"status": "started", "scope": "topics"}
+
+    if scope in {"index", "all"}:
+        payload = gidx.build_index_for_tenant(db, user.tenant_id, force=True, mode="full")
+        return {
+            "status": "ok",
+            "scope": scope,
+            "fingerprint": payload.get("fingerprint"),
+            "topics": (payload.get("stats") or {}).get("topics_summary"),
+        }
+    index = gtopics.read_published_index(user.tenant_id, db)
+    if not index:
+        _err("GRAPH_INDEX_MISSING", "Индекс связности ещё не построен", status=404)
+    built = gtopics.build_after_index(user.tenant_id, index, force=True, lock=True, use_artifacts=False)
+    return {"status": "ok", "scope": "topics", "topics": gtopics.summary_of(built)}
