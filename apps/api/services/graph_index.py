@@ -47,7 +47,7 @@ from apps.api.services.text_entities import (
 
 log = structlog.get_logger()
 
-INDEX_VERSION = 9
+INDEX_VERSION = 10
 
 # Filename grammar tokens (source-site / language folder markers), not corpus content.
 SOURCE_TOKENS = frozenset({"ch", "eb"})
@@ -194,9 +194,11 @@ class DocMeta:
     work_key: str = ""
     chunk_count: int = 0
     created_at: str | None = None
-    author_source: str | None = None  # filename | ingest_header | text_header | work_merge
+    author_source: str | None = None  # filename | ingest_header | text_header | work_merge | override
     canonical: bool = True
     duplicate_of: str | None = None
+    contained_in: str | None = None
+    relation: str = "canonical"  # canonical | duplicate | contained_in
 
 
 @dataclass
@@ -1573,7 +1575,7 @@ def assemble_index(
         "co_cited_eval",
         "mentions_author",
     }
-    structural_types = {"wrote", "in_theme", "part_of", "work_meta"}
+    structural_types = {"wrote", "in_theme", "part_of", "work_meta", "contains"}
     content_linked: set[str] = set()
     structural_linked: set[str] = set()
     for e in edges:
@@ -1733,6 +1735,8 @@ def assemble_index(
                 "created_at": d.created_at,
                 "canonical": d.canonical,
                 "duplicate_of": d.duplicate_of,
+                "contained_in": d.contained_in,
+                "relation": d.relation,
             }
             for d in docs
         ],
@@ -2160,19 +2164,21 @@ def build_index_for_tenant(
             chunk_total += 1
         meta.chunk_count = len(art.get("clean_chunks") or [])
 
-    # A6: near-duplicate editions within work_key (stdlib shingles)
+    # E1: duplicates + contained_in (minhash/LSH); DF only on canonical
     texts_by_id = {
         did: "\n".join(ch.get("text") or "" for ch in (art.get("clean_chunks") or []))
         for did, art in artifacts.items()
     }
-    dup_map = gdup.mark_canonical_duplicates(docs, texts_by_id)
+    dup_map = gdup.detect_relations(docs, texts_by_id)
     canon_ids = gdup.canonical_doc_ids(dup_map)
     for meta in docs:
         info = dup_map.get(meta.document_id) or {}
         meta.canonical = bool(info.get("canonical", True))
         meta.duplicate_of = info.get("duplicate_of")
+        meta.contained_in = info.get("contained_in")
+        meta.relation = str(info.get("relation") or "canonical")
 
-    # Rebuild global stats from canonical docs only
+    # Rebuild global stats from canonical docs only (no duplicates / contained)
     case_stats = defaultdict(lambda: {"upper": 0, "lower": 0})
     pos_stats = defaultdict(lambda: {"sent_start": 0, "mid": 0})
     for meta in docs:
@@ -2186,7 +2192,7 @@ def build_index_for_tenant(
             pos_stats[k]["sent_start"] += int(v.get("sent_start") or 0)
             pos_stats[k]["mid"] += int(v.get("mid") or 0)
 
-    # Textual layers use canonical docs only (duplicates fold at work level)
+    # Textual layers use canonical docs only; contained inherit at work level later
     docs_canon = [d for d in docs if d.document_id in canon_ids]
     chunk_rows_canon = [r for r in chunk_rows if r[0] in canon_ids]
     doc_entities_canon = {k: v for k, v in doc_entities.items() if k in canon_ids}
@@ -2196,6 +2202,7 @@ def build_index_for_tenant(
     edges: list[Edge] = []
     t_l = time.perf_counter()
     edges.extend(layer_a_edges(docs))
+    edges.extend(gdup.contains_edges_from_map(dup_map, edge_cls=Edge))
     layer_ms["layer_a"] = int((time.perf_counter() - t_l) * 1000)
 
     t_l = time.perf_counter()
@@ -2203,7 +2210,17 @@ def build_index_for_tenant(
     layer_ms["mentions_author"] = int((time.perf_counter() - t_l) * 1000)
 
     t_l = time.perf_counter()
-    edges.extend(layer_b_refers_to(docs=docs_canon, chunk_iter=chunk_rows_canon, params=params))
+    # Title catalog = all docs (nested works visible); sources = non-contained only.
+    # Container→nested refers_to rewritten to structural contains.
+    source_ids = {
+        d.document_id
+        for d in docs
+        if not (dup_map.get(d.document_id) or {}).get("contained_in")
+        and not (dup_map.get(d.document_id) or {}).get("duplicate_of")
+    }
+    chunk_rows_refers = [r for r in chunk_rows if r[0] in source_ids]
+    refers = layer_b_refers_to(docs=docs, chunk_iter=chunk_rows_refers, params=params)
+    edges.extend(gdup.rewrite_refers_to_contains(refers, dup_map, edge_cls=Edge))
     layer_ms["refers_to"] = int((time.perf_counter() - t_l) * 1000)
 
     t_l = time.perf_counter()
@@ -2257,15 +2274,7 @@ def build_index_for_tenant(
         built_ms=built_ms,
         extra_stats={
             "lex_debug": lex_debug,
-            "duplicates": {
-                "canonical": sum(1 for d in docs if d.canonical),
-                "duplicate": sum(1 for d in docs if not d.canonical),
-                "pairs": [
-                    {"doc": d.document_id, "duplicate_of": d.duplicate_of, "sim": (dup_map.get(d.document_id) or {}).get("sim")}
-                    for d in docs
-                    if not d.canonical
-                ][:40],
-            },
+            "duplicates": gdup.relation_stats(dup_map),
             "documents_without_author_preview": [
                 {
                     "document_id": d.document_id,

@@ -261,16 +261,25 @@ def test_topup_second_edition_and_volume_updates_work_canonical_author():
     assert vol2.author_source == "work_merge"
     assert vol1.volume_no == 1 and vol2.volume_no == 2
 
-    body = ("Князь Андрей смотрел на Кутузова. " * 40)
-    almost = body[:-20] + " небольшая правка издания."
-    texts = {"v1": body, "v2": "Совершенно другой текст тома два. " * 30, "ed": almost}
-    m = gd.mark_canonical_duplicates(docs, texts, threshold=0.80)
+    para = (
+        "Князь Андрей смотрел на Кутузова и думал о сражении при Аустерлице. "
+        "Пьер Безухов спорил о масонстве в салоне Анны Павловны. "
+        "Наташа Ростова танцевала на первом балу. "
+        "Николай уходил в гусары вопреки воле отца. "
+    )
+    body = para * 25
+    almost = body + " Издательская пометка в конце тома один."
+    texts = {"v1": body, "v2": "Совершенно другой текст тома два про партизан и пожар Москвы. " * 40, "ed": almost}
+    m = gd.detect_relations(docs, texts, dup_threshold=0.80)
     # edition near-dup of vol1 → one canonical among {v1, ed}; vol2 separate canonical
     assert m["v2"]["canonical"] is True
-    dups = [k for k, v in m.items() if not v["canonical"]]
-    assert len(dups) == 1
-    assert dups[0] in {"v1", "ed"}
-    assert m[dups[0]]["duplicate_of"] in {"v1", "ed"} - {dups[0]}
+    dups = [k for k, v in m.items() if v.get("relation") == "duplicate"]
+    # near-equal editions → duplicate; if length gap large, contained_in is also acceptable
+    linked = [k for k, v in m.items() if not v.get("canonical")]
+    assert len(linked) == 1
+    assert linked[0] in {"v1", "ed"}
+    info = m[linked[0]]
+    assert info.get("duplicate_of") in {"v1", "ed"} - {linked[0]} or info.get("contained_in") in {"v1", "ed"} - {linked[0]}
 
     for d in docs:
         info = m[d.document_id]

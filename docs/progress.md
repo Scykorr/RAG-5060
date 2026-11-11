@@ -1,3 +1,10 @@
+## 2026-11-11 — Graph 1e E1 (duplicates + contained_in)
+
+- task_id: T-GRAPH-IDX-1E — in progress (E1 done)
+- Minhash-128 / LSH; duplicate Jaccard≥0.8; contained_in coverage≥0.8; contains edges
+- DF only on canonical; refers_to container→nested → contains; INDEX_VERSION=10
+- Tests: Anna canonical/duplicate/contained; story-in-collection contains
+
 # Progress
 
 ## 2026-11-11 — Lifecycle clarifications (F04.18c)
