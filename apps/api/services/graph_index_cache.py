@@ -329,6 +329,15 @@ def invalidate_tenant_graph(tenant_id: UUID | str) -> dict[str, int]:
                 removed_docs += 1
             except OSError:
                 pass
+    topics_removed = 0
+    topics_file = graph_dir() / "topics" / f"{tid}.json"
+    for extra in (topics_file, topics_file.with_suffix(".json.tmp")):
+        if extra.exists():
+            try:
+                extra.unlink()
+                topics_removed += 1
+            except OSError:
+                pass
     for helper in (build_status_path(tid), current_pointer_path(tid), lock_path(tid)):
         if helper.exists():
             try:
@@ -344,7 +353,11 @@ def invalidate_tenant_graph(tenant_id: UUID | str) -> dict[str, int]:
             "stale": False,
         },
     )
-    return {"indexes_removed": removed_idx, "doc_artifacts_removed": removed_docs}
+    return {
+        "indexes_removed": removed_idx,
+        "doc_artifacts_removed": removed_docs,
+        "topics_removed": topics_removed,
+    }
 
 
 def index_filename(tenant_id: UUID | str, fingerprint: str, index_version: int, p_hash: str) -> str:

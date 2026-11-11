@@ -250,6 +250,11 @@ for _ru, _key in qi.AUTHOR_ALIASES.items():
 
 
 def theme_from_filename(name: str) -> str:
+    """Filename prefix used as a source collection (``classic_`` / «Прочее»).
+
+    Kept under the legacy key ``theme`` / edge type ``in_theme``. Topics code
+    reads it as ``collection`` and treats ``in_collection`` as the same link.
+    """
     base = Path(name or "").name
     m = re.match(r"^([A-Za-z][A-Za-z0-9]*)_", base)
     if not m:
@@ -3118,7 +3123,7 @@ def build_index_for_tenant(
                 built_ms=prev["built_ms"],
                 path="pointer",
             )
-            return prev
+            return _with_topics(tenant_id, prev)
 
     if not force and not ptr.get("stale"):
         cached = read_index(path)
@@ -3156,7 +3161,7 @@ def build_index_for_tenant(
                 fingerprint=fp,
                 built_ms=cached["built_ms"],
             )
-            return cached
+            return _with_topics(tenant_id, cached)
 
     rows = _active_documents(db, tenant_id)
     if mode in ("full", "incremental"):
@@ -3176,16 +3181,19 @@ def build_index_for_tenant(
             mode=build_mode,
             params_hash_value=ph,
         )
-        return _publish_index(
-            tenant_id=tenant_id,
-            path=path,
-            payload=payload,
-            fingerprint=fp,
-            params_hash_value=ph,
-            build_mode=build_mode,
-            lifecycle={"added": 0, "changed": 0, "removed": 0, "cached": 0},
-            layer_ms={},
-            chunk_total=0,
+        return _with_topics(
+            tenant_id,
+            _publish_index(
+                tenant_id=tenant_id,
+                path=path,
+                payload=payload,
+                fingerprint=fp,
+                params_hash_value=ph,
+                build_mode=build_mode,
+                lifecycle={"added": 0, "changed": 0, "removed": 0, "cached": 0},
+                layer_ms={},
+                chunk_total=0,
+            ),
         )
 
     docs: list[DocMeta] = []
@@ -3668,16 +3676,19 @@ def build_index_for_tenant(
         did = str(drow.get("document_id") or "")
         art = artifacts.get(did) or {}
         drow["content_hash"] = art.get("content_hash")
-    return _publish_index(
-        tenant_id=tenant_id,
-        path=path,
-        payload=payload,
-        fingerprint=fp,
-        params_hash_value=ph,
-        build_mode=build_mode,
-        lifecycle=lifecycle,
-        layer_ms=layer_ms,
-        chunk_total=chunk_total,
+    return _with_topics(
+        tenant_id,
+        _publish_index(
+            tenant_id=tenant_id,
+            path=path,
+            payload=payload,
+            fingerprint=fp,
+            params_hash_value=ph,
+            build_mode=build_mode,
+            lifecycle=lifecycle,
+            layer_ms=layer_ms,
+            chunk_total=chunk_total,
+        ),
     )
 
 
@@ -3740,6 +3751,22 @@ def _publish_index(
         purged_old=removed,
         lifecycle=lifecycle,
     )
+    return payload
+
+
+def _with_topics(tenant_id: UUID | str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Cluster themes/topics after the connectivity index is published.
+
+    A topics failure must not discard a good index.
+    """
+    try:
+        from apps.api.services.graph_topics import build_after_index, summary_of
+
+        built = build_after_index(tenant_id, payload)
+        payload.setdefault("stats", {})["topics_summary"] = summary_of(built)
+    except Exception:
+        log.exception("graph_topics_failed", tenant_id=str(tenant_id))
+        payload.setdefault("stats", {})["topics_error"] = "topics_failed"
     return payload
 
 

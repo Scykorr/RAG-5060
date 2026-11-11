@@ -1,0 +1,29 @@
+{
+  "_note": "Offline topic/theme clustering parameters. No corpus-specific titles or authors.",
+  "edge_type_weights": {
+    "work_lex_similar": 0.45,
+    "work_refers_to": 1.9,
+    "work_shared_entity": 1.8,
+    "contains": 0.3
+  },
+  "same_author_factor": 0.6,
+  "weak_factor": 0.5,
+  "min_edge_weight": 0.02,
+  "topic_resolution": 2.6,
+  "theme_resolution": 1.0,
+  "min_topic_size": 3,
+  "recluster_threshold": 0.2,
+  "assign_confidence_min": 0.34,
+  "jaccard_match": 0.5,
+  "seed": 42,
+  "max_passes": 16,
+  "max_levels": 6,
+  "llm": false,
+  "llm_model": "qwen3:8b",
+  "node_limit_default": 1500,
+  "node_limit_max": 3000,
+  "label_terms": 3,
+  "characteristic_terms": 10,
+  "central_works": 5,
+  "topics_schema": 1
+}

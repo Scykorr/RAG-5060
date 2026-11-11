@@ -1,0 +1,7 @@
+{
+  "_note": "Manual labels and pin/merge/split. Applied last; survives rebuild by topic_id/theme_id. Empty by default — nothing corpus-specific.",
+  "topics": {},
+  "themes": {},
+  "merges": [],
+  "splits": []
+}
