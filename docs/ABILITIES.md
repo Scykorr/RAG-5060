@@ -48,7 +48,8 @@
 | A16 | Offline runtime (без cloud) | yes | Compose up; чат/Ollama внутри сети | Нет внешних URL в Network; `OLLAMA_NO_CLOUD=1` | S46, S47 |
 | A17 | Graph UI: анимация layout / hover / pulse | yes | Вкладка графа; hover узла | Визуально + `graph.js` offline vendor | S50 |
 | A18 | Graph Obsidian-like: chain BFS, orphans, degree size | yes | Клик узла → local; hover depth≥2 dim | `/graph.js` содержит `highlightChain`; hide-orphans | S53 |
-| A19 | Connectivity index: full replace + incremental top-up offline | yes | reset-rag → rebuild empty; import pack → rebuild; add 2 docs → incremental; delete doc → edges gone; incr≈full | `pytest tests/unit/test_graph_index_lifecycle.py` (32 graph unit suite green) | S54 |
+| A19 | Connectivity index: full replace + incremental top-up offline | yes | reset-rag → rebuild empty; import pack → rebuild; add 2 docs → incremental; delete doc → edges gone; incr≈full | `pytest tests/unit/test_graph_index_lifecycle.py`; warm rebuild `cached=N` в stats | S54 |
+| A20 | Connectivity quality 1d (strict refers/lex/ents/authors/dupes) | yes | Rebuild index → смотреть top refers (без строчных обломков), lex regression, author zones, text_header, isolated_content | `pytest tests/unit/test_graph_{refers,lex_ents,authors,duplicates,index,index_lifecycle,text_clean}.py`; report `artifacts/20261111-050958-graph-index/` (refers≈90%, INDEX_VERSION=9) | S54, S55 |
 
 ## Контекст для смены документов (replay корпуса)
 

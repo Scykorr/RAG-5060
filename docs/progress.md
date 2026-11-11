@@ -1,5 +1,10 @@
 # Progress
 
+## 2026-11-11 — Knowledge sync after 1d (S48/S51)
+
+- S55 + A20; ERRORS E-20261111-{refers-partial-lower,lex-proper-names,report-dataroot}
+- ROADMAP F04.18a/b + F15.6a checked; mirrors `Обучение/docs/*` synced
+
 ## 2026-11-11 — Graph connectivity 1d complete (report)
 
 - task_id: T-GRAPH-IDX-1D-A — verified (unit + corpus report)

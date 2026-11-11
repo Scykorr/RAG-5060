@@ -76,7 +76,8 @@
 | S51 | Знания: skill/ability/error только с apply/replay | Любая новая запись в трёх файлах | Заполнить контракт файла; иначе статус draft | этот файл |
 | S52 | UI через Windows-прокси :18080 → docker :28080 | F5 / ERR_CONNECTION_REFUSED | Держать `RAG5060.exe start` (не закрывать окно); docker publish 28080 | launcher/proxy.go |
 | S53 | Graph Obsidian-like на Cytoscape (не D3) | Вкладка графа / «сетка» узлов | Hide orphans; size∝degree; BFS depth; click→local; Анализ при 0 рёбер | graph.js |
-| S54 | Connectivity index offline + lifecycle | Сборка графа / reset / дозагрузка корпуса | Только локальный корпус; кэш tenant+fp+version+params_hash; per-doc artifacts; full|incremental; invalidate на reset-rag; пустой корпус → пустой индекс; фон + single-flight | docs/graph/CONNECTIVITY_LIFECYCLE.md; graph_index.py |
+| S54 | Connectivity index offline + lifecycle | Сборка графа / reset / дозагрузка корпуса | Только локальный корпус; кэш tenant+fp+version+params_hash; per-doc artifacts; full|incremental; invalidate на reset-rag; пустой корпус → пустой индекс; фон + single-flight; report: `scripts/_run-1d-report.sh` (volume `rag5060_ragdata`, `DATA_ROOT=/var/lib/rag`) | docs/graph/CONNECTIVITY_LIFECYCLE.md; graph_index.py; A19 |
+| S55 | Connectivity quality: строгие refers/lex/ents/authors | Правки `graph_index` / ложные рёбра / отчёт | 1) refers: полное название, заглавная/кавычки, genre 0–2 токена, без стем-фамилий (`graph_refers`); 2) lex: имена по mid-cap≥0.7 до стемма + editorial/speech из `graph_lexicon.json`; 3) entities: лемма+strong≥1; 4) authors: `graph_authors` + `author_name_table`; 5) дубли shinле/canonical; 6) язык только в конфиге | `pytest tests/unit/test_graph_*.py`; report `artifacts/20261111-050958-graph-index/` |
 
 ---
 
@@ -86,10 +87,10 @@
 | --- | --- |
 | Retrieval / classic QA | S01, S03, S05, S22, S24, S25 |
 | Cloze / RuCoS | S04, S09–S19, S26 |
-| Корпус / prefix / reset | S06, S11, S21, S27, S28, S30–S32 |
+| Корпус / prefix / reset | S06, S11, S21, S27, S28, S30–S32, S54 |
 | Intent / catalog | S33, S34 |
 | Login / WSL / UI port | S37–S45, S47, S49, S52 |
-| Graph Explorer | S50, S53 |
-| Offline / deps | S29, S46 |
-| Graph | S35, S36, S50 |
+| Graph Explorer | S50, S53, S54, S55 |
+| Offline / deps | S29, S46, S54 |
+| Graph | S35, S36, S50, S54, S55 |
 | Ритуал агента | S23, S48, S51 |
