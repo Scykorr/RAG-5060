@@ -166,10 +166,10 @@ def load_params(path: str | Path | None = None) -> dict[str, Any]:
         "topic_raw_top_k",
         "topic_vector_top_k",
         "proper_noun_min_n",
-        "vector_cache_rev",
         "min_tokens_for_topic",
     ):
         cfg[int_key] = int(cfg[int_key])
+    cfg["vector_cache_rev"] = str(cfg.get("vector_cache_rev") or "2d-2")
     cfg["llm"] = bool(cfg["llm"])
     cfg["llm_model"] = str(cfg["llm_model"])
     return cfg
