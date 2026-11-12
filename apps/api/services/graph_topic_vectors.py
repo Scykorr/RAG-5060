@@ -187,6 +187,24 @@ def detect_style_stems(
     return style
 
 
+_PATRONYMIC_ENDINGS = (
+    "ович",
+    "евич",
+    "овна",
+    "евна",
+    "ична",
+    "инична",
+    "иничн",
+    "ьевн",
+    "ьевич",
+)
+
+
+def _is_patronymic_stem(stem: str) -> bool:
+    s = (stem or "").casefold().replace("ё", "е")
+    return any(s.endswith(end) for end in _PATRONYMIC_ENDINGS) and len(s) >= 6
+
+
 def detect_proper_nouns(
     case_stats: dict[str, dict[str, int]] | None,
     pos_stats: dict[str, dict[str, int]] | None,
@@ -194,12 +212,17 @@ def detect_proper_nouns(
     min_n: int = 3,
     min_cap_ratio: float = 0.8,
     entity_stems: set[str] | None = None,
+    work_case_pos: dict[str, dict[str, dict[str, int]]] | None = None,
 ) -> tuple[set[str], list[dict[str, Any]]]:
     """Stems with high mid-sentence capitalization → proper nouns (weight 0).
 
     ``cap_ratio`` = mid-capital / (mid + sent_start + lower), aggregated by stem.
-    Entity stems from shared_entity are always included.
+    Play speaker cues should already be counted as ``mid`` (not sent_start).
+    Patronymic endings and cross-work mid-cap (≥2 works, ≥80% outside sent start)
+    are always proper. Entity stems from shared_entity are included.
     """
+    from apps.api.services.text_entities import stem_ru
+
     case_stats = case_stats or {}
     pos_stats = pos_stats or {}
     by_stem: dict[str, dict[str, int]] = defaultdict(
@@ -210,8 +233,6 @@ def detect_proper_nouns(
         if len(key) < 3:
             continue
         if any("а" <= ch <= "я" for ch in key):
-            from apps.api.services.text_entities import stem_ru
-
             stem = stem_ru(key)
         else:
             stem = key
@@ -222,6 +243,22 @@ def detect_proper_nouns(
         slot["lower"] += int(st.get("lower") or 0)
     proper: set[str] = set()
     rows: list[dict[str, Any]] = []
+
+    def _mark(stem: str, *, ratio: float | None, n: int | None, mid: int | None, source: str) -> None:
+        if stem in proper and source == "entity":
+            return
+        if stem not in proper:
+            proper.add(stem)
+            rows.append(
+                {
+                    "stem": stem,
+                    "cap_ratio": round(ratio, 4) if ratio is not None else None,
+                    "n": n,
+                    "mid": mid,
+                    "source": source,
+                }
+            )
+
     for stem, bag in by_stem.items():
         mid = int(bag["mid"])
         start = int(bag["sent_start"])
@@ -229,50 +266,57 @@ def detect_proper_nouns(
         total = mid + start + low
         if total <= 0:
             continue
+        if _is_patronymic_stem(stem):
+            _mark(stem, ratio=1.0, n=total, mid=mid, source="patronymic")
+            continue
         # Spec: mid-sentence capitals / all mentions.
         ratio = mid / total
         # Dialogue-heavy person names are often capitalized at line start
         # (sent_start≫mid) but almost never lowercase — still proper nouns.
         upperish = (mid + start) / total
-        is_proper = False
-        source = "cap_ratio"
         if total >= min_n and ratio >= min_cap_ratio:
-            is_proper = True
+            _mark(stem, ratio=ratio, n=total, mid=mid, source="cap_ratio")
         elif (
             total >= min_n
             and mid >= min_n
             and low <= max(1, int(0.05 * total))
             and upperish >= 0.9
         ):
-            is_proper = True
-            source = "cap_dialogue"
-            ratio = upperish
-        if is_proper:
-            proper.add(stem)
-            rows.append(
-                {
-                    "stem": stem,
-                    "cap_ratio": round(ratio, 4),
-                    "n": total,
-                    "mid": mid,
-                    "source": source,
-                }
-            )
+            _mark(stem, ratio=upperish, n=total, mid=mid, source="cap_dialogue")
+
+    # Cross-work: mid/(mid+lower) ≥ 0.8 in ≥2 works (sent_start excluded).
+    if work_case_pos:
+        stem_works: dict[str, set[str]] = defaultdict(set)
+        for wk, forms in work_case_pos.items():
+            local: dict[str, dict[str, int]] = defaultdict(lambda: {"mid": 0, "lower": 0})
+            for form, bag in (forms or {}).items():
+                key = str(form or "").casefold().replace("ё", "е")
+                if len(key) < 3:
+                    continue
+                stem = stem_ru(key) if any("а" <= ch <= "я" for ch in key) else key
+                local[stem]["mid"] += int(bag.get("mid") or 0)
+                local[stem]["lower"] += int(bag.get("lower") or 0)
+            for stem, bag in local.items():
+                mid = int(bag["mid"])
+                low = int(bag["lower"])
+                den = mid + low
+                if den <= 0:
+                    continue
+                if mid / den >= 0.8:
+                    stem_works[stem].add(str(wk))
+        for stem, wks in stem_works.items():
+            if len(wks) >= 2 and stem not in proper:
+                _mark(stem, ratio=0.8, n=len(wks), mid=None, source="cross_work_cap")
+
     for stem in entity_stems or ():
         s = str(stem or "").casefold().replace("ё", "е")
         if len(s) < 4:
             continue
         if any("а" <= ch <= "я" for ch in s):
-            from apps.api.services.text_entities import stem_ru
-
             s = stem_ru(s)
         if len(s) < 4:
             continue
-        if s not in proper:
-            proper.add(s)
-            rows.append(
-                {"stem": s, "cap_ratio": None, "n": None, "mid": None, "source": "entity"}
-            )
+        _mark(s, ratio=None, n=None, mid=None, source="entity")
     rows.sort(key=lambda r: (-(float(r["cap_ratio"]) if r["cap_ratio"] is not None else 1.1), str(r["stem"])))
     return proper, rows
 
@@ -322,6 +366,7 @@ def build_raw_vectors(
     case_stats: dict[str, dict[str, int]] | None = None,
     pos_stats: dict[str, dict[str, int]] | None = None,
     entity_stems: set[str] | None = None,
+    work_case_pos: dict[str, dict[str, dict[str, int]]] | None = None,
 ) -> tuple[dict[str, dict[str, float]], dict[str, Any]]:
     """TF-log vectors with thematic filters. Returns vectors + debug stats."""
     min_ent = float(params.get("min_author_entropy") or 0.5)
@@ -353,6 +398,7 @@ def build_raw_vectors(
         min_n=min_cap_n,
         min_cap_ratio=min_cap,
         entity_stems=entity_stems,
+        work_case_pos=work_case_pos,
     )
     low_entropy: list[tuple[float, str, int]] = []
     for stem, info in entropy.items():
@@ -620,6 +666,7 @@ def build_topic_vectors(
     *,
     case_stats: dict[str, dict[str, int]] | None = None,
     pos_stats: dict[str, dict[str, int]] | None = None,
+    work_case_pos: dict[str, dict[str, dict[str, int]]] | None = None,
     entity_stems: set[str] | None = None,
 ) -> dict[str, Any]:
     """Full pipeline: filter → debias → normalize. Debug included."""
@@ -629,6 +676,7 @@ def build_topic_vectors(
         params=params,
         case_stats=case_stats,
         pos_stats=pos_stats,
+        work_case_pos=work_case_pos,
         entity_stems=entity_stems,
     )
     alpha = float(params.get("author_debias_alpha") or 0.6)
