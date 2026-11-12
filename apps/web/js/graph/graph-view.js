@@ -30,6 +30,17 @@
     return null;
   }
 
+  /** Resolve renderer programs from the sigma 3 UMD global. */
+  function sigmaPrograms(S) {
+    const pick = (name) => (S && S[name]) || (S && S.default && S.default[name]) || null;
+    return {
+      EdgeArrowProgram: pick("EdgeArrowProgram"),
+      EdgeRectangleProgram: pick("EdgeRectangleProgram") || pick("EdgeLineProgram"),
+      NodeCircleProgram: pick("NodeCircleProgram"),
+      createNodeBorderProgram: pick("createNodeBorderProgram"),
+    };
+  }
+
   function create(container, options) {
     const opts = options || {};
     if (!container) throw new Error("graph-view: container required");
@@ -76,16 +87,29 @@
       destroyed: false,
     };
 
-    // Default styles via node/edge reducer
+    const programs = sigmaPrograms(S);
+    state._sigmaPrograms = programs;
+    const edgeProgramClasses = {};
+    if (programs.EdgeRectangleProgram) edgeProgramClasses.line = programs.EdgeRectangleProgram;
+    if (programs.EdgeArrowProgram) edgeProgramClasses.arrow = programs.EdgeArrowProgram;
+    const nodeProgramClasses = {};
+    if (programs.NodeCircleProgram) nodeProgramClasses.circle = programs.NodeCircleProgram;
+
+    // Sigma 3 settings (UMD). Reducers / custom hover label draw land in later 3b steps.
     state.sigma = new S(state.graph, container, {
       renderLabels: true,
       labelFont: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
       labelSize: 12,
       labelWeight: "400",
       labelColor: { color: opts.labelColor || "#d7e0f2" },
+      labelGridCellSize: 100,
+      labelDensity: 1,
       defaultEdgeType: "line",
+      defaultNodeType: "circle",
       defaultNodeColor: state.display.nodeColor,
       defaultEdgeColor: state.display.edgeColor,
+      edgeProgramClasses: Object.keys(edgeProgramClasses).length ? edgeProgramClasses : undefined,
+      nodeProgramClasses: Object.keys(nodeProgramClasses).length ? nodeProgramClasses : undefined,
       zIndex: true,
       allowInvalidContainer: true,
     });

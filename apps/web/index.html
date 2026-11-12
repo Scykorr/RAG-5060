@@ -332,7 +332,11 @@
     <script src="/app.js"></script>
     <script src="/vendor/graphology/graphology.umd.min.js" defer></script>
     <script src="/vendor/sigma/sigma.min.js" defer></script>
-    <script src="/vendor/d3/d3.min.js" defer></script>
+    <!-- Slim d3-force stack (no full d3.min.js) -->
+    <script src="/vendor/d3/d3-dispatch.min.js" defer></script>
+    <script src="/vendor/d3/d3-timer.min.js" defer></script>
+    <script src="/vendor/d3/d3-quadtree.min.js" defer></script>
+    <script src="/vendor/d3/d3-force.min.js" defer></script>
     <script src="/js/graph/i18n.js" defer></script>
     <script src="/js/graph/graph-settings.js" defer></script>
     <script src="/js/graph/graph-view.js" defer></script>
