@@ -327,3 +327,25 @@
 - prevent: S60; любые данные в GraphView только через адаптер
 - links: `apps/web/js/graph/graph-view.js`
 - status: fixed
+
+## 2026-11-12 — max_inter сводки ≠ матрица (2c)
+- id: E-20261112-topics-inter-metric
+- symptom: acceptance max_inter=0.0096 при клетках матрицы 0.31 / 0.26
+- reproduce: report `artifacts/20261112-064335-topics/` — summary vs matrix formulas diverge
+- root_cause: сводка считала mean edge/(|A|·|B|), матрица — raw_sum/sqrt(|A|·|B|)
+- fix: одна `theme_affinity_stats` = cut/min(vol_A,vol_B); `theme_link_weights` читает ту же matrix
+- replay: report 2d `inter_metric_consistent` + max_inter≤0.2 (`artifacts/20261112-075149-topics/`)
+- prevent: S61; не дублировать формулы affinity
+- links: `graph_topics_quality.theme_affinity_stats`, `graph_topics.theme_link_weights`
+- status: fixed
+
+## 2026-11-12 — латинские двойники в русских токенах
+- id: E-20261112-topics-homoglyph
+- symptom: словарь тем `cказал`, `cнег`, `bзжелт`, `асильевн`
+- reproduce: INDEX_VERSION≤16; topic terms / low-entropy stems
+- root_cause: OCR lookalikes в исходниках; clean_chunk не нормализовал mixed-script
+- fix: `normalize_homoglyphs` при clean_chunk + tokenize; INDEX_VERSION=17; bust `vector_cache_rev`
+- replay: report Homoglyph section tokens_fixed>0, mixed_script=0, en_touched=0
+- prevent: S61; не кэшировать vectors across index_version/rev
+- links: `graph_text_clean.normalize_homoglyphs`, `graph_index.INDEX_VERSION`
+- status: fixed

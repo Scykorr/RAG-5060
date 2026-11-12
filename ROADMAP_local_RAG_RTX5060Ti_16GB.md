@@ -278,6 +278,7 @@ Haystack Apache-2.0 допустим как последующая библио�
 - [x] F04.18f. P2 (slice 2): themes/topics Louvain offline + stable ids/incremental + level API (`view=levels`, `/themes`, `/topics`); INDEX_VERSION stays 16; S57/A22; report `artifacts/20261111-104731-topics/` (lifecycle OK; purity still author-heavy → 2b).
 - [x] F04.18g. P2 (slice 2b): thematic `topic_vectors` (entropy/style/debias) + `topic_knn` + `same_author_factor=0.35` + LLM/term labels + expectations config; S58/A23; report `artifacts/20261112-052018-topics/` (theme purity 0.37, lex_same_author 0.35, expectations 3/3).
 - [x] F04.18h. P2 (slice 2c): proper-noun filter + weak/short → «Без темы» + theme_resolution grid + grounded LLM labels + vec_cache/stage timings; α=0.6 / same_author=0.35 unchanged; S59/A24; report `artifacts/20261112-064335-topics/` PASS.
+- [x] F04.18i. P2 (slice 2d): homoglyph normalize (INDEX_VERSION=17) + unified cut/min(vol) affinity + play/patronymic proper + top-level unthemed + grounded labels without glue; S61/A26; report `artifacts/20261112-075149-topics/` PASS.
 - [ ] F04.19. Запускать Label Studio и массовую авторазметку отдельным профилем/сеансом; измерить дополнительную RAM. Не добавлять их поверх уже выделенных 20 ГБ WSL без пересчёта бюджета. LLM-разметка использует общую очередь GPU и уступает chat.
 
 **Приёмка:** имеется схема и инструкция, проверенная выборка, версионный экспорт/импорт, прослеживаемость исправлений; автоматически предложенные метки отличимы от проверенных. Бесплатные инструменты не заменяют предметные правила и экспертную ответственность.
@@ -407,7 +408,7 @@ Offline автоусиление ответов на корпусе (не fine-t
 - [x] F15.5. Graph visual polish: animated layout/fit, hover highlight, pulse select, ambient canvas (no CDN).
 - [x] F15.6. Obsidian-like UX on Cytoscape (no D3): degree size, prefix colors, hide orphans, BFS chain depth, click→local, sparse-edge CTA.
 - [x] F15.6a. Offline connectivity index (F04.18/a/b): layers + lifecycle + 1d quality; skills S54/S55, abilities A19/A20.
-- [x] F15.6b. Theme/topic levels API (F04.18f/g/h): overview levels + thematic clustering + 2c cleanup; S57/S58/S59, A22/A23/A24; no dedicated UI tab yet.
+- [x] F15.6b. Theme/topic levels API (F04.18f/g/h/i): overview levels + thematic clustering + 2c/2d cleanup; S57/S58/S59/S61, A22/A23/A24/A26; no dedicated UI tab yet.
 - [x] F15.6c. Obsidian Graph UI (Slice 3): sigma+d3-force vendor offline; levels/hash/settings/look; S60/A25; report `artifacts/20261112-graph-s3/`.
 - [ ] F15.7. P1/P2: real embedding ANN после N1; LLM relation detector OFF by default; entity graph.
 

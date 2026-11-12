@@ -1,3 +1,14 @@
+## 2026-11-12 — Slice 2d (homoglyph / inter / unthemed / labels)
+
+- Homoglyph Latin→Cyrillic in `clean_chunk` + tokenize; INDEX_VERSION **17**; en untouched
+- Inter-theme: unified cut/min(vol); grid picks theme_resolution **1.3** (max_inter≈0.20, purity 0.42)
+- Proper: play-speaker mid-cap + patronymic/cross-work; common nouns kept
+- «Без темы»: top-level `kind=unthemed`; not a vote target; low-conf keeps secondary
+- Labels: stem-grounded, reject «A и B», theme≠topic, 3-term fallback without work title
+- α=0.6 / same_author_factor=0.35 / vec cache rev `2d-2` unchanged otherwise
+- Report `artifacts/20261112-075149-topics/` **PASS** (groups 3/3, noop 23ms, wo_llm≈2.2s)
+- Knowledge: **S61**, **A26**, E-topics-inter-metric / homoglyph; ROADMAP **F04.18i**
+
 ## 2026-11-12 — Slice 3 (Obsidian Graph UI)
 
 - Vendor: graphology 0.25.4 + sigma 2.4.0 + d3 7.9 (offline under `apps/web/vendor/`); adapter `js/graph/graph-view.js`

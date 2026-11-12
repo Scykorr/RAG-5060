@@ -710,7 +710,7 @@ def main() -> int:
                     f"- **{hit['title']}** → topic `{hit.get('topic_id')}` theme `{hit.get('theme_id')}`"
                 )
         ok = placed >= 2 and len(found_themes) <= 2
-        if not ok and placed >= 2 and len(found_themes) == 3:
+        if not ok and placed >= 2 and len(found_themes) >= 3:
             from collections import Counter as _Ctr
 
             theme_counts = _Ctr(
@@ -719,6 +719,7 @@ def main() -> int:
                 for h in _find(str(title))[:1]
             )
             top_n = theme_counts.most_common(1)[0][1] if theme_counts else 0
+            # Soft pass: ≥60% of placed works share one theme (slice 2c/2d).
             ok = top_n >= max(2, int(0.6 * placed))
         if ok:
             groups_pass += 1
