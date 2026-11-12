@@ -226,13 +226,18 @@
         bg: opts.bg || "#1e1e1e",
         dimOpacity: 0.15,
       },
-      highlight: { focus: null, neighbors: null },
+      highlight: { focus: null, neighbors: null, selected: null },
       highlightFade: 0,
       _fadeRaf: 0,
+      selection: new Set(),
+      hoverFocus: null,
       pinned: new Set(),
       onClick: opts.onClick || null,
+      onDoubleClick: opts.onDoubleClick || null,
+      onStageClick: opts.onStageClick || null,
       onHover: opts.onHover || null,
       onDragEnd: opts.onDragEnd || null,
+      onSelectionChange: opts.onSelectionChange || null,
       onReady: opts.onReady || null,
       raf: 0,
       destroyed: false,
@@ -353,6 +358,9 @@
         animateHighlight(state, h || {});
         if (state.kind === "fallback") renderFallbackList(state);
       },
+      setSelection: (ids, opts) => setSelection(state, ids, opts),
+      getSelection: () => [...state.selection],
+      clearSelection: () => setSelection(state, [], { silent: false }),
       focusNode: (id) => focusNode(state, id),
       getPositions: () => getPositions(state),
       setPositions: (pos) => setPositions(state, pos),
@@ -387,6 +395,41 @@
     };
   }
 
+  function neighborsOf(state, ids) {
+    const nbrs = new Set();
+    const g = state.graph;
+    if (!g) return nbrs;
+    (ids || []).forEach((id) => {
+      if (!g.hasNode(id)) return;
+      g.forEachNeighbor(id, (nb) => nbrs.add(nb));
+    });
+    return nbrs;
+  }
+
+  function selectionHighlight(state) {
+    if (!state.selection || !state.selection.size) return {};
+    const selected = new Set(state.selection);
+    const neighbors = neighborsOf(state, [...selected]);
+    const focus = [...selected][0];
+    return { focus, selected, neighbors };
+  }
+
+  function refreshPinnedOrIdleHighlight(state) {
+    if (state.hoverFocus) return;
+    animateHighlight(state, selectionHighlight(state));
+  }
+
+  function setSelection(state, ids, opts) {
+    const o = opts || {};
+    const next = new Set();
+    (ids || []).forEach((id) => {
+      if (id != null && String(id)) next.add(String(id));
+    });
+    state.selection = next;
+    if (!state.hoverFocus) animateHighlight(state, selectionHighlight(state));
+    if (!o.silent && state.onSelectionChange) state.onSelectionChange([...state.selection]);
+  }
+
   function applySigmaTheme(state) {
     if (!state.sigma || !state.sigma.setSetting) return;
     const p = readThemePalette(state.display);
@@ -408,7 +451,15 @@
   function animateHighlight(state, h) {
     state.highlight = h || {};
     if (state.kind !== "sigma") return;
-    const target = state.highlight.focus ? 1 : 0;
+    const sel = state.highlight.selected;
+    const target =
+      state.highlight.focus ||
+      (sel && ((sel instanceof Set && sel.size) || (Array.isArray(sel) && sel.length))) ||
+      (state.highlight.neighbors &&
+        ((state.highlight.neighbors instanceof Set && state.highlight.neighbors.size) ||
+          (Array.isArray(state.highlight.neighbors) && state.highlight.neighbors.length)))
+        ? 1
+        : 0;
     if (state._fadeRaf) cancelAnimationFrame(state._fadeRaf);
     const start = state.highlightFade || 0;
     const t0 = performance.now();
@@ -428,32 +479,50 @@
     const hi = state.highlight || {};
     const fade = state.highlightFade || 0;
     const focus = hi.focus;
+    const selected =
+      hi.selected instanceof Set ? hi.selected : new Set(hi.selected || (focus ? [focus] : []));
     const nbrs = hi.neighbors instanceof Set ? hi.neighbors : new Set(hi.neighbors || []);
-    const dimming = !!(focus || nbrs.size) && fade > 0.01;
+    const dimming = !!(selected.size || focus || nbrs.size) && fade > 0.01;
     const p = readThemePalette(state.display);
     const baseColor = data.color || state.display.nodeColor || p.nodeColor;
+    const hasBorder = !!(state.sigma && state.sigma.getSetting && (state.sigma.getSetting("nodeProgramClasses") || {}).bordered);
 
     const isTheme = data.nodeKind === "theme";
     const isLocalCenter = state.display.localCenterId && node === state.display.localCenterId;
+    const isSelected = selected.has(node);
     if (!dimming) {
-      return {
+      const out = {
         ...data,
-        zIndex: isTheme || isLocalCenter ? 1 : data.zIndex || 0,
-        forceLabel: !!(isTheme || isLocalCenter),
-        labelWeight: isTheme || isLocalCenter ? "600" : data.labelWeight || "400",
+        zIndex: isTheme || isLocalCenter || isSelected ? 1 : data.zIndex || 0,
+        forceLabel: !!(isTheme || isLocalCenter || isSelected),
+        labelWeight: isTheme || isLocalCenter || isSelected ? "600" : data.labelWeight || "400",
       };
+      if (isSelected && hasBorder) {
+        out.type = "bordered";
+        out.borderColor = p.accent;
+      }
+      return out;
     }
 
-    const hot = node === focus || nbrs.has(node) || isLocalCenter;
+    const hot = isSelected || node === focus || nbrs.has(node) || isLocalCenter;
     if (hot) {
-      return {
+      const out = {
         ...data,
-        color: isLocalCenter ? p.accent : baseColor,
+        color: isLocalCenter || isSelected ? (isSelected ? baseColor : p.accent) : baseColor,
         forceLabel: true,
-        zIndex: 2,
+        zIndex: isSelected ? 3 : 2,
         highlighted: true,
-        labelWeight: isTheme || isLocalCenter ? "600" : "400",
+        labelWeight: isTheme || isLocalCenter || isSelected ? "600" : "400",
       };
+      if (isSelected && hasBorder) {
+        out.type = "bordered";
+        out.borderColor = p.accent;
+      } else if (isSelected) {
+        // Fallback: slightly larger selected disc when border program unavailable.
+        out.size = Math.max(Number(data.size) || 4, 4) + 1.5;
+        out.color = p.accent;
+      }
+      return out;
     }
 
     // fade=1 → keep ~15% of node color mixed into bg (opaque, not alpha).
@@ -464,6 +533,7 @@
       forceLabel: false,
       zIndex: 0,
       highlighted: false,
+      type: data.nodeKind === "theme" && hasBorder ? data.type : "circle",
     };
   }
 
@@ -472,8 +542,10 @@
     const hi = state.highlight || {};
     const fade = state.highlightFade || 0;
     const focus = hi.focus;
+    const selected =
+      hi.selected instanceof Set ? hi.selected : new Set(hi.selected || (focus ? [focus] : []));
     const nbrs = hi.neighbors instanceof Set ? hi.neighbors : new Set(hi.neighbors || []);
-    const dimming = !!(focus || nbrs.size) && fade > 0.01;
+    const dimming = !!(selected.size || focus || nbrs.size) && fade > 0.01;
     const p = readThemePalette(state.display);
     const extremities = g.extremities(edge);
     const source = extremities[0];
@@ -492,12 +564,12 @@
     }
 
     if (dimming) {
+      const foci = selected.size ? selected : focus ? new Set([focus]) : new Set();
       const hot =
-        source === focus ||
-        target === focus ||
-        (nbrs.has(source) && (target === focus || nbrs.has(target))) ||
-        (nbrs.has(target) && source === focus);
+        (foci.has(source) && (foci.has(target) || nbrs.has(target))) ||
+        (foci.has(target) && (foci.has(source) || nbrs.has(source)));
       if (hot) {
+        // Solid accent, no alpha — avoids WebGL dashed look at thin sizes.
         color = p.accent;
         size = Math.max(1.5, Math.min(2.5, size * 1.6));
         zIndex = 2;
@@ -872,6 +944,12 @@
     cam.animate({ ratio: next }, { duration: 120 });
   }
 
+  function eventShiftKey(e) {
+    const ev = (e && e.event) || e || {};
+    const oe = ev.original || ev.originalEvent || ev.srcEvent || ev;
+    return !!(oe && oe.shiftKey);
+  }
+
   function wireSigmaEvents(state) {
     const s = state.sigma;
     if (!s || !s.on) return;
@@ -880,23 +958,40 @@
     let dragMoved = false;
     let suppressClick = false;
 
-    s.on("clickNode", ({ node }) => {
+    s.on("clickNode", (e) => {
       if (suppressClick) {
         suppressClick = false;
         return;
       }
-      if (state.onClick) state.onClick({ id: node, node: state.nodes.get(node) });
+      const node = e.node;
+      if (state.onClick) {
+        state.onClick({
+          id: node,
+          node: state.nodes.get(node),
+          shiftKey: eventShiftKey(e),
+          event: e,
+        });
+      }
+    });
+    s.on("clickStage", (e) => {
+      if (suppressClick) {
+        suppressClick = false;
+        return;
+      }
+      if (state.onStageClick) state.onStageClick({ event: e });
     });
     s.on("enterNode", ({ node }) => {
       if (!drag) state.container.style.cursor = "grab";
-      const nbrs = new Set();
-      state.graph.forEachNeighbor(node, (nb) => nbrs.add(nb));
-      animateHighlight(state, { focus: node, neighbors: nbrs });
+      state.hoverFocus = node;
+      const nbrs = neighborsOf(state, [node]);
+      // Temporary hover overlay; leave restores pinned selection.
+      animateHighlight(state, { focus: node, selected: new Set([node]), neighbors: nbrs });
       if (state.onHover) state.onHover({ id: node, neighbors: [...nbrs] });
     });
     s.on("leaveNode", () => {
       if (!drag) state.container.style.cursor = "";
-      animateHighlight(state, {});
+      state.hoverFocus = null;
+      refreshPinnedOrIdleHighlight(state);
       if (state.onHover) state.onHover(null);
     });
     const mouseCaptor = s.getMouseCaptor && s.getMouseCaptor();
@@ -907,9 +1002,7 @@
       drag = { id: nodeId, x0: x, y0: y };
       dragMoved = false;
       suppressClick = false;
-      state.pinned.add(nodeId);
       state.container.style.cursor = "grabbing";
-      if (state.sim) state.sim.alphaTarget(0.3).restart();
     };
     const moveDrag = (x, y, ev) => {
       if (!drag) return;
@@ -917,9 +1010,14 @@
       const dx = (x || 0) - (drag.x0 || 0);
       const dy = (y || 0) - (drag.y0 || 0);
       if (Math.hypot(dx, dy) > 3) {
-        dragMoved = true;
-        suppressClick = true;
+        if (!dragMoved) {
+          dragMoved = true;
+          suppressClick = true;
+          state.pinned.add(drag.id);
+          if (state.sim) state.sim.alphaTarget(0.3).restart();
+        }
       }
+      if (!dragMoved) return;
       const pos = state.sigma.viewportToGraph ? state.sigma.viewportToGraph({ x, y }) : null;
       if (!pos || !state.graph.hasNode(drag.id)) return;
       state.graph.setNodeAttribute(drag.id, "x", pos.x);
@@ -938,17 +1036,29 @@
     const endDrag = () => {
       if (!drag) return;
       const id = drag.id;
+      const wasDrag = dragMoved;
       drag = null;
       state.container.style.cursor = "";
       if (state.sim) {
         const n = state.sim.nodes().find((nn) => nn.id === id);
-        if (n) {
-          n.fx = n.x;
-          n.fy = n.y;
+        if (wasDrag) {
+          if (n) {
+            n.fx = n.x;
+            n.fy = n.y;
+          }
+          state.sim.alphaTarget(0);
+          if (state.onDragEnd) state.onDragEnd({ id });
+        } else {
+          // Click without move: do not leave the node layout-pinned.
+          state.pinned.delete(id);
+          if (n) {
+            n.fx = null;
+            n.fy = null;
+          }
         }
-        state.sim.alphaTarget(0);
+      } else if (!wasDrag) {
+        state.pinned.delete(id);
       }
-      if (dragMoved && state.onDragEnd) state.onDragEnd({ id });
     };
 
     s.on("downNode", (e) => {
@@ -969,7 +1079,9 @@
     }
     s.on("upNode", endDrag);
     s.on("upStage", endDrag);
-    s.on("doubleClickNode", ({ node }) => {
+    s.on("doubleClickNode", (e) => {
+      const node = e.node;
+      // Double-click unpins layout fx/fy, then opens local graph via shell.
       state.pinned.delete(node);
       if (state.sim) {
         const n = state.sim.nodes().find((nn) => nn.id === node);
@@ -978,7 +1090,11 @@
           n.fy = null;
         }
       }
-      if (state.onDragEnd) state.onDragEnd({ id: node, unpinned: true });
+      if (state.onDoubleClick) {
+        state.onDoubleClick({ id: node, node: state.nodes.get(node), event: e });
+      } else if (state.onDragEnd) {
+        state.onDragEnd({ id: node, unpinned: true });
+      }
     });
   }
 
@@ -990,9 +1106,7 @@
       const cam = state.sigma.getCamera();
       cam.animate({ x: attrs.x, y: attrs.y, ratio: cam.ratio }, { duration: 280 });
     }
-    const nbrs = new Set();
-    state.graph.forEachNeighbor(id, (nb) => nbrs.add(nb));
-    animateHighlight(state, { focus: id, neighbors: nbrs });
+    setSelection(state, [id]);
   }
 
   function getPositions(state) {

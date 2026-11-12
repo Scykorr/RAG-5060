@@ -1,3 +1,9 @@
+## 2026-11-12 — Graph pinned selection (Obsidian selected note)
+
+- Click (&lt;3px) pins highlight + side panel; leave cursor keeps selection; hover overlays then restores
+- Esc / empty click clears; Shift+click multi; `?sel=` in hash; double-click → local
+- Report screenshot `artifacts/20261112-graph-s3b/screenshots/07-selection-pinned-cursor-away.png`
+
 ## 2026-11-12 — Slice 3b (Obsidian Graph polish, sigma 3)
 
 - Preflight: 2d overview labels + `kind=unthemed` («Без темы») OK

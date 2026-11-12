@@ -43,7 +43,7 @@
     wired: false,
     visible: false,
     view: null,
-    route: { level: "overview", id: null },
+    route: { level: "overview", id: null, sel: [] },
     settings: null,
     settingsLevel: "global",
     raw: null,
@@ -54,6 +54,7 @@
     posTimer: null,
     animTimer: null,
     selectedId: null,
+    selectedIds: [],
     tenantId: "default",
     busy: false,
     t0: 0,
@@ -111,17 +112,45 @@
     }, 800);
   }
 
+  function parseSelParam(queryPart) {
+    if (!queryPart) return [];
+    try {
+      const params = new URLSearchParams(queryPart);
+      const raw = params.get("sel");
+      if (!raw) return [];
+      return raw
+        .split(",")
+        .map((s) => {
+          try {
+            return decodeURIComponent(s.trim());
+          } catch (_) {
+            return s.trim();
+          }
+        })
+        .filter(Boolean);
+    } catch (_) {
+      return [];
+    }
+  }
+
   function parseHash() {
     const h = (location.hash || "").replace(/^#/, "");
     if (!h.startsWith("graph")) return null;
-    const parts = h.split("/").filter(Boolean);
+    const qAt = h.indexOf("?");
+    const path = qAt >= 0 ? h.slice(0, qAt) : h;
+    const query = qAt >= 0 ? h.slice(qAt + 1) : "";
+    const parts = path.split("/").filter(Boolean);
+    const sel = parseSelParam(query);
     // graph | graph/overview | graph/theme/5 | graph/topic/10 | graph/local/work:x
-    if (parts.length <= 1 || parts[1] === "overview") return { level: "overview", id: null };
-    if (parts[1] === "theme" && parts[2]) return { level: "theme", id: decodeURIComponent(parts[2]) };
-    if (parts[1] === "topic" && parts[2]) return { level: "topic", id: decodeURIComponent(parts[2]) };
-    if (parts[1] === "local" && parts[2]) return { level: "local", id: decodeURIComponent(parts.slice(2).join("/")) };
-    if (parts[1] === "node" && parts[2]) return { level: "local", id: decodeURIComponent(parts.slice(2).join("/")) };
-    return { level: "overview", id: null };
+    let route;
+    if (parts.length <= 1 || parts[1] === "overview") route = { level: "overview", id: null };
+    else if (parts[1] === "theme" && parts[2]) route = { level: "theme", id: decodeURIComponent(parts[2]) };
+    else if (parts[1] === "topic" && parts[2]) route = { level: "topic", id: decodeURIComponent(parts[2]) };
+    else if (parts[1] === "local" && parts[2]) route = { level: "local", id: decodeURIComponent(parts.slice(2).join("/")) };
+    else if (parts[1] === "node" && parts[2]) route = { level: "local", id: decodeURIComponent(parts.slice(2).join("/")) };
+    else route = { level: "overview", id: null };
+    route.sel = sel;
+    return route;
   }
 
   function writeHash(route, replace) {
@@ -129,25 +158,50 @@
     if (route.level === "theme" && route.id) h = `#graph/theme/${encodeURIComponent(route.id)}`;
     else if (route.level === "topic" && route.id) h = `#graph/topic/${encodeURIComponent(route.id)}`;
     else if (route.level === "local" && route.id) h = `#graph/local/${encodeURIComponent(route.id)}`;
+    const sel = Array.isArray(route.sel) ? route.sel : state.selectedIds || [];
+    if (sel.length) h += `?sel=${sel.map((id) => encodeURIComponent(id)).join(",")}`;
     if (replace) history.replaceState(null, "", h);
     else if (location.hash !== h) location.hash = h;
   }
 
-  let lastTap = { id: null, t: 0 };
+  function applySelection(ids, opts) {
+    const o = opts || {};
+    const list = (ids || []).map(String).filter(Boolean);
+    state.selectedIds = list;
+    state.selectedId = list[0] || null;
+    state.route = { ...state.route, sel: list.slice() };
+    if (state.view && state.view.setSelection) state.view.setSelection(list, { silent: true });
+    if (!o.skipHash) writeHash(state.route, o.replaceHash !== false);
+    if (!o.skipPanel) {
+      if (list.length) {
+        const id = list[list.length - 1];
+        const raw = (state.raw && (state.raw.nodes || []).find((n) => String(n.id) === String(id))) || null;
+        openPanel(id, raw);
+      } else if (o.closePanel !== false) {
+        closePanel(false);
+      }
+    }
+  }
 
-  function handleNodeClick(id, node) {
-    const now = Date.now();
-    if (lastTap.id === id && now - lastTap.t < 350) {
-      lastTap = { id: null, t: 0 };
-      const raw = (node && node.raw) || node || {};
-      const typ = raw.type || (node && node.type);
-      if (typ === "theme") navigate({ level: "theme", id });
-      else if (typ === "topic") navigate({ level: "topic", id });
+  function clearSelection(opts) {
+    applySelection([], { closePanel: true, ...(opts || {}) });
+  }
+
+  function handleNodeClick(id, node, meta) {
+    const shift = !!(meta && meta.shiftKey);
+    if (shift) {
+      const cur = state.selectedIds.slice();
+      const i = cur.indexOf(String(id));
+      if (i >= 0) cur.splice(i, 1);
+      else cur.push(String(id));
+      applySelection(cur, { replaceHash: true });
       return;
     }
-    lastTap = { id, t: now };
-    state.selectedId = id;
-    openPanel(id, node);
+    applySelection([String(id)], { replaceHash: true });
+  }
+
+  function handleNodeDoubleClick(id, node) {
+    navigate({ level: "local", id });
   }
 
   function ensureView() {
@@ -164,7 +218,15 @@
       nodeColor: colors.nodeColor,
       edgeColor: colors.edgeColor,
       labelColor: colors.labelColor,
-      onClick: ({ id, node }) => handleNodeClick(id, node),
+      onClick: ({ id, node, shiftKey }) => handleNodeClick(id, node, { shiftKey }),
+      onDoubleClick: ({ id, node }) => handleNodeDoubleClick(id, node),
+      onStageClick: () => clearSelection({ replaceHash: true }),
+      onSelectionChange: (ids) => {
+        state.selectedIds = ids || [];
+        state.selectedId = (ids && ids[0]) || null;
+        state.route = { ...state.route, sel: (ids || []).slice() };
+        writeHash(state.route, true);
+      },
       onDragEnd: () => persistPositionsSoon(),
     });
     return state.view;
@@ -469,7 +531,11 @@
     else view.setData({ nodes, edges: filtered.edges });
     if (cached) view.setPositions(cached);
     persistPositionsSoon();
-    if (state.searchHits.size) {
+    // Restore pinned selection from route (?sel=) after paint; search hits are overlay-only.
+    const sel = (state.route && state.route.sel) || state.selectedIds || [];
+    if (sel.length) {
+      applySelection(sel, { skipHash: true, skipPanel: false, replaceHash: true });
+    } else if (state.searchHits.size) {
       view.highlight({ focus: null, neighbors: state.searchHits });
     }
   }
@@ -554,9 +620,12 @@
       const k = posCacheKey();
       GraphSettings.savePositions(state.tenantId, k.level, k.id, state.view.getPositions());
     }
-    state.route = route;
+    // Level change clears selection unless caller passes sel.
+    state.route = { sel: [], ...route };
+    state.selectedIds = state.route.sel || [];
+    state.selectedId = state.selectedIds[0] || null;
     state.etag = null;
-    writeHash(route, replace);
+    writeHash(state.route, replace);
     const nextBucket = settingsBucket();
     if (nextBucket !== state.settingsLevel) loadSettings();
     closePanel(false);
@@ -651,7 +720,13 @@
 
   function closePanel(clearSel) {
     document.getElementById("graph-side")?.classList.add("hidden");
-    if (clearSel) state.selectedId = null;
+    if (clearSel) {
+      state.selectedId = null;
+      state.selectedIds = [];
+      state.route = { ...state.route, sel: [] };
+      if (state.view && state.view.setSelection) state.view.setSelection([], { silent: true });
+      writeHash(state.route, true);
+    }
   }
 
   function btn(label, onClick, cls) {
@@ -1089,12 +1164,22 @@
       if (!state.visible) return;
       const next = parseHash();
       if (!next) return;
-      if (next.level === state.route.level && next.id === state.route.id) return;
+      const sameLevel = next.level === state.route.level && next.id === state.route.id;
+      if (sameLevel) {
+        const prevSel = (state.route.sel || []).join(",");
+        const nextSel = (next.sel || []).join(",");
+        if (prevSel !== nextSel) {
+          applySelection(next.sel || [], { skipHash: true, replaceHash: false });
+        }
+        return;
+      }
       if (state.view) {
         const k = posCacheKey();
         GraphSettings.savePositions(state.tenantId, k.level, k.id, state.view.getPositions());
       }
       state.route = next;
+      state.selectedIds = next.sel || [];
+      state.selectedId = state.selectedIds[0] || null;
       state.etag = null;
       loadSettings();
       closePanel(false);
@@ -1103,7 +1188,15 @@
 
     document.addEventListener("keydown", (e) => {
       if (!state.visible) return;
-      if (e.key === "Backspace" && !/INPUT|TEXTAREA|SELECT/.test((e.target && e.target.tagName) || "")) {
+      const tag = (e.target && e.target.tagName) || "";
+      if (e.key === "Escape") {
+        if (state.selectedIds && state.selectedIds.length) {
+          e.preventDefault();
+          clearSelection({ replaceHash: true });
+        }
+        return;
+      }
+      if (e.key === "Backspace" && !/INPUT|TEXTAREA|SELECT/.test(tag)) {
         e.preventDefault();
         history.back();
       }

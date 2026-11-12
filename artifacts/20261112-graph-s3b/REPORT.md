@@ -80,3 +80,13 @@ Under `artifacts/20261112-graph-s3b/screenshots/` (overview dark + settings, lig
 - 3000-node hover FPS &lt; 50 without further LOD.
 - `@sigma/node-border` used via UMD `createNodeBorderProgram` when available; ESM plugin kept for reference.
 - Accidental `POST /api/graph/rebuild` from UI ↻ can block the single API worker — prefer soft reload; restart API if health hangs.
+
+## Follow-up: pinned selection (selected note)
+
+- Click (&lt;3px move) pins selection: node + neighbors stay highlighted after cursor leaves; side panel opens.
+- Hover other nodes = temporary overlay; leave restores selection.
+- Stage click / Esc clears; Shift+click multi-select (union of neighbors).
+- Double-click / «Локальный граф» → local graph.
+- URL: `#graph/…?sel=<id>` (comma-list for multi); survives reload / back.
+- Selected disc uses accent border (`bordered` / accent fallback); hot edges solid accent.
+- Screenshot: `screenshots/07-selection-pinned-cursor-away.png` (node selected, cursor off node).
