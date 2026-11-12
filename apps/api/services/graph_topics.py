@@ -89,7 +89,7 @@ _DEFAULTS: dict[str, Any] = {
     # Slice 2c
     "proper_noun_min_cap_ratio": 0.8,
     "proper_noun_min_n": 3,
-    "vector_cache_rev": "2d-1",
+    "vector_cache_rev": "2d-2",
     "min_tokens_for_topic": 1500,
     "min_topic_confidence": 0.25,
     "max_unthemed_share": 0.10,
@@ -1658,6 +1658,15 @@ def _decorate(
             theme["llm_label"] = grounded.get("llm_label")
             theme["label_grounded"] = grounded.get("label_grounded")
             theme["ground_terms"] = grounded.get("ground_terms")
+            # Theme label must not equal any member topic label.
+            norm_topics = {str(x).casefold().replace("ё", "е") for x in topic_labels if x}
+            if str(theme.get("label") or "").casefold().replace("ё", "е") in norm_topics:
+                alt = labels.default_label(term_names[3:9] or term_names, None, n_terms=3, with_title=False)
+                if str(alt).casefold().replace("ё", "е") in norm_topics:
+                    alt = (term_names[0] if term_names else "Тема") + " круг"
+                theme["label"] = alt
+                theme["label_source"] = "terms_fallback"
+                theme["label_grounded"] = False
         spec = theme_over.get(theme["id"]) or {}
         if isinstance(spec, dict) and spec.get("label"):
             theme["label"] = str(spec["label"])

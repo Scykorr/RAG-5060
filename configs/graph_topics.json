@@ -27,7 +27,7 @@
   "characteristic_terms": 10,
   "central_works": 5,
   "topics_schema": 2,
-  "vector_cache_rev": "2d-1",
+  "vector_cache_rev": "2d-2",
   "min_author_entropy": 0.5,
   "min_topic_authors": 3,
   "author_debias_alpha": 0.6,
@@ -44,8 +44,7 @@
   "topic_vector_top_k": 400,
   "proper_noun_min_cap_ratio": 0.8,
   "proper_noun_min_n": 3,
-  "vector_cache_rev": 3,
   "min_tokens_for_topic": 1500,
   "min_topic_confidence": 0.25,
-  "max_unthemed_share": 0.10
+  "max_unthemed_share": 0.1
 }

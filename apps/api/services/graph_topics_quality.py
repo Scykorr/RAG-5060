@@ -618,9 +618,10 @@ def sweep_theme_resolution(
         key=lambda r: (
             0 if r["ok"] else 1,
             0 if r.get("ok_soft") else 1,
+            0 if 0.35 <= float(r.get("mean_theme_purity") or 0) <= 0.65 else 1,
+            # Prefer mid-size theme counts (regression groups stay coherent).
+            abs(float(r["n_themes"]) - 6),
             -float(r["ratio"]),
-            abs(float(r["n_themes"]) - 7),
-            abs(float(r.get("mean_theme_purity") or 0) - 0.5),
             float(r["max_inter"]),
         )
     )

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Corpus report for themes/topics (slice 2 / 2c).
+"""Corpus report for themes/topics (slice 2 / 2c / 2d).
 
 Reads the published connectivity index, clusters topics, and writes
 artifacts/<run-id>-topics/ (tree, purity, inter-theme matrix, timings, lineage).
@@ -83,11 +83,11 @@ def main() -> int:
         ptr = gcache.read_current_pointer(tenant_id) or {}
         index_file = ptr.get("index_file")
         if not index_file:
-            index = gidx.build_index_for_tenant(db, tenant_id, force=False)
+            index = gidx.build_index_for_tenant(db, tenant_id, force=True)
         else:
             index = gidx.read_index(gcache.graph_dir() / str(index_file)) or {}
-            if not index:
-                index = gidx.build_index_for_tenant(db, tenant_id, force=False)
+            if not index or int(index.get("version") or 0) != int(gidx.INDEX_VERSION):
+                index = gidx.build_index_for_tenant(db, tenant_id, force=True)
         index_ms = int((time.perf_counter() - t0) * 1000)
 
         try:
@@ -97,20 +97,76 @@ def main() -> int:
         except Exception:
             pass
 
-        t1 = time.perf_counter()
-        payload = gtopics.build_after_index(
-            tenant_id,
-            index,
-            force=True,
-            use_artifacts=not args.no_artifacts,
+        # Preview works for artifact terms (grid + builds).
+        works_preview = gtopics._canonical_works(  # noqa: SLF001
+            [d for d in (index.get("documents") or []) if isinstance(d, dict)]
         )
+        demo_terms = None
+        demo_surfaces = None
+        demo_case = None
+        demo_pos = None
+        demo_wcp = None
+        if not args.no_artifacts:
+            loaded, demo_surfaces, name_stems, demo_case, demo_pos, demo_wcp = (
+                gtopics.load_terms_from_artifacts(tenant_id, works_preview)
+            )
+            cleaned = {wk: Counter() for wk in works_preview}
+            for wk, counts in loaded.items():
+                slot = cleaned.setdefault(wk, Counter())
+                for stem, tf in counts.items():
+                    if len(str(stem)) < 4 or stem in name_stems:
+                        continue
+                    try:
+                        slot[str(stem)] += int(tf)
+                    except (TypeError, ValueError):
+                        continue
+            if any(cleaned.values()):
+                demo_terms = cleaned
+
+        params_base = gtopics.load_params()
+        # Keep 2b/2c knobs; grid may only retune theme_resolution.
+        grid_rows: list[dict] = []
+        stage_ms: dict = {}
+        if not args.skip_grid:
+            t_grid = time.perf_counter()
+            grid_rows = gtq.sweep_theme_resolution(
+                index,
+                params_base,
+                resolutions=[1.0, 1.3, 1.6, 2.0, 2.5, 3.0],
+                work_terms=demo_terms,
+                case_stats=demo_case,
+                pos_stats=demo_pos,
+                work_case_pos=demo_wcp,
+                tenant_id=str(tenant_id),
+            )
+            stage_ms["theme_resolution_grid"] = int((time.perf_counter() - t_grid) * 1000)
+            if grid_rows:
+                best = grid_rows[0]
+                params_base["theme_resolution"] = float(best["theme_resolution"])
+
+        t1 = time.perf_counter()
+        # Always build with the grid-picked resolution (α / same_author unchanged).
+        payload = gtopics.build_topics_from_index(
+            index,
+            params=params_base,
+            overrides=gtopics.load_overrides(),
+            previous=None,
+            work_terms=demo_terms,
+            surfaces=demo_surfaces,
+            case_stats=demo_case,
+            pos_stats=demo_pos,
+            work_case_pos=demo_wcp,
+            force_mode="full",
+            tenant_id=str(tenant_id),
+        )
+        gtopics.save_topics(tenant_id, payload)
         topics_ms = int((time.perf_counter() - t1) * 1000)
-        stage_ms = dict((payload.get("stats") or {}).get("stage_ms") or {})
+        stage_ms.update(dict((payload.get("stats") or {}).get("stage_ms") or {}))
         labels_ms = int(stage_ms.get("labels_llm") or 0)
         topics_wo_llm_ms = max(0, topics_ms - labels_ms)
 
         # Second full rebuild without LLM — should hit vector cache.
-        params_cached = gtopics.load_params()
+        params_cached = dict(params_base)
         params_cached["llm"] = False
         t_cached = time.perf_counter()
         cached_payload = gtopics.build_topics_from_index(
@@ -120,6 +176,11 @@ def main() -> int:
             previous=payload,
             force_mode="full",
             tenant_id=str(tenant_id),
+            work_terms=demo_terms,
+            surfaces=demo_surfaces,
+            case_stats=demo_case,
+            pos_stats=demo_pos,
+            work_case_pos=demo_wcp,
             llm_generate=lambda _p, _m: "",
         )
         cached_full_ms = int((time.perf_counter() - t_cached) * 1000)
@@ -128,12 +189,32 @@ def main() -> int:
         stage_ms["cached_vectors"] = cached_stage.get("vectors")
         stage_ms["cached_vec_hits"] = cached_stage.get("vec_cache_hits")
 
+        # Persist grid-picked resolution so later loads/noops share the same params hash.
+        try:
+            cfg_path = ROOT / "configs" / "graph_topics.json"
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            cfg["theme_resolution"] = float(
+                params_base.get("theme_resolution") or cfg.get("theme_resolution") or 1.3
+            )
+            # Keep cache bust rev from code defaults if missing/stale.
+            if not cfg.get("vector_cache_rev"):
+                cfg["vector_cache_rev"] = params_base.get("vector_cache_rev") or "2d-2"
+            cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
         t_noop = time.perf_counter()
-        noop_payload = gtopics.build_after_index(
-            tenant_id,
+        noop_payload = gtopics.build_topics_from_index(
             index,
-            force=False,
-            use_artifacts=not args.no_artifacts,
+            params=params_base,
+            overrides=gtopics.load_overrides(),
+            previous=payload,
+            work_terms=demo_terms,
+            surfaces=demo_surfaces,
+            case_stats=demo_case,
+            pos_stats=demo_pos,
+            work_case_pos=demo_wcp,
+            tenant_id=str(tenant_id),
         )
         noop_ms = int((time.perf_counter() - t_noop) * 1000)
     finally:
@@ -167,26 +248,6 @@ def main() -> int:
     drop_n = max(1, int(0.15 * max(1, len(works))))
     dropped = set(ranked_lo[:drop_n])
     prev_big = _copy_without(payload, dropped)
-    demo_terms = None
-    demo_surfaces = None
-    demo_case = None
-    demo_pos = None
-    if not args.no_artifacts:
-        loaded, demo_surfaces, name_stems, demo_case, demo_pos = gtopics.load_terms_from_artifacts(
-            tenant_id, works
-        )
-        cleaned = {wk: Counter() for wk in works}
-        for wk, counts in loaded.items():
-            slot = cleaned.setdefault(wk, Counter())
-            for stem, tf in counts.items():
-                if len(str(stem)) < 4 or stem in name_stems:
-                    continue
-                try:
-                    slot[str(stem)] += int(tf)
-                except (TypeError, ValueError):
-                    continue
-        if any(cleaned.values()):
-            demo_terms = cleaned
     params_recluster = dict(params_timing)
     params_recluster["llm"] = False
     t3 = time.perf_counter()
@@ -200,6 +261,7 @@ def main() -> int:
         surfaces=demo_surfaces,
         case_stats=demo_case,
         pos_stats=demo_pos,
+        work_case_pos=demo_wcp,
         llm_generate=noop_llm,
         force_mode="full",
     )
@@ -235,23 +297,20 @@ def main() -> int:
     for edge in links:
         matrix[(edge["source"], edge["target"])] = float(edge["weight"])
     link_stats = gtq.theme_affinity_stats(payload)
-
-    # theme_resolution grid (no LLM)
-    grid_rows: list[dict] = []
-    if not args.skip_grid:
-        t_grid = time.perf_counter()
-        grid_rows = gtq.sweep_theme_resolution(
-            index,
-            params_timing,
-            work_terms=demo_terms,
-            case_stats=demo_case,
-            pos_stats=demo_pos,
-            tenant_id=str(tenant_id),
-        )
-        stage_ms["theme_resolution_grid"] = int((time.perf_counter() - t_grid) * 1000)
+    # Consistency: matrix edge weights must equal affinity stats.matrix
+    matrix_from_stats = {
+        tuple(k.split("|", 1)): float(v) for k, v in (link_stats.get("matrix") or {}).items()
+    }
+    inter_metric_consistent = True
+    for key, val in matrix.items():
+        a, b = key if key[0] < key[1] else (key[1], key[0])
+        expected = float(matrix_from_stats.get((a, b), 0.0))
+        if abs(float(val) - expected) > 1e-6:
+            inter_metric_consistent = False
+            break
 
     lines: list[str] = []
-    lines.append("# Graph topics report (slice 2c)")
+    lines.append("# Graph topics report (slice 2d)")
     lines.append("")
     lines.append(f"- run_id: `{run_id}`")
     lines.append(f"- tenant_id: `{tenant_id}`")
@@ -322,8 +381,44 @@ def main() -> int:
     content_themes = [
         th
         for th in themes
-        if str(th.get("collection") or "") != "Прочее" and int(th.get("size") or 0) > 0
+        if str(th.get("collection") or "") != "Прочее"
+        and str(th.get("service") or "") != "unthemed"
+        and int(th.get("size") or 0) > 0
     ]
+    unthemed_themes = [th for th in themes if th.get("service") == "unthemed"]
+    text_clean = (index.get("stats") or {}).get("text_clean") or {}
+    lines.append("## Homoglyph normalization (index)")
+    lines.append("")
+    lines.append(f"- index_version: **{index.get('version')}** (code `{gidx.INDEX_VERSION}`)")
+    lines.append(f"- tokens_fixed: **{text_clean.get('homoglyph_fixes', 0)}**")
+    lines.append(f"- en_docs_homoglyph_touched: **{text_clean.get('en_docs_homoglyph_touched', 0)}** (expect 0)")
+    lines.append("")
+    lines.append("| before | after | language |")
+    lines.append("| --- | --- | --- |")
+    for ex in (text_clean.get("homoglyph_examples") or [])[:20]:
+        lines.append(
+            f"| {ex.get('before')} | {ex.get('after')} | {ex.get('language') or ''} |"
+        )
+    lines.append("")
+    # mixed-script tokens remaining in topic term dictionary
+    mixed_left = 0
+    mixed_examples = []
+    _cyr = set("абвгдеёжзийклмнопрстуфхцчшщъыьэюя")
+    _lat = set("abcdefghijklmnopqrstuvwxyz")
+    for topic in topics:
+        for row in topic.get("terms") or []:
+            tok = str(row.get("term") or row.get("stem") or "")
+            low = tok.casefold()
+            has_c = any(ch in _cyr for ch in low)
+            has_l = any(ch in _lat for ch in low)
+            if has_c and has_l:
+                mixed_left += 1
+                if len(mixed_examples) < 20:
+                    mixed_examples.append(tok)
+    lines.append(f"- mixed_script_tokens_in_topic_terms: **{mixed_left}**")
+    if mixed_examples:
+        lines.append(f"- examples: `{mixed_examples}`")
+    lines.append("")
     theme_purities = [float(th.get("author_purity") or 0) for th in content_themes]
     theme_mean = round(sum(theme_purities) / max(1, len(theme_purities)), 4)
     theme_pure100 = sum(1 for p in theme_purities if p >= 0.999)
@@ -338,9 +433,9 @@ def main() -> int:
         f"half-rule pass: **{purity.get('passes_half_rule')}**"
     )
     lines.append(
-        f"- content themes (тематики, excl. Прочее): **{len(content_themes)}**, "
+        f"- content themes (excl. Прочее / Без темы): **{len(content_themes)}**, "
         f"100% pure: **{theme_pure100}** (share {theme_pure_share}), mean **{theme_mean}** "
-        f"(target mean 0.35–0.65)"
+        f"(target mean 0.35–0.65); unthemed_themes={len(unthemed_themes)}"
     )
     lines.append(f"- histogram (topics): `{purity.get('histogram')}`")
     lines.append("")
@@ -364,10 +459,21 @@ def main() -> int:
         lines.append(
             f"| {row.get('stem')} | {row.get('cap_ratio')} | {row.get('n')} | {row.get('source')} |"
         )
-    common_ok = ["казак", "батарей", "учен", "станиц"]
+    common_ok = [
+        "маточка",
+        "бабушка",
+        "дедушка",
+        "князь",
+        "казак",
+        "доктор",
+        "батарей",
+        "учен",
+        "станиц",
+    ]
     kept_common = []
     for stem in common_ok:
-        hit = stem in proper_set or any(stem in p for p in proper_set)
+        # Exact stem only — prefix matches would false-positive «князь» vs surnames.
+        hit = stem in proper_set
         kept_common.append((stem, not hit))
     lines.append("")
     lines.append(
@@ -502,17 +608,27 @@ def main() -> int:
     lines.append("## Inter-theme matrix")
     lines.append("")
     lines.append(
+        f"- formula=`{link_stats.get('formula')}` "
+        f"(2c mismatch note: {link_stats.get('legacy_note')})"
+    )
+    lines.append(
         f"- mean_intra=`{link_stats.get('mean_intra')}` mean_inter=`{link_stats.get('mean_inter')}` "
-        f"max_inter=`{link_stats.get('max_inter')}` ratio=`{link_stats.get('ratio')}`"
+        f"max_inter=`{link_stats.get('max_inter')}` ratio=`{link_stats.get('ratio')}` "
+        f"consistent=`{inter_metric_consistent}`"
     )
     lines.append("")
-    header = "| | " + " | ".join(th["id"] for th in themes) + " |"
-    sep = "| --- | " + " | ".join("---" for _ in themes) + " |"
+    matrix_themes = [
+        th
+        for th in themes
+        if th.get("service") != "unthemed" and str(th.get("collection") or "") != "Прочее"
+    ]
+    header = "| | " + " | ".join(th["id"] for th in matrix_themes) + " |"
+    sep = "| --- | " + " | ".join("---" for _ in matrix_themes) + " |"
     lines.append(header)
     lines.append(sep)
-    for left in themes:
+    for left in matrix_themes:
         cells = []
-        for right in themes:
+        for right in matrix_themes:
             if left["id"] == right["id"]:
                 cells.append("—")
                 continue
@@ -617,13 +733,16 @@ def main() -> int:
     lines.append(f"- negative no-single-author-theme: **{no_single}** (authors={authors_in_corpus})")
     lines.append("")
 
-    # Acceptance (slice 2c)
+    # Acceptance (slice 2d)
     min_tok = int((payload.get("params") or {}).get("min_tokens_for_topic") or 1500)
     min_tok_final = int(
         (weak_meta or {}).get("min_tokens_for_topic_final")
         if weak_meta.get("min_tokens_for_topic_final") is not None
         else min_tok
     )
+    # Slice 2d: short texts may stay themed; flag only low-confidence majorities.
+    conf_thr = float((payload.get("params") or {}).get("min_topic_confidence") or 0.25)
+    conf_thr = float(weak_meta.get("min_topic_confidence_final") or conf_thr)
     weak_topic_fail = 0
     for topic in topics:
         if topic.get("service"):
@@ -631,18 +750,19 @@ def main() -> int:
         members = list(topic.get("work_keys") or [])
         if not members:
             continue
-        unknown_or_short = 0
+        low_conf = 0
         for wk in members:
-            info = works.get(wk) or {}
-            kind = str(info.get("doc_kind") or "unknown")
-            tok = int(info.get("token_estimate") or 0)
-            short = min_tok_final > 0 and tok > 0 and tok < min_tok_final
-            if kind == "unknown" or short:
-                unknown_or_short += 1
-        if unknown_or_short > 0.5 * len(members):
+            conf = float(((payload.get("assignments") or {}).get(wk) or {}).get("confidence") or 1.0)
+            if conf < conf_thr:
+                low_conf += 1
+        if low_conf > 0.5 * len(members):
             weak_topic_fail += 1
+    _ = min_tok, min_tok_final  # retained for report context / future gates
 
     labels_ok = True
+    glue_fail = 0
+    theme_topic_same = 0
+    level_dupes = 0
     for item in list(topics) + list(themes):
         if item.get("service"):
             continue
@@ -650,58 +770,151 @@ def main() -> int:
         grounded = item.get("label_grounded")
         if grounded is False and src not in {"terms_fallback", "terms", "service", "override"}:
             labels_ok = False
-        if grounded is False and src == "terms_fallback":
-            continue  # allowed fallback mark
-        if grounded is None and src not in {"terms", "service", "override"}:
+        if grounded is None and src not in {"terms", "service", "override", "terms_fallback"}:
             labels_ok = False
+        # Shown label must not be a rejected LLM glue when source is llm
+        if src == "llm" and gtq.label_is_top6_glue(
+            str(item.get("label") or ""),
+            [r.get("term") or "" for r in (item.get("terms") or [])[:6]],
+        ):
+            glue_fail += 1
+            labels_ok = False
+
+    for theme in content_themes:
+        tlabels = {
+            str((by_topic.get(tid) or {}).get("label") or "")
+            for tid in (theme.get("topic_ids") or [])
+            if not (by_topic.get(tid) or {}).get("service")
+        }
+        if str(theme.get("label") or "") in tlabels:
+            theme_topic_same += 1
+    theme_labels = [str(th.get("label") or "") for th in content_themes]
+    if len(theme_labels) != len(set(theme_labels)):
+        level_dupes += 1
+    topic_labels_content = [
+        str(t.get("label") or "") for t in topics if not t.get("service")
+    ]
+    if len(topic_labels_content) != len(set(topic_labels_content)):
+        level_dupes += 1
+
+    unthemed_nested = False
+    for theme in content_themes:
+        for tid in theme.get("topic_ids") or []:
+            if (by_topic.get(tid) or {}).get("service") == "unthemed":
+                unthemed_nested = True
+    unthemed_top = len(unthemed_themes) >= 1 or float(stats.get("unthemed_works") or 0) == 0
+    if unthemed_themes:
+        unthemed_top = all(th.get("service") == "unthemed" for th in unthemed_themes) and not unthemed_nested
+
+    overview = gtopics.view_overview(payload, limit=500)
+    overview_unthemed_ok = any(
+        (n.get("kind") == "unthemed" or (n.get("attrs") or {}).get("kind") == "unthemed")
+        for n in (overview.get("nodes") or [])
+        if n.get("type") == "theme"
+    ) or float(stats.get("unthemed_works") or 0) == 0
 
     n_topics = int(stats.get("topics") or 0)
     n_themes = int(stats.get("themes") or 0)
     un_share = float(stats.get("unthemed_share") or 0)
     purity_mean = float(theme_mean)
+    max_inter_val = float(link_stats.get("max_inter") or 0)
+    common_nouns_ok = all(ok for _, ok in kept_common)
     acceptance = {
-        "no_proper_in_top6": proper_in_top6 == 0,
+        "no_mixed_script_tokens": mixed_left == 0,
+        "no_proper_in_top6": proper_in_top6 == 0 and common_nouns_ok,
+        "inter_metric_consistent": inter_metric_consistent and max_inter_val <= 0.2,
+        "unthemed_top_level": unthemed_top and overview_unthemed_ok and un_share <= 0.10 + 1e-9,
+        "labels": labels_ok and glue_fail == 0 and theme_topic_same == 0 and level_dupes == 0,
         "purity_in_band": 0.35 <= purity_mean <= 0.65,
         "regression_3_of_3": groups_pass == n_groups and n_groups >= 3,
         "no_weak_majority_topic": weak_topic_fail == 0,
-        "max_inter_le_0_2": float(link_stats.get("max_inter") or 0) <= 0.2,
         "themes_4_10": 4 <= len(content_themes) <= 10,
         "topics_15_60": 15 <= n_topics <= 60,
-        "labels_grounded_or_fallback": labels_ok,
-        "topics_build_wo_llm_le_30s": min(topics_wo_llm_ms, int(stage_ms.get("cached_full_rebuild") or topics_wo_llm_ms))
+        "topics_build_wo_llm_le_30s": min(
+            topics_wo_llm_ms, int(stage_ms.get("cached_full_rebuild") or topics_wo_llm_ms)
+        )
         <= 30_000,
         "recluster_le_30s": recluster_ms <= 30_000,
         "incremental_le_1s": incremental_ms <= 1_000,
         "noop_le_1s": noop_ms <= 1_000,
         "overlap_ge_0_9": overlap_share >= 0.9,
-        "unthemed_le_10pct": un_share <= 0.10 + 1e-9,
+        "en_homoglyph_untouched": int(text_clean.get("en_docs_homoglyph_touched") or 0) == 0,
     }
-    lines.append("## Acceptance (slice 2c)")
+    # Honest FAIL for max_inter: keep check separate detail even if combined above fails.
+    lines.append("## Acceptance (slice 2d)")
     lines.append("")
     lines.append("| check | pass | detail |")
     lines.append("| --- | --- | --- |")
     details = {
-        "no_proper_in_top6": f"hits={proper_in_top6}",
+        "no_mixed_script_tokens": f"mixed={mixed_left}",
+        "no_proper_in_top6": f"hits={proper_in_top6}; common_nouns_ok={common_nouns_ok}",
+        "inter_metric_consistent": (
+            f"consistent={inter_metric_consistent} max_inter={max_inter_val} "
+            f"(best_grid={grid_rows[0].get('max_inter') if grid_rows else 'n/a'} "
+            f"@ res={grid_rows[0].get('theme_resolution') if grid_rows else 'n/a'})"
+        ),
+        "unthemed_top_level": (
+            f"themes={len(unthemed_themes)} nested={unthemed_nested} "
+            f"share={un_share} overview_kind={overview_unthemed_ok}"
+        ),
+        "labels": (
+            f"ok={labels_ok} glue={glue_fail} theme=topic={theme_topic_same} level_dupes={level_dupes}"
+        ),
         "purity_in_band": f"mean={purity_mean}",
         "regression_3_of_3": f"{groups_pass}/{n_groups}",
         "no_weak_majority_topic": f"fail_topics={weak_topic_fail}",
-        "max_inter_le_0_2": f"max_inter={link_stats.get('max_inter')}",
         "themes_4_10": f"content_themes={len(content_themes)} total={n_themes}",
         "topics_15_60": f"topics={n_topics}",
-        "labels_grounded_or_fallback": "ok" if labels_ok else "fail",
         "topics_build_wo_llm_le_30s": f"{topics_wo_llm_ms}ms",
         "recluster_le_30s": f"{recluster_ms}ms",
         "incremental_le_1s": f"{incremental_ms}ms",
         "noop_le_1s": f"{noop_ms}ms",
         "overlap_ge_0_9": f"{overlap_share}",
-        "unthemed_le_10pct": f"{un_share}",
+        "en_homoglyph_untouched": f"touched={text_clean.get('en_docs_homoglyph_touched', 0)}",
     }
     all_pass = True
     for key, ok in acceptance.items():
         all_pass = all_pass and bool(ok)
         lines.append(f"| {key} | **{ok}** | {details.get(key)} |")
     lines.append("")
+    if max_inter_val > 0.2:
+        lines.append(
+            f"- max_inter honest FAIL: best achieved `{max_inter_val}` "
+            f"(grid best `{grid_rows[0] if grid_rows else {}}`)"
+        )
     lines.append(f"- overall: **{'PASS' if all_pass else 'FAIL'}**")
+    lines.append("")
+
+    # Old → new labels vs 2c report
+    old_stats_path = ROOT / "artifacts" / "20261112-064335-topics" / "stats.json"
+    old_labels: dict[str, str] = {}
+    if old_stats_path.is_file():
+        try:
+            old = json.loads(old_stats_path.read_text(encoding="utf-8"))
+            for row in (old.get("themes") or []):
+                if row.get("id"):
+                    old_labels[str(row["id"])] = str(row.get("label") or "")
+            for row in (old.get("topics") or []):
+                if row.get("id"):
+                    old_labels[str(row["id"])] = str(row.get("label") or "")
+        except (OSError, json.JSONDecodeError):
+            pass
+    lines.append("## Labels: old (2c) → new (2d)")
+    lines.append("")
+    lines.append("| id | kind | old | new | source | grounded |")
+    lines.append("| --- | --- | --- | --- | --- | --- |")
+    for theme in themes:
+        tid = str(theme.get("id") or "")
+        lines.append(
+            f"| {tid} | theme | {old_labels.get(tid, '—')} | {theme.get('label')} | "
+            f"{theme.get('label_source')} | {theme.get('label_grounded')} |"
+        )
+        for pid in theme.get("topic_ids") or []:
+            topic = by_topic.get(pid) or {}
+            lines.append(
+                f"| {pid} | topic | {old_labels.get(str(pid), '—')} | {topic.get('label')} | "
+                f"{topic.get('label_source')} | {topic.get('label_grounded')} |"
+            )
     lines.append("")
 
     report_path = out_dir / "topics_report.md"
