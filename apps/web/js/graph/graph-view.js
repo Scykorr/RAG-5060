@@ -232,6 +232,7 @@
       pinned: new Set(),
       onClick: opts.onClick || null,
       onHover: opts.onHover || null,
+      onDragEnd: opts.onDragEnd || null,
       onReady: opts.onReady || null,
       raf: 0,
       destroyed: false,
@@ -244,6 +245,15 @@
     if (programs.EdgeArrowProgram) edgeProgramClasses.arrow = programs.EdgeArrowProgram;
     const nodeProgramClasses = {};
     if (programs.NodeCircleProgram) nodeProgramClasses.circle = programs.NodeCircleProgram;
+    if (typeof programs.createNodeBorderProgram === "function") {
+      try {
+        nodeProgramClasses.bordered = programs.createNodeBorderProgram({
+          borders: [{ size: { value: 2, absoluteSizeOnScreen: true }, color: { attribute: "borderColor" } }],
+        });
+      } catch (_) {
+        /* keep circle-only */
+      }
+    }
 
     const getPalette = () => readThemePalette(state.display);
 
@@ -253,8 +263,8 @@
       labelSize: 12,
       labelWeight: "400",
       labelColor: { color: getPalette().labelColor },
-      labelGridCellSize: 100,
-      labelDensity: 1,
+      labelGridCellSize: 80,
+      labelDensity: 0.7,
       defaultEdgeType: "line",
       defaultNodeType: "circle",
       defaultNodeColor: state.display.nodeColor,
@@ -273,6 +283,21 @@
     wireSigmaEvents(state);
     applyForces(state);
     if (state.onReady) state.onReady({ kind: "sigma", webgl: true });
+    try {
+      global.__graphViewDebug = () => ({
+        nodes: state.graph ? state.graph.order : 0,
+        edges: state.graph ? state.graph.size : 0,
+        camera: state.sigma && state.sigma.getCamera ? state.sigma.getCamera().getState() : null,
+        sample: (() => {
+          const out = [];
+          if (!state.graph) return out;
+          state.graph.forEachNode((id, a) => {
+            if (out.length < 5) out.push({ id, x: a.x, y: a.y, size: a.size, color: a.color, label: a.label });
+          });
+          return out;
+        })(),
+      });
+    } catch (_) {}
 
     return api(state);
   }
@@ -331,7 +356,16 @@
       setPositions: (pos) => setPositions(state, pos),
       pinNode: (id, pinned) => {
         if (pinned) state.pinned.add(id);
-        else state.pinned.delete(id);
+        else {
+          state.pinned.delete(id);
+          if (state.sim) {
+            const n = state.sim.nodes().find((nn) => nn.id === id);
+            if (n) {
+              n.fx = null;
+              n.fy = null;
+            }
+          }
+        }
       },
       reheat: () => {
         if (state.sim) state.sim.alpha(0.7).restart();
@@ -397,18 +431,26 @@
     const p = readThemePalette(state.display);
     const baseColor = data.color || state.display.nodeColor || p.nodeColor;
 
+    const isTheme = data.nodeKind === "theme";
+    const isLocalCenter = state.display.localCenterId && node === state.display.localCenterId;
     if (!dimming) {
-      return { ...data, zIndex: data.zIndex || 0 };
+      return {
+        ...data,
+        zIndex: isTheme || isLocalCenter ? 1 : data.zIndex || 0,
+        forceLabel: !!(isTheme || isLocalCenter),
+        labelWeight: isTheme || isLocalCenter ? "600" : data.labelWeight || "400",
+      };
     }
 
-    const hot = node === focus || nbrs.has(node);
+    const hot = node === focus || nbrs.has(node) || isLocalCenter;
     if (hot) {
       return {
         ...data,
-        color: baseColor,
+        color: isLocalCenter ? p.accent : baseColor,
         forceLabel: true,
         zIndex: 2,
         highlighted: true,
+        labelWeight: isTheme || isLocalCenter ? "600" : "400",
       };
     }
 
@@ -510,9 +552,16 @@
 
   function nodeRadius(n, display) {
     const deg = Math.max(0, n.degree || 0);
-    const base = 3 + Math.sqrt(deg + Math.max(1, n.size)) * 2.2;
-    const typeBoost = n.type === "theme" ? 2.2 : n.type === "topic" ? 1.5 : 1;
-    return Math.max(3, base * typeBoost * (display.nodeScale || 1));
+    const scale = display.nodeScale || 1;
+    const kind = n.type || "work";
+    // Obsidian-like: works ~2–10px, topics a bit larger, themes up to ~14–18.
+    const bySqrt = 2 + Math.sqrt(deg + 1) * 1.35;
+    let r;
+    if (kind === "theme") r = Math.min(18, Math.max(10, 8 + Math.sqrt(deg + 1) * 1.8));
+    else if (kind === "topic") r = Math.min(12, Math.max(4, 3.2 + Math.sqrt(deg + 1) * 1.4));
+    else r = Math.min(10, Math.max(2, bySqrt));
+    if (display.localCenterId && n.id === display.localCenterId) r = Math.max(r * 1.45, r + 3);
+    return Math.max(2, r * scale);
   }
 
   function applyEdgeTypes(state) {
@@ -571,6 +620,8 @@
     nodes.forEach((n, i) => {
       const angle = (i / Math.max(1, nodes.length)) * Math.PI * 2;
       const r = 40 + (i % 7) * 18;
+      const isTheme = n.type === "theme";
+      const bordered = isTheme && state._sigmaPrograms && state.sigma && state.sigma.getSetting && (state.sigma.getSetting("nodeProgramClasses") || {}).bordered;
       g.addNode(n.id, {
         label: n.label,
         x: n.x != null ? n.x : Math.cos(angle) * r + (Math.random() - 0.5) * 8,
@@ -581,7 +632,12 @@
         degree: n.degree,
         ghost: n.ghost,
         external: n.external,
-        zIndex: 0,
+        zIndex: isTheme ? 1 : 0,
+        type: bordered ? "bordered" : "circle",
+        borderColor: isTheme ? state.display.accent || "#7f6df2" : undefined,
+        forceLabel: isTheme,
+        labelWeight: isTheme ? "600" : "400",
+        themeId: (n.raw && (n.raw.theme_id || (n.raw.attrs && n.raw.attrs.theme_id))) || null,
       });
     });
     state.edges.forEach((e) => {
@@ -699,14 +755,19 @@
     if (state.kind !== "sigma" || typeof d3 === "undefined") return;
     const g = state.graph;
     const nodes = [];
+    const byId = new Map();
     g.forEachNode((id, attrs) => {
-      nodes.push({
+      const n = {
         id,
         x: attrs.x || 0,
         y: attrs.y || 0,
         fx: state.pinned.has(id) ? attrs.x : null,
         fy: state.pinned.has(id) ? attrs.y : null,
-      });
+        nodeKind: attrs.nodeKind,
+        themeId: attrs.themeId,
+      };
+      nodes.push(n);
+      byId.set(id, n);
     });
     const links = [];
     g.forEachEdge((eid, attrs, source, target) => {
@@ -715,22 +776,41 @@
 
     if (state.sim) state.sim.stop();
     const f = state.forces;
-    state.sim = d3
+    const pull = f.pull != null ? f.pull : 0.04;
+    const sim = d3
       .forceSimulation(nodes)
       .force("center", d3.forceCenter(0, 0).strength(f.center))
+      .force("x", d3.forceX(0).strength(pull))
+      .force("y", d3.forceY(0).strength(pull))
       .force("charge", d3.forceManyBody().strength(f.charge))
       .force(
         "link",
         d3
           .forceLink(links)
           .id((d) => d.id)
-          .distance(f.distance)
+          .distance((d) => {
+            const a = byId.get(d.source.id || d.source);
+            const b = byId.get(d.target.id || d.target);
+            if (a && b && ((a.nodeKind === "theme" && b.nodeKind === "topic") || (b.nodeKind === "theme" && a.nodeKind === "topic"))) {
+              return Math.max(36, (f.distance || 80) * 0.55);
+            }
+            return f.distance;
+          })
           .strength((d) => Math.min(1, (d.weight || 0.1) * f.link))
       )
       .alpha(reheat ? 0.6 : 0.25)
       .alphaDecay(0.028)
       .on("tick", () => {
         if (state.destroyed) return;
+        // Soft pull of topics toward their theme center (cluster look).
+        nodes.forEach((n) => {
+          if (n.nodeKind !== "topic" || !n.themeId) return;
+          const tid = String(n.themeId).startsWith("theme:") ? String(n.themeId) : `theme:${n.themeId}`;
+          const theme = byId.get(tid) || byId.get(String(n.themeId));
+          if (!theme || n.fx != null) return;
+          n.vx = (n.vx || 0) + (theme.x - n.x) * 0.02;
+          n.vy = (n.vy || 0) + (theme.y - n.y) * 0.02;
+        });
         nodes.forEach((n) => {
           if (!g.hasNode(n.id)) return;
           if (state.pinned.has(n.id)) return;
@@ -740,6 +820,7 @@
         if (state.sigma) state.sigma.refresh();
         if (state.sim && state.sim.alpha() < 0.01) state.sim.stop();
       });
+    state.sim = sim;
   }
 
   function fitView(state) {
@@ -759,13 +840,19 @@
     });
     if (!n || !state.sigma.getCamera) return;
     const cam = state.sigma.getCamera();
+    const padL = 24;
+    const padR = 96; // zoom buttons
+    const padT = 56; // top icon cluster
+    const padB = 40;
+    const settingsOpen = !document.getElementById("graph-settings-panel")?.classList.contains("hidden");
+    const padRightExtra = settingsOpen ? 320 : 0;
     const cx = (minX + maxX) / 2;
     const cy = (minY + maxY) / 2;
     const w = Math.max(40, maxX - minX);
     const h = Math.max(40, maxY - minY);
-    const vw = state.container.clientWidth || 800;
-    const vh = state.container.clientHeight || 600;
-    const ratio = Math.max(w / vw, h / vh) * 1.25;
+    const vw = Math.max(120, (state.container.clientWidth || 800) - padL - padR - padRightExtra);
+    const vh = Math.max(120, (state.container.clientHeight || 600) - padT - padB);
+    const ratio = Math.max(w / vw, h / vh) * 1.35;
     cam.animate({ x: cx, y: cy, ratio: Math.max(0.08, ratio) }, { duration: 280 });
   }
 
@@ -779,77 +866,110 @@
   function wireSigmaEvents(state) {
     const s = state.sigma;
     if (!s || !s.on) return;
+    // Node drag (Obsidian-like): pan only on empty stage; node down pins fx/fy.
+    let drag = null;
+    let dragMoved = false;
+    let suppressClick = false;
+
     s.on("clickNode", ({ node }) => {
+      if (suppressClick) {
+        suppressClick = false;
+        return;
+      }
       if (state.onClick) state.onClick({ id: node, node: state.nodes.get(node) });
     });
     s.on("enterNode", ({ node }) => {
+      if (!drag) state.container.style.cursor = "grab";
       const nbrs = new Set();
       state.graph.forEachNeighbor(node, (nb) => nbrs.add(nb));
       animateHighlight(state, { focus: node, neighbors: nbrs });
       if (state.onHover) state.onHover({ id: node, neighbors: [...nbrs] });
     });
     s.on("leaveNode", () => {
+      if (!drag) state.container.style.cursor = "";
       animateHighlight(state, {});
       if (state.onHover) state.onHover(null);
     });
-    // Drag (refined in 3b step 3.5) — prevent camera pan while dragging.
-    let drag = null;
-    let dragMoved = false;
     const mouseCaptor = s.getMouseCaptor && s.getMouseCaptor();
-    s.on("downNode", (e) => {
-      if (e.preventSigmaDefault) e.preventSigmaDefault();
-      drag = { id: e.node, x0: e.event.x, y0: e.event.y };
+    const touchCaptor = s.getTouchCaptor && s.getTouchCaptor();
+
+    const beginDrag = (nodeId, x, y, ev) => {
+      if (ev && ev.preventSigmaDefault) ev.preventSigmaDefault();
+      drag = { id: nodeId, x0: x, y0: y };
       dragMoved = false;
-      state.pinned.add(e.node);
+      suppressClick = false;
+      state.pinned.add(nodeId);
       state.container.style.cursor = "grabbing";
       if (state.sim) state.sim.alphaTarget(0.3).restart();
+    };
+    const moveDrag = (x, y, ev) => {
+      if (!drag) return;
+      if (ev && ev.preventSigmaDefault) ev.preventSigmaDefault();
+      const dx = (x || 0) - (drag.x0 || 0);
+      const dy = (y || 0) - (drag.y0 || 0);
+      if (Math.hypot(dx, dy) > 3) {
+        dragMoved = true;
+        suppressClick = true;
+      }
+      const pos = state.sigma.viewportToGraph ? state.sigma.viewportToGraph({ x, y }) : null;
+      if (!pos || !state.graph.hasNode(drag.id)) return;
+      state.graph.setNodeAttribute(drag.id, "x", pos.x);
+      state.graph.setNodeAttribute(drag.id, "y", pos.y);
+      if (state.sim) {
+        const n = state.sim.nodes().find((nn) => nn.id === drag.id);
+        if (n) {
+          n.fx = pos.x;
+          n.fy = pos.y;
+          n.x = pos.x;
+          n.y = pos.y;
+        }
+      }
+      state.sigma.refresh();
+    };
+    const endDrag = () => {
+      if (!drag) return;
+      const id = drag.id;
+      drag = null;
+      state.container.style.cursor = "";
+      if (state.sim) {
+        const n = state.sim.nodes().find((nn) => nn.id === id);
+        if (n) {
+          n.fx = n.x;
+          n.fy = n.y;
+        }
+        state.sim.alphaTarget(0);
+      }
+      if (dragMoved && state.onDragEnd) state.onDragEnd({ id });
+    };
+
+    s.on("downNode", (e) => {
+      const pt = e.event || {};
+      beginDrag(e.node, pt.x, pt.y, e);
     });
     if (mouseCaptor) {
-      mouseCaptor.on("mousemovebody", (e) => {
-        if (!drag) return;
-        if (e.preventSigmaDefault) e.preventSigmaDefault();
-        const dx = (e.x || 0) - (drag.x0 || 0);
-        const dy = (e.y || 0) - (drag.y0 || 0);
-        if (Math.hypot(dx, dy) > 3) dragMoved = true;
-        const pos = state.sigma.viewportToGraph
-          ? state.sigma.viewportToGraph({ x: e.x, y: e.y })
-          : null;
-        if (!pos || !state.graph.hasNode(drag.id)) return;
-        state.graph.setNodeAttribute(drag.id, "x", pos.x);
-        state.graph.setNodeAttribute(drag.id, "y", pos.y);
-        if (state.sim) {
-          const n = state.sim.nodes().find((x) => x.id === drag.id);
-          if (n) {
-            n.fx = pos.x;
-            n.fy = pos.y;
-            n.x = pos.x;
-            n.y = pos.y;
-          }
-        }
-        state.sigma.refresh();
-      });
-      mouseCaptor.on("mouseup", () => {
-        if (!drag) return;
-        const id = drag.id;
-        const wasDrag = dragMoved;
-        drag = null;
-        state.container.style.cursor = "";
-        if (state.sim) {
-          const n = state.sim.nodes().find((x) => x.id === id);
-          if (n) {
-            n.fx = n.x;
-            n.fy = n.y;
-          }
-          state.sim.alphaTarget(0);
-        }
-        dragMoved = wasDrag;
-      });
+      mouseCaptor.on("mousemovebody", (e) => moveDrag(e.x, e.y, e));
+      mouseCaptor.on("mouseup", endDrag);
     }
-    s.on("enterNode", () => {
-      if (!drag) state.container.style.cursor = "grab";
-    });
-    s.on("leaveNode", () => {
-      if (!drag) state.container.style.cursor = "";
+    if (touchCaptor) {
+      touchCaptor.on("touchmove", (e) => {
+        if (!drag) return;
+        const t = (e.touches && e.touches[0]) || e;
+        moveDrag(t.x, t.y, e);
+      });
+      touchCaptor.on("touchup", endDrag);
+    }
+    s.on("upNode", endDrag);
+    s.on("upStage", endDrag);
+    s.on("doubleClickNode", ({ node }) => {
+      state.pinned.delete(node);
+      if (state.sim) {
+        const n = state.sim.nodes().find((nn) => nn.id === node);
+        if (n) {
+          n.fx = null;
+          n.fy = null;
+        }
+      }
+      if (state.onDragEnd) state.onDragEnd({ id: node, unpinned: true });
     });
   }
 

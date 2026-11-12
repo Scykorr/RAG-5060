@@ -165,6 +165,7 @@
       edgeColor: colors.edgeColor,
       labelColor: colors.labelColor,
       onClick: ({ id, node }) => handleNodeClick(id, node),
+      onDragEnd: () => persistPositionsSoon(),
     });
     return state.view;
   }
@@ -257,8 +258,71 @@
     return null;
   }
 
+  function ensureThemeColorGroups(raw, settings) {
+    if (!settings.display || settings.display.colorByThemes === false) return;
+    if (settings.groups && settings.groups.length) return;
+    const themes = (raw.nodes || []).filter((n) => n.type === "theme");
+    if (!themes.length) return;
+    settings.groups = themes.map((n, i) => {
+      const kind = (n.attrs && n.attrs.kind) || "";
+      const grey = kind === "unthemed" || /без темы|прочее/i.test(String(n.label || ""));
+      return {
+        query: `theme:${String(n.id).replace(/^theme:/, "")}`,
+        color: grey ? "#888888" : GraphSettings.THEME_PALETTE[i % GraphSettings.THEME_PALETTE.length],
+      };
+    });
+  }
+
+  function themeColorForId(themeKey, settings) {
+    const id = String(themeKey || "").replace(/^theme:/, "");
+    const groups = settings.groups || [];
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i];
+      if (!g || !g.query) continue;
+      const m = String(g.query).match(/^theme:\s*(.+)$/i);
+      if (m && String(m[1]).replace(/^theme:/, "") === id) return g.color;
+    }
+    return null;
+  }
+
+  function defaultNodeColor(n, settings, colors) {
+    const typ = String(n.type || "work");
+    const kind = (n.attrs && n.attrs.kind) || "";
+    if (kind === "unthemed" || /без темы|прочее/i.test(String(n.label || ""))) return "#888888";
+    if (typ === "theme") {
+      return themeColorForId(n.id, settings) || GraphSettings.THEME_PALETTE[0];
+    }
+    const tid = n.theme_id || (n.attrs && n.attrs.theme_id);
+    if (tid) return themeColorForId(tid, settings) || colors.nodeColor;
+    return colors.nodeColor;
+  }
+
+  function topKEdges(edges, maxPerNode) {
+    const k = Math.max(0, Number(maxPerNode) || 0);
+    if (!k) return edges;
+    const byNode = new Map();
+    edges.forEach((e) => {
+      const w = Number(e.weight) || 0;
+      if (!byNode.has(e.source)) byNode.set(e.source, []);
+      if (!byNode.has(e.target)) byNode.set(e.target, []);
+      byNode.get(e.source).push(e);
+      byNode.get(e.target).push(e);
+    });
+    const keep = new Set();
+    byNode.forEach((list) => {
+      list
+        .slice()
+        .sort((a, b) => (Number(b.weight) || 0) - (Number(a.weight) || 0))
+        .slice(0, k)
+        .forEach((e) => keep.add(e));
+    });
+    return edges.filter((e) => keep.has(e));
+  }
+
   function filterPayload(raw, settings) {
     const f = settings.filters;
+    const colors = themeColors();
+    ensureThemeColorGroups(raw, settings);
     const nodes = [];
     const degree = new Map();
     (raw.edges || []).forEach((e) => {
@@ -280,7 +344,7 @@
       if (!f.unthemed && !themed && typ !== "theme" && typ !== "topic") return;
       const deg = degree.get(n.id) || 0;
       if (!f.orphans && deg === 0 && typ !== "theme") return;
-      const colored = colorForNode(n, settings);
+      const colored = colorForNode(n, settings) || defaultNodeColor(n, settings, colors);
       nodes.push({
         ...n,
         color: colored || undefined,
@@ -288,13 +352,23 @@
       });
     });
     const ids = new Set(nodes.map((n) => n.id));
-    const edges = (raw.edges || []).filter((e) => {
+    let edges = (raw.edges || []).filter((e) => {
       if (!ids.has(e.source) || !ids.has(e.target)) return false;
       if (!edgeTypeAllowed(e.type, f)) return false;
       if (Number(e.weight || 0) < Number(f.minWeight || 0)) return false;
       return true;
     });
+    if (state.route && state.route.level === "overview") {
+      edges = topKEdges(edges, f.maxEdgesPerNode != null ? f.maxEdgesPerNode : 4);
+    }
     return { nodes, edges, meta: raw.meta || {} };
+  }
+
+  function labelForNodeId(id) {
+    if (!id) return "";
+    const fromRaw = (state.raw && (state.raw.nodes || []).find((n) => String(n.id) === String(id))) || null;
+    if (fromRaw && fromRaw.label) return String(fromRaw.label);
+    return String(id);
   }
 
   function renderBreadcrumbs() {
@@ -302,17 +376,31 @@
     if (!el) return;
     const r = state.route;
     const parts = [`<button type="button" class="graph-crumb" data-go="overview">${t("overview")}</button>`];
-    if (r.level === "theme" || r.level === "topic" || r.level === "local") {
-      if (r.level === "theme" || (state.raw && state.raw.meta)) {
-        const themeId = r.level === "theme" ? r.id : null;
-        if (themeId) parts.push(`<span class="graph-crumb-sep">›</span><button type="button" class="graph-crumb" data-go="theme" data-id="${esc(themeId)}">${t("theme")}</button>`);
+    if (r.level === "theme" && r.id) {
+      parts.push(
+        `<span class="graph-crumb-sep">›</span><button type="button" class="graph-crumb" data-go="theme" data-id="${esc(r.id)}">${esc(
+          labelForNodeId(r.id.startsWith("theme:") ? r.id : `theme:${r.id}`)
+        )}</button>`
+      );
+    }
+    if (r.level === "topic" && r.id) {
+      const topicNode = (state.raw && (state.raw.nodes || []).find((n) => String(n.id) === String(r.id) || String(n.id) === `topic:${r.id}`)) || null;
+      const themeId = topicNode && (topicNode.theme_id || (topicNode.attrs && topicNode.attrs.theme_id));
+      if (themeId) {
+        parts.push(
+          `<span class="graph-crumb-sep">›</span><button type="button" class="graph-crumb" data-go="theme" data-id="${esc(themeId)}">${esc(
+            labelForNodeId(String(themeId).startsWith("theme:") ? themeId : `theme:${themeId}`)
+          )}</button>`
+        );
       }
+      parts.push(
+        `<span class="graph-crumb-sep">›</span><button type="button" class="graph-crumb" data-go="topic" data-id="${esc(r.id)}">${esc(
+          labelForNodeId(r.id.startsWith("topic:") ? r.id : `topic:${r.id}`)
+        )}</button>`
+      );
     }
-    if (r.level === "topic") {
-      parts.push(`<span class="graph-crumb-sep">›</span><button type="button" class="graph-crumb" data-go="topic" data-id="${esc(r.id)}">${t("topic")}</button>`);
-    }
-    if (r.level === "local") {
-      parts.push(`<span class="graph-crumb-sep">›</span><span class="graph-crumb current">${t("local")}</span>`);
+    if (r.level === "local" && r.id) {
+      parts.push(`<span class="graph-crumb-sep">›</span><span class="graph-crumb current">${esc(labelForNodeId(r.id))}</span>`);
     }
     el.innerHTML = parts.join("");
     el.querySelectorAll("[data-go]").forEach((btn) => {
@@ -350,6 +438,11 @@
   function applyToView(filtered, incremental) {
     const view = ensureView();
     if (!view) return;
+    if (state.raw) {
+      const before = (state.settings.groups || []).length;
+      ensureThemeColorGroups(state.raw, state.settings);
+      if ((state.settings.groups || []).length !== before) saveSettings();
+    }
     const colors = themeColors();
     view.setDisplay({
       nodeScale: state.settings.display.nodeScale,
@@ -361,6 +454,7 @@
       edgeColor: colors.edgeColor,
       labelColor: colors.labelColor,
       bg: colors.bg,
+      localCenterId: state.route.level === "local" ? state.route.id : null,
     });
     view.setForces(state.settings.forces);
     const k = posCacheKey();
@@ -526,6 +620,20 @@
     actions.appendChild(
       btn(t("showLocal"), () => navigate({ level: "local", id }), "primary")
     );
+    actions.appendChild(
+      btn(t("unpin"), () => {
+        state.view?.pinNode(id, false);
+        if (state.view && state.view.kind && state.view.kind() === "sigma") {
+          // clear fx/fy via setPositions without pin
+          const pos = state.view.getPositions();
+          if (pos[id]) {
+            state.view.pinNode(id, false);
+            state.view.reheat();
+          }
+        }
+        persistPositionsSoon();
+      })
+    );
     const docId = (docs[0] && docs[0].document_id) || (id.startsWith("work:") ? null : /^\w{8}-/.test(id) ? id : null);
     if (docId || (docs[0] && docs[0].title)) {
       actions.appendChild(
@@ -590,16 +698,46 @@
     box.querySelectorAll("input").forEach((el) => el.addEventListener("change", apply));
   }
 
+  function syncRangeVal(el) {
+    if (!el || !el.id) return;
+    const badge = document.querySelector(`.gs-val[data-for="${el.id}"]`);
+    if (badge) badge.textContent = el.value;
+  }
+
+  function toggleRow(id, label, checked) {
+    return `<label class="gs-row"><span title="${esc(label)}">${esc(label)}</span><input class="gs-toggle" type="checkbox" id="${id}" ${checked ? "checked" : ""}/></label>`;
+  }
+  function toggleData(attr, key, label, checked, title) {
+    return `<label class="gs-row"><span title="${esc(title || key)}">${esc(label)}</span><input class="gs-toggle" type="checkbox" ${attr}="${esc(key)}" ${checked ? "checked" : ""}/></label>`;
+  }
+  function rangeRow(id, label, min, max, step, value) {
+    return `<div class="gs-row-range"><span>${esc(label)}</span><span class="gs-val" data-for="${id}">${esc(String(value))}</span><input type="range" id="${id}" min="${min}" max="${max}" step="${step}" value="${value}" /></div>`;
+  }
+
   function buildSettingsPanel() {
     const root = document.getElementById("graph-settings-panel");
     if (!root) return;
     const s = state.settings;
     const open = s.sectionsOpen || {};
     const f = s.filters;
+    const edgeKeys = [
+      "has_topic",
+      "has_work",
+      "theme_link",
+      "topic_link",
+      "topic_knn",
+      "work_lex_similar",
+      "work_refers_to",
+      "work_shared_entity",
+      "mentions_author",
+      "contains",
+      "wrote",
+      "part_of",
+    ];
     root.innerHTML = `
       <div class="graph-settings-head">
         <strong>${t("settings")}</strong>
-        <button type="button" class="btn ghost" id="graph-settings-reset">${t("resetSettings")}</button>
+        <button type="button" class="gs-reset-icon" id="graph-settings-reset" title="${t("resetSettings")}" aria-label="${t("resetSettings")}">↺</button>
         <button type="button" class="graph-icon-btn" id="graph-settings-close" aria-label="close">×</button>
       </div>
       ${section(
@@ -609,34 +747,26 @@
         `
         <input type="search" id="gs-search" placeholder="${t("search")}" value="${esc(f.search || "")}" />
         <p class="muted tiny">${t("searchHint")}</p>
-        <div class="gs-grid">${NODE_TYPE_KEYS.map(
-          (k) => `<label class="chk"><input type="checkbox" data-nt="${k}" ${f.nodeTypes[k] !== false ? "checked" : ""}/> ${t("type_" + k)}</label>`
-        ).join("")}</div>
-        <div class="gs-grid">${[
-          ["has_topic", "структурные"],
-          ["work_lex_similar", "lex_similar"],
-          ["work_refers_to", "refers_to"],
-          ["work_shared_entity", "shared_entity"],
-          ["mentions_author", "mentions_author"],
-          ["contains", "contains"],
-          ["wrote", "wrote"],
-          ["part_of", "part_of"],
-        ]
-          .map(([k, label]) => {
-            const on = f.edgeTypes[k] === true || (f.edgeTypes[k] !== false && ["has_topic", "work_lex_similar", "work_refers_to", "work_shared_entity"].includes(k));
-            return `<label class="chk"><input type="checkbox" data-et="${k}" ${on ? "checked" : ""}/> ${label}</label>`;
+        <p class="gs-subhead">${t("nodeTypes")}</p>
+        ${NODE_TYPE_KEYS.map((k) => toggleData("data-nt", k, t("type_" + k), f.nodeTypes[k] !== false)).join("")}
+        <p class="gs-subhead">${t("edgeTypes")}</p>
+        ${edgeKeys
+          .map((k) => {
+            const on =
+              f.edgeTypes[k] === true ||
+              (f.edgeTypes[k] !== false && ["has_topic", "has_work", "theme_link", "topic_link", "topic_knn", "work_lex_similar", "work_refers_to", "work_shared_entity", "wrote"].includes(k));
+            return toggleData("data-et", k, t("edge_" + k), on, k);
           })
-          .join("")}</div>
-        <label class="chk"><input type="checkbox" id="gs-only-existing" ${f.onlyExisting ? "checked" : ""}/> ${t("onlyExisting")}</label>
-        <label class="chk"><input type="checkbox" id="gs-orphans" ${f.orphans ? "checked" : ""}/> ${t("showOrphans")}</label>
-        <label class="chk"><input type="checkbox" id="gs-unthemed" ${f.unthemed !== false ? "checked" : ""}/> ${t("showUnthemed")}</label>
-        <div class="gs-grid">
-          ${["ru", "en", "mixed", "other"].map((k) => `<label class="chk"><input type="checkbox" data-lang="${k}" ${f.langs[k] !== false ? "checked" : ""}/> ${k}</label>`).join("")}
-        </div>
-        <div class="gs-grid">
-          ${["fiction", "nonfiction", "technical", "unknown"].map((k) => `<label class="chk"><input type="checkbox" data-kind="${k}" ${f.kinds[k] !== false ? "checked" : ""}/> ${k}</label>`).join("")}
-        </div>
-        <label>${t("minWeight")} <input type="range" id="gs-min-weight" min="0" max="1" step="0.05" value="${f.minWeight || 0}" /></label>
+          .join("")}
+        ${toggleRow("gs-only-existing", t("onlyExisting"), !!f.onlyExisting)}
+        ${toggleRow("gs-orphans", t("showOrphans"), !!f.orphans)}
+        ${toggleRow("gs-unthemed", t("showUnthemed"), f.unthemed !== false)}
+        <p class="gs-subhead">${t("language")}</p>
+        ${["ru", "en", "mixed", "other"].map((k) => toggleData("data-lang", k, k, f.langs[k] !== false)).join("")}
+        <p class="gs-subhead">${t("docKind")}</p>
+        ${["fiction", "nonfiction", "technical", "unknown"].map((k) => toggleData("data-kind", k, k, f.kinds[k] !== false)).join("")}
+        ${rangeRow("gs-min-weight", t("minWeight"), 0, 1, 0.05, f.minWeight || 0)}
+        ${rangeRow("gs-max-edges", t("maxEdgesPerNode"), 1, 20, 1, f.maxEdgesPerNode != null ? f.maxEdgesPerNode : 4)}
       `
       )}
       ${section(
@@ -654,10 +784,10 @@
         t("display"),
         open.display !== false,
         `
-        <label class="chk"><input type="checkbox" id="gs-arrows" ${s.display.arrows ? "checked" : ""}/> ${t("arrows")}</label>
-        <label>${t("textFade")} <input type="range" id="gs-label-thr" min="0" max="1" step="0.05" value="${s.display.labelThreshold}" /></label>
-        <label>${t("nodeSize")} <input type="range" id="gs-node-scale" min="0.4" max="2.5" step="0.1" value="${s.display.nodeScale}" /></label>
-        <label>${t("edgeWidth")} <input type="range" id="gs-edge-scale" min="0.4" max="3" step="0.1" value="${s.display.edgeScale}" /></label>
+        ${toggleRow("gs-arrows", t("arrows"), !!s.display.arrows)}
+        ${rangeRow("gs-label-thr", t("textFade"), 0, 1, 0.05, s.display.labelThreshold)}
+        ${rangeRow("gs-node-scale", t("nodeSize"), 0.4, 2.5, 0.1, s.display.nodeScale)}
+        ${rangeRow("gs-edge-scale", t("edgeWidth"), 0.4, 3, 0.1, s.display.edgeScale)}
         <button type="button" class="btn" id="gs-animate">${t("animate")}</button>
       `
       )}
@@ -666,10 +796,10 @@
         t("forces"),
         !!open.forces,
         `
-        <label>${t("forceCenter")} <input type="range" id="gs-f-center" min="0" max="1" step="0.01" value="${s.forces.center}" /></label>
-        <label>${t("forceCharge")} <input type="range" id="gs-f-charge" min="-600" max="-20" step="10" value="${s.forces.charge}" /></label>
-        <label>${t("forceLink")} <input type="range" id="gs-f-link" min="0" max="1" step="0.05" value="${s.forces.link}" /></label>
-        <label>${t("forceDistance")} <input type="range" id="gs-f-dist" min="20" max="200" step="5" value="${s.forces.distance}" /></label>
+        ${rangeRow("gs-f-center", t("forceCenter"), 0, 1, 0.01, s.forces.center)}
+        ${rangeRow("gs-f-charge", t("forceCharge"), -600, -20, 10, s.forces.charge)}
+        ${rangeRow("gs-f-link", t("forceLink"), 0, 1, 0.05, s.forces.link)}
+        ${rangeRow("gs-f-dist", t("forceDistance"), 20, 200, 5, s.forces.distance)}
       `
       )}
     `;
@@ -761,6 +891,17 @@
       state.settings.filters.minWeight = Number(e.target.value);
       saveSettings();
       applyFiltersLive();
+      syncRangeVal(e.target);
+    });
+    document.getElementById("gs-max-edges")?.addEventListener("input", (e) => {
+      state.settings.filters.maxEdgesPerNode = Number(e.target.value);
+      saveSettings();
+      applyFiltersLive();
+      syncRangeVal(e.target);
+    });
+    root.querySelectorAll("input[type='range']").forEach((el) => {
+      el.addEventListener("input", () => syncRangeVal(el));
+      syncRangeVal(el);
     });
     document.getElementById("gs-arrows")?.addEventListener("change", (e) => {
       state.settings.display.arrows = e.target.checked;

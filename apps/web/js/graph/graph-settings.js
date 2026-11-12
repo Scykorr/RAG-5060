@@ -37,6 +37,7 @@
       langs: { ru: true, en: true, mixed: true, other: true, unknown: true },
       kinds: { fiction: true, nonfiction: true, technical: true, unknown: true },
       minWeight: 0,
+      maxEdgesPerNode: 4,
     },
     groups: [],
     display: {
@@ -45,8 +46,9 @@
       nodeScale: 1,
       edgeScale: 1,
       animate: false,
+      colorByThemes: true,
     },
-    forces: { center: 0.05, charge: -180, link: 0.4, distance: 80 },
+    forces: { center: 0.05, charge: -180, link: 0.4, distance: 80, pull: 0.04 },
     sectionsOpen: { filters: true, groups: false, display: true, forces: false },
     local: { depth: 2, incoming: true, outgoing: true, undirected: true },
   };
