@@ -27,6 +27,7 @@
   "characteristic_terms": 10,
   "central_works": 5,
   "topics_schema": 2,
+  "vector_cache_rev": "2d-1",
   "min_author_entropy": 0.5,
   "min_topic_authors": 3,
   "author_debias_alpha": 0.6,

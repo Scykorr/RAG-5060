@@ -89,7 +89,7 @@ _DEFAULTS: dict[str, Any] = {
     # Slice 2c
     "proper_noun_min_cap_ratio": 0.8,
     "proper_noun_min_n": 3,
-    "vector_cache_rev": 3,
+    "vector_cache_rev": "2d-1",
     "min_tokens_for_topic": 1500,
     "min_topic_confidence": 0.25,
     "max_unthemed_share": 0.10,

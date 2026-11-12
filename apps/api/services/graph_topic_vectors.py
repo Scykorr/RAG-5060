@@ -197,6 +197,10 @@ _PATRONYMIC_ENDINGS = (
     "иничн",
     "ьевн",
     "ьевич",
+    # Truncated OCR stems of patronymics (Васильевна → асильевн).
+    "евн",
+    "овн",
+    "ичн",
 )
 
 

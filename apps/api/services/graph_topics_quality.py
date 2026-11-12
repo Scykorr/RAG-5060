@@ -212,13 +212,13 @@ def _stem_bag(words: list[str]) -> set[str]:
 
 
 def label_is_top6_glue(label: str, top_terms: list[str], *, top_n: int = 6) -> bool:
-    """Reject «term1 и term2» when both sides are verbatim from the top-N terms."""
+    """Reject two-word «A и B» glues (esp. when both sides are from top-N terms)."""
     m = _GLUE_RE.match((label or "").strip())
     if not m:
         return False
-    left, right = m.group(1).casefold().replace("ё", "е"), m.group(2).casefold().replace("ё", "е")
-    top = {str(t or "").casefold().replace("ё", "е") for t in top_terms[:top_n] if t}
-    return left in top and right in top
+    # Slice 2d: never accept two-word «A и B» LLM titles (top-N or otherwise).
+    _ = top_terms, top_n
+    return True
 
 
 def label_grounded(
@@ -583,7 +583,23 @@ def sweep_theme_resolution(
         )
         stats = theme_affinity_stats(payload)
         n_topics = int((payload.get("stats") or {}).get("topics") or 0)
+        theme_purity = [
+            float(t.get("author_purity") or 0)
+            for t in (payload.get("themes") or [])
+            if str(t.get("service") or "") != "unthemed"
+            and str(t.get("collection") or "") != "Прочее"
+            and t.get("author_purity") is not None
+        ]
+        mean_purity = (
+            round(sum(theme_purity) / len(theme_purity), 4) if theme_purity else 0.0
+        )
         ok = (
+            stats["max_inter"] <= 0.2
+            and 4 <= stats["n_themes"] <= 10
+            and 15 <= n_topics <= 60
+            and 0.35 <= mean_purity <= 0.65
+        )
+        ok_soft = (
             stats["max_inter"] <= 0.2
             and 4 <= stats["n_themes"] <= 10
             and 15 <= n_topics <= 60
@@ -593,14 +609,18 @@ def sweep_theme_resolution(
                 "theme_resolution": res,
                 **stats,
                 "n_topics": n_topics,
+                "mean_theme_purity": mean_purity,
                 "ok": ok,
+                "ok_soft": ok_soft,
             }
         )
     rows.sort(
         key=lambda r: (
             0 if r["ok"] else 1,
+            0 if r.get("ok_soft") else 1,
             -float(r["ratio"]),
             abs(float(r["n_themes"]) - 7),
+            abs(float(r.get("mean_theme_purity") or 0) - 0.5),
             float(r["max_inter"]),
         )
     )
