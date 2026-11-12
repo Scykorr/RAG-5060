@@ -349,3 +349,36 @@
 - prevent: S61; не кэшировать vectors across index_version/rev
 - links: `graph_text_clean.normalize_homoglyphs`, `graph_index.INDEX_VERSION`
 - status: fixed
+
+## 2026-11-12 — Drag узла двигает камеру (sigma)
+- id: E-20261112-graph-drag-pan
+- symptom: зажатие на узле панорамирует сцену; граф неподвижен
+- reproduce: `#graph/overview` → mousedown на узле → move
+- root_cause: mouse captor камеры не отключён; нет fx/fy в d3-force
+- fix: `downNode` + `mousemovebody` → `preventSigmaDefault`; `viewportToGraph` → x/y + fx/fy; alphaTarget 0.3; click если сдвиг &lt;3px
+- replay: перетащить узел → соседи подтягиваются; reload → позиция из cache
+- prevent: S62; drag только в `graph-view.js`
+- links: `apps/web/js/graph/graph-view.js` wireSigmaEvents
+- status: fixed
+
+## 2026-11-12 — Скриншот WebGL пустой при живом графе
+- id: E-20261112-webgl-screenshot
+- symptom: статус «N узлов», debug sample с координатами, PNG canvas чёрный
+- reproduce: browser screenshot без preserveDrawingBuffer
+- root_cause: WebGL default `preserveDrawingBuffer=false` → buffer cleared before capture
+- fix: sigma `webGLContextOptions: { preserveDrawingBuffer: true }`
+- replay: screenshot overview показывает узлы/рёбра
+- prevent: S62
+- links: `graph-view.js` Sigma settings
+- status: fixed
+
+## 2026-11-12 — API health hang после Graph Rebuild из UI
+- id: E-20261112-graph-rebuild-block
+- symptom: `/api/health` через nginx timeout; UI «Проверка API…»; static 200
+- reproduce: клик ↻ (btn-graph-rebuild) на одноворкерном API во время rebuild
+- root_cause: долгий `POST /api/graph/rebuild` блокирует event loop
+- fix: `docker restart rag5060-api-1`; для soft refresh не вызывать rebuild
+- replay: health `{"status":"ok"}` после restart
+- prevent: S62; не путать rebuild с reload; при hang — restart api
+- links: `graph-app.js` btn-graph-rebuild
+- status: fixed

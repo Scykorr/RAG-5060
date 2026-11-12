@@ -1,3 +1,13 @@
+## 2026-11-12 — Slice 3b (Obsidian Graph polish, sigma 3)
+
+- Preflight: 2d overview labels + `kind=unthemed` («Без темы») OK
+- Step 0: sigma **3.0.2** UMD + slim d3-force stack (full d3.min.js dropped from SPA)
+- Step 1: arrow edges, hover reducers, theme-aware label plates, live ◐ `setSetting`
+- Steps 2–4: Obsidian sizes/palette/top-k, layout pull+clusters, **node drag**, settings toggles/↺
+- Step 5: perf 1500/5000 ≈60 FPS; 3000 hover 37 → hideEdgesOnMove ≥1200
+- Report `artifacts/20261112-graph-s3b/`; knowledge **S62/A27**; ROADMAP **F15.6d**
+- Note: UI ↻ rebuild can block API worker — restart api if health hangs
+
 ## 2026-11-12 — Slice 2d (homoglyph / inter / unthemed / labels)
 
 - Homoglyph Latin→Cyrillic in `clean_chunk` + tokenize; INDEX_VERSION **17**; en untouched

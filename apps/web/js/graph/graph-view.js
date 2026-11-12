@@ -273,6 +273,8 @@
       nodeProgramClasses: Object.keys(nodeProgramClasses).length ? nodeProgramClasses : undefined,
       zIndex: true,
       allowInvalidContainer: true,
+      // Keep buffer so screenshots / captureStream see the last frame.
+      webGLContextOptions: { preserveDrawingBuffer: true, antialias: true },
       defaultDrawNodeLabel: makeDrawNodeLabel(getPalette),
       defaultDrawNodeHover: makeDrawNodeHover(getPalette),
       nodeReducer: (node, data) => reduceNode(state, node, data),
@@ -659,7 +661,14 @@
     });
     applyForces(state, true);
     refreshBaseAttrs(state);
-    if (state.sigma && state.sigma.refresh) state.sigma.refresh();
+    if (state.sigma) {
+      if (state.sigma.setSetting && nodes.length >= 1200) {
+        state.sigma.setSetting("hideEdgesOnMove", true);
+      } else if (state.sigma.setSetting) {
+        state.sigma.setSetting("hideEdgesOnMove", false);
+      }
+      if (state.sigma.refresh) state.sigma.refresh();
+    }
   }
 
   function updateData(state, payload) {

@@ -410,6 +410,7 @@ Offline автоусиление ответов на корпусе (не fine-t
 - [x] F15.6a. Offline connectivity index (F04.18/a/b): layers + lifecycle + 1d quality; skills S54/S55, abilities A19/A20.
 - [x] F15.6b. Theme/topic levels API (F04.18f/g/h/i): overview levels + thematic clustering + 2c/2d cleanup; S57/S58/S59/S61, A22/A23/A24/A26; no dedicated UI tab yet.
 - [x] F15.6c. Obsidian Graph UI (Slice 3): sigma+d3-force vendor offline; levels/hash/settings/look; S60/A25; report `artifacts/20261112-graph-s3/`.
+- [x] F15.6d. Obsidian Graph polish (Slice 3b, after 2d): sigma **3.0.2** + slim d3-force; arrows/hover/contrast; Obsidian sizes/palette/top-k; node drag; settings toggles; perf fixture; S62/A27; report `artifacts/20261112-graph-s3b/`.
 - [ ] F15.7. P1/P2: real embedding ANN после N1; LLM relation detector OFF by default; entity graph.
 
 **Приёмка:** реальные рёбра из корпуса, ACL, offline UI, без CDN; chat/ingestion не сломаны.
