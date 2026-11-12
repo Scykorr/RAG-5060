@@ -411,6 +411,7 @@ def build_cluster_graph(
     work_terms: dict[str, Counter] | None = None,
     case_stats: dict[str, dict[str, int]] | None = None,
     pos_stats: dict[str, dict[str, int]] | None = None,
+    work_case_pos: dict[str, dict[str, dict[str, int]]] | None = None,
     entity_stems: set[str] | None = None,
     tenant_id: str = "",
     work_hashes: dict[str, str] | None = None,
@@ -469,6 +470,7 @@ def build_cluster_graph(
             params,
             case_stats=case_stats,
             pos_stats=pos_stats,
+            work_case_pos=work_case_pos,
             entity_stems=ents,
         )
         if tenant_id:
@@ -806,7 +808,7 @@ def _cluster_components(
     for topic in content_topics:
         topic["theme_temp"] = temp_theme.get(topic["temp"])
 
-    # Isolates → «Без темы» inside the dominant theme of their collection.
+    # Isolates → top-level «Без темы» theme (not nested under a content theme).
     iso_by_coll: dict[str, set[str]] = defaultdict(set)
     for wk in isolated:
         iso_by_coll[works[wk]["collection"]].add(wk)
@@ -826,11 +828,18 @@ def _cluster_components(
             return scores.most_common(1)[0][0]
         return None
 
+    unthemed_theme_temp = "tmp-theme:unthemed"
+    if iso_by_coll or any(t.get("service") == "unthemed" for t in topics):
+        if not any(th["temp"] == unthemed_theme_temp for th in themes):
+            themes.append(
+                {
+                    "temp": unthemed_theme_temp,
+                    "topic_temps": [],
+                    "service": "unthemed",
+                    "collection": None,
+                }
+            )
     for coll in sorted(iso_by_coll):
-        th = _dominant(coll)
-        if th is None:
-            th = f"tmp-theme:coll:{coll}"
-            themes.append({"temp": th, "topic_temps": []})
         temp = f"tmp-unthemed:{coll}"
         topics.append(
             {
@@ -838,11 +847,11 @@ def _cluster_components(
                 "work_keys": set(iso_by_coll[coll]),
                 "service": "unthemed",
                 "collection": coll,
-                "theme_temp": th,
+                "theme_temp": unthemed_theme_temp,
             }
         )
         for th_row in themes:
-            if th_row["temp"] == th:
+            if th_row["temp"] == unthemed_theme_temp:
                 th_row["topic_temps"].append(temp)
 
     # Park «Разное» on the dominant theme of that collection (or a new one).
@@ -1254,18 +1263,23 @@ def _apply_weak_membership(
                 tok = int((works.get(wk) or {}).get("token_estimate") or 0)
                 conf = gtq.topic_confidence(wk, members, adj)
                 works.setdefault(wk, {})["topic_confidence"] = round(conf, 4)
-                short = corpus_has_long and tok > 0 and tok < min_tokens
-                if short or conf < thr:
+                # Slice 2d: only confidence gates «Без темы» (short texts keep a topic if conf ok).
+                _ = tok  # token_estimate still recorded for reports
+                if conf < thr:
                     weak.append(wk)
             if len(weak) > 0.5 * len(members):
                 dissolved.append(t["id"])
-                weak_pool.extend(sorted(members))
+                for wk in sorted(members):
+                    works.setdefault(wk, {})["_best_topic"] = t["id"]
+                    weak_pool.append(wk)
                 t["work_keys"] = set()
             else:
                 for wk in weak:
                     t["work_keys"].discard(wk)
+                    works.setdefault(wk, {})["_best_topic"] = t["id"]
                     weak_pool.append(wk)
-        # Route weak works to unthemed (per collection)
+        # Route weak works to unthemed (per collection); keep best topic as secondary.
+        local_themes_base = [dict(th) for th in themes]
         for wk in weak_pool:
             coll = (works.get(wk) or {}).get("collection") or "Прочее"
             host = next(
@@ -1277,35 +1291,45 @@ def _apply_weak_membership(
                 None,
             )
             if host is None:
-                theme_id = None
-                for t in local_topics:
-                    if not t.get("theme_id") or not t["work_keys"]:
-                        continue
-                    sample = next(iter(t["work_keys"]))
-                    if (works.get(sample) or {}).get("collection") == coll:
-                        theme_id = t.get("theme_id")
-                        break
+                un_theme = next((th for th in local_themes_base if th.get("service") == "unthemed"), None)
+                if un_theme is None:
+                    un_theme = {
+                        "id": "theme:unthemed",
+                        "topic_ids": [],
+                        "service": "unthemed",
+                        "label": "Без темы",
+                    }
+                    local_themes_base.append(un_theme)
                 host = {
                     "id": alloc_topic(),
-                    "theme_id": theme_id or (themes[0]["id"] if themes else None),
+                    "theme_id": un_theme["id"],
                     "work_keys": set(),
                     "service": "unthemed",
                     "collection": coll,
                 }
                 local_topics.append(host)
-            # secondary from neighbors still in content topics
-            sec = []
+                if host["id"] not in (un_theme.get("topic_ids") or []):
+                    un_theme.setdefault("topic_ids", []).append(host["id"])
+            sec: list[dict[str, Any]] = []
+            best = (works.get(wk) or {}).get("_best_topic")
+            if best:
+                sec.append(
+                    {
+                        "topic_id": best,
+                        "score": round(float((works.get(wk) or {}).get("topic_confidence") or 0), 4),
+                    }
+                )
             for nb, w in sorted((adj.get(wk) or {}).items(), key=lambda kv: -kv[1])[:6]:
                 for t in local_topics:
                     if t.get("service") == "unthemed":
                         continue
-                    if nb in t["work_keys"]:
+                    if nb in t["work_keys"] and t["id"] != best:
                         sec.append({"topic_id": t["id"], "score": round(float(w), 4)})
                         break
                 if len(sec) >= int(params.get("secondary_max") or 2):
                     break
             host["work_keys"].add(wk)
-            works.setdefault(wk, {})["_weak_secondary"] = sec
+            works.setdefault(wk, {})["_weak_secondary"] = sec[: int(params.get("secondary_max") or 2)]
         local_topics = [t for t in local_topics if t.get("work_keys")]
         # Rebuild assignments
         new_assign: dict[str, dict[str, Any]] = {}
@@ -1322,9 +1346,9 @@ def _apply_weak_membership(
                 }
         # Refresh theme topic_ids
         local_themes = []
-        for th in themes:
+        for th in local_themes_base:
             tids = [t["id"] for t in local_topics if t.get("theme_id") == th["id"]]
-            if not tids and str(th.get("collection") or "") == "Прочее":
+            if not tids:
                 continue
             row = dict(th)
             row["topic_ids"] = tids
@@ -1336,6 +1360,7 @@ def _apply_weak_membership(
         for info in works.values():
             info.pop("_weak_secondary", None)
             info.pop("topic_confidence", None)
+            info.pop("_best_topic", None)
 
     # Lower confidence (then length gate) until unthemed share ≤ max.
     min_tok_eff = min_tokens if corpus_has_long else 0
@@ -1370,6 +1395,28 @@ def _apply_weak_membership(
     for t in final_topics:
         t["work_keys"] = sorted(t["work_keys"])
     return final_topics, final_themes, final_assign, meta
+
+
+def _label_snippets(
+    central: list[dict[str, Any]],
+    label_terms: dict[str, Counter],
+    works: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Short lexical fragments from central works (offline stand-in for page excerpts)."""
+    out: list[str] = []
+    for row in central[:5]:
+        wk = str(row.get("work_key") or "")
+        bag = label_terms.get(wk) or Counter()
+        tops = [str(t) for t, _ in bag.most_common(8) if len(str(t)) >= 4][:6]
+        if not tops:
+            title = str((works.get(wk) or {}).get("title") or wk)
+            if title:
+                out.append(title[:120])
+            continue
+        out.append(" ".join(tops)[:160])
+        if len(out) >= 3:
+            break
+    return out[:3]
 
 
 def _decorate(
@@ -1476,20 +1523,24 @@ def _decorate(
                     term_names.append(display)
                 elif stem:
                     term_names.append(stem)
-            title = topic["central_works"][0]["title"] if topic["central_works"] else None
             cache_key = hashlib.sha1(
                 ("|".join(topic["work_keys"])).encode("utf-8")
             ).hexdigest()[:16]
+            titles = [
+                f"{c['title']} — {c.get('author_key') or '—'}" for c in topic["central_works"][:5]
+            ]
+            snippets = _label_snippets(topic["central_works"], label_terms, works)
             grounded = gtq.maybe_llm_label_grounded(
                 enabled=bool(params.get("llm")),
                 model=str(params.get("llm_model") or "qwen3:8b"),
-                terms=term_names[:10],
-                titles=[c["title"] for c in topic["central_works"]],
+                terms=term_names[:15],
+                titles=titles,
                 lang=maj_lang,
                 cache_key=cache_key,
                 cache=label_cache,
                 generate=llm_generate,
                 for_theme=False,
+                snippets=snippets,
             )
             topic["term_label"] = grounded.get("term_label")
             topic["label"] = grounded["label"]
@@ -1557,8 +1608,18 @@ def _decorate(
             else None
         )
         term_names = [row["term"] for row in theme["terms"]]
-        title = theme["central_works"][0]["title"] if theme["central_works"] else None
-        # Service-only theme (just «Без темы») keeps a collection-scoped label.
+        # Top-level «Без темы» theme — fixed label; works excluded from purity/terms/central.
+        if theme.get("service") == "unthemed" or (
+            member_topics and all(t.get("service") == "unthemed" for t in member_topics)
+        ):
+            theme["service"] = "unthemed"
+            theme["label"] = "Без темы"
+            theme["label_source"] = "service"
+            theme["label_grounded"] = True
+            theme["central_works"] = []
+            theme["terms"] = []
+            theme["author_purity"] = None
+            continue
         only_service = member_topics and all(t.get("service") for t in member_topics)
         if only_service:
             theme["label"] = str(theme.get("collection") or "Прочее")
@@ -1566,22 +1627,30 @@ def _decorate(
             theme["label_grounded"] = True
         else:
             topic_labels = [
-                str(t.get("label") or "") for t in member_topics if t.get("label") and not t.get("service")
+                str(t.get("label") or "")
+                for t in member_topics
+                if t.get("label") and not t.get("service")
             ]
             cache_key = hashlib.sha1(
                 ("theme|" + "|".join(sorted(theme["topic_ids"]))).encode("utf-8")
             ).hexdigest()[:16]
+            titles = [
+                f"{c['title']} — {c.get('author_key') or '—'}" for c in theme["central_works"][:5]
+            ]
+            snippets = _label_snippets(theme["central_works"], label_terms, works)
             grounded = gtq.maybe_llm_label_grounded(
                 enabled=bool(params.get("llm")),
                 model=str(params.get("llm_model") or "qwen3:8b"),
-                terms=term_names[:10],
-                titles=[c["title"] for c in theme["central_works"]],
+                terms=term_names[:15],
+                titles=titles,
                 lang=maj_lang,
                 cache_key=cache_key,
                 cache=label_cache,
                 generate=llm_generate,
                 topic_labels=topic_labels,
                 for_theme=True,
+                snippets=snippets,
+                forbidden_labels=topic_labels,
             )
             theme["term_label"] = grounded.get("term_label")
             theme["label"] = grounded["label"]
@@ -1619,6 +1688,7 @@ def build_topics_from_index(
     surfaces: dict[str, str] | None = None,
     case_stats: dict[str, dict[str, int]] | None = None,
     pos_stats: dict[str, dict[str, int]] | None = None,
+    work_case_pos: dict[str, dict[str, dict[str, int]]] | None = None,
     force_mode: str | None = None,
     llm_generate: Callable[[str, str], str] | None = None,
     terms_source: str = "provenance",
@@ -1674,6 +1744,7 @@ def build_topics_from_index(
             work_terms=work_terms,
             case_stats=case_stats,
             pos_stats=pos_stats,
+            work_case_pos=work_case_pos,
             tenant_id=tenant_id,
             stage_ms=stage_ms,
         )
@@ -1928,15 +1999,26 @@ def build_topics_from_index(
         threshold=float(params["jaccard_match"]),
         alloc=alloc_theme,
     )
+    raw_by_temp = {str(r.get("temp")): r for r in raw_themes}
     themes = []
     for th, ids in theme_clusters:
-        themes.append({"id": theme_map[th], "temp": th, "topic_ids": sorted(ids)})
+        row = {"id": theme_map[th], "temp": th, "topic_ids": sorted(ids)}
+        src = raw_by_temp.get(th) or {}
+        if src.get("service"):
+            row["service"] = src.get("service")
+        if src.get("collection") is not None:
+            row["collection"] = src.get("collection")
+        themes.append(row)
     for topic in topics:
         th = topic.get("theme_temp")
         if th and th in theme_map:
             topic["theme_id"] = theme_map[th]
+        elif topic.get("service") == "unthemed":
+            un = next((t for t in themes if t.get("service") == "unthemed"), None)
+            topic["theme_id"] = un["id"] if un else (themes[0]["id"] if themes else None)
         elif themes:
-            topic["theme_id"] = themes[0]["id"]
+            content = next((t for t in themes if t.get("service") != "unthemed"), themes[0])
+            topic["theme_id"] = content["id"]
     lineage = {
         "trigger": trigger,
         "matched": topic_lineage["matched"],
@@ -2058,12 +2140,49 @@ def _incremental(
     confidences: list[float] = []
     new_ids: list[str] = []
     assign_targets = sorted(added | changed)
+    conf_thr = float(params.get("min_topic_confidence") or 0.25)
+    topic_by_id = {t["id"]: t for t in topics}
+
+    def _ensure_unthemed_host(coll: str) -> dict[str, Any]:
+        host = next(
+            (
+                t
+                for t in topics
+                if t.get("service") == "unthemed" and t.get("collection") == coll
+            ),
+            None,
+        )
+        if host is not None:
+            return host
+        un_theme_id = None
+        for row in previous.get("themes") or []:
+            if row.get("service") == "unthemed" or str(row.get("label") or "") == "Без темы":
+                un_theme_id = row.get("id")
+                break
+        if un_theme_id is None:
+            un_theme_id = "theme:unthemed"
+        host = {
+            "id": alloc_topic(),
+            "theme_id": un_theme_id,
+            "work_keys": set(),
+            "service": "unthemed",
+            "collection": coll,
+            "label": "Без темы",
+            "label_source": "service",
+        }
+        topics.append(host)
+        new_ids.append(host["id"])
+        return host
+
     for wk in assign_targets:
         votes: Counter[str] = Counter()
         neighbor_rows = []
         for nb, w in sorted(adj.get(wk, {}).items(), key=lambda kv: (-kv[1], kv[0])):
             tid = by_work_topic.get(nb)
             if not tid:
+                continue
+            # Unthemed must never be a neighbor-vote target.
+            if (topic_by_id.get(tid) or {}).get("service") == "unthemed":
                 continue
             votes[tid] += w
             if len(neighbor_rows) < 12:
@@ -2072,51 +2191,37 @@ def _incremental(
             owner = next(t for t in topics if t["id"] == by_work_topic[wk])
             owner["work_keys"].discard(wk)
             by_work_topic.pop(wk, None)
+        coll = works[wk]["collection"]
         if not votes:
             confidences.append(0.0)
-            coll = works[wk]["collection"]
-            host = next(
-                (
-                    t
-                    for t in topics
-                    if t.get("service") == "unthemed" and t.get("collection") == coll
-                ),
-                None,
-            )
-            if host is None:
-                # theme: dominant among this collection, else first theme
-                theme_id = None
-                scores: Counter[str] = Counter()
-                for t in topics:
-                    if not t.get("theme_id"):
-                        continue
-                    for other in t["work_keys"]:
-                        if works[other]["collection"] == coll:
-                            scores[t["theme_id"]] += 1
-                if scores:
-                    theme_id = scores.most_common(1)[0][0]
-                elif topics and topics[0].get("theme_id"):
-                    theme_id = topics[0]["theme_id"]
-                host = {
-                    "id": alloc_topic(),
-                    "theme_id": theme_id,
-                    "work_keys": set(),
-                    "service": "unthemed",
-                    "collection": coll,
-                }
-                topics.append(host)
-                new_ids.append(host["id"])
+            host = _ensure_unthemed_host(coll)
             host["work_keys"].add(wk)
             by_work_topic[wk] = host["id"]
+            works[wk]["_assign_prov"] = {
+                "mode": "incremental",
+                "neighbors": neighbor_rows,
+                "confidence": 0.0,
+                "secondary": [],
+            }
             continue
         best, best_w = votes.most_common(1)[0]
         total = sum(votes.values()) or 1.0
         conf = best_w / total
         confidences.append(conf)
+        if conf < conf_thr:
+            host = _ensure_unthemed_host(coll)
+            host["work_keys"].add(wk)
+            by_work_topic[wk] = host["id"]
+            works[wk]["_assign_prov"] = {
+                "mode": "incremental",
+                "neighbors": neighbor_rows,
+                "confidence": round(conf, 4),
+                "secondary": [{"topic_id": best, "score": round(conf, 4)}],
+            }
+            continue
         host = next(t for t in topics if t["id"] == best)
         host["work_keys"].add(wk)
         by_work_topic[wk] = best
-        # stash provenance on the work via assignments later
         works[wk]["_assign_prov"] = {
             "mode": "incremental",
             "neighbors": neighbor_rows,
@@ -2131,29 +2236,62 @@ def _incremental(
     themes = []
     for row in previous.get("themes") or []:
         tids = [tid for tid in (row.get("topic_ids") or []) if tid in live_ids]
-        # also topics that still point at this theme
         pointed = [t["id"] for t in topics if t.get("theme_id") == row.get("id")]
         tids = sorted(set(tids) | set(pointed))
         if not tids:
             continue
-        themes.append({"id": row["id"], "topic_ids": tids, "label": row.get("label")})
+        themes.append(
+            {
+                "id": row["id"],
+                "topic_ids": tids,
+                "label": row.get("label"),
+                "service": row.get("service"),
+            }
+        )
+    # Ensure a top-level unthemed theme exists when hosts were created.
+    if any(t.get("service") == "unthemed" for t in topics) and not any(
+        th.get("service") == "unthemed" for th in themes
+    ):
+        un_ids = [t["id"] for t in topics if t.get("service") == "unthemed"]
+        themes.append(
+            {
+                "id": "theme:unthemed",
+                "topic_ids": un_ids,
+                "label": "Без темы",
+                "service": "unthemed",
+            }
+        )
+        for t in topics:
+            if t.get("service") == "unthemed":
+                t["theme_id"] = "theme:unthemed"
     known_themes = {th["id"] for th in themes}
+    content_theme = next((th for th in themes if th.get("service") != "unthemed"), None)
     for topic in topics:
         if topic.get("theme_id") not in known_themes:
-            if themes:
-                topic["theme_id"] = themes[0]["id"]
-                if topic["id"] not in themes[0]["topic_ids"]:
-                    themes[0]["topic_ids"].append(topic["id"])
+            if topic.get("service") == "unthemed":
+                un = next((th for th in themes if th.get("service") == "unthemed"), None)
+                if un:
+                    topic["theme_id"] = un["id"]
+                    if topic["id"] not in un["topic_ids"]:
+                        un["topic_ids"].append(topic["id"])
+                    continue
+            if content_theme:
+                topic["theme_id"] = content_theme["id"]
+                if topic["id"] not in content_theme["topic_ids"]:
+                    content_theme["topic_ids"].append(topic["id"])
     assignments = {}
     for topic in topics:
         for wk in topic["work_keys"]:
-            prov = works[wk].pop("_assign_prov", None) or {"mode": "incremental" if wk in assign_targets else "kept"}
+            prov = works[wk].pop("_assign_prov", None) or {
+                "mode": "incremental" if wk in assign_targets else "kept"
+            }
             conf = float(prov.get("confidence") or (1.0 if wk not in assign_targets else 0.0))
             assignments[wk] = {
                 "topic_id": topic["id"],
                 "theme_id": topic["theme_id"],
                 "confidence": round(conf if wk in assign_targets else 1.0, 4),
                 "provenance": prov,
+                "secondary": list(prov.get("secondary") or []),
             }
     mean = sum(confidences) / len(confidences) if confidences else 1.0
     return {
@@ -2187,6 +2325,14 @@ def _assign_secondary(
     for wk, row in assignments.items():
         primary = row.get("topic_id")
         if not primary:
+            continue
+        # Preserve secondary chosen by weak/incremental unthemed routing.
+        if row.get("secondary"):
+            if wk in works:
+                works[wk]["secondary_topics"] = list(row["secondary"])
+            continue
+        primary_topic = next((t for t in topics if t["id"] == primary), None)
+        if primary_topic and primary_topic.get("service") == "unthemed":
             continue
         # Score other topics by neighbor weight into that topic
         scores: Counter[str] = Counter()
@@ -2375,12 +2521,16 @@ def load_terms_from_artifacts(
     set[str],
     dict[str, dict[str, int]],
     dict[str, dict[str, int]],
+    dict[str, dict[str, dict[str, int]]],
 ]:
-    """Stem counts, surfaces, legacy name stems, case_stats, pos_stats."""
+    """Stem counts, surfaces, legacy name stems, case_stats, pos_stats, work_case_pos."""
     counts: dict[str, Counter] = {wk: Counter() for wk in works}
     surface_counts: dict[str, Counter] = defaultdict(Counter)
     case_acc: dict[str, dict[str, int]] = defaultdict(lambda: {"upper": 0, "lower": 0})
     pos_acc: dict[str, dict[str, int]] = defaultdict(lambda: {"mid": 0, "sent_start": 0})
+    work_case_pos: dict[str, dict[str, dict[str, int]]] = defaultdict(
+        lambda: defaultdict(lambda: {"mid": 0, "lower": 0, "sent_start": 0})
+    )
     doc_to_work: dict[str, str] = {}
     for wk, info in works.items():
         for did in info.get("document_ids") or []:
@@ -2413,6 +2563,18 @@ def load_terms_from_artifacts(
                         slot[str(stat)] = slot.get(str(stat), 0) + int(n)
                     except (TypeError, ValueError):
                         continue
+                wslot = work_case_pos[wk][str(form)]
+                if key == "case_stats":
+                    try:
+                        wslot["lower"] += int(stats.get("lower") or 0)
+                    except (TypeError, ValueError):
+                        pass
+                else:
+                    try:
+                        wslot["mid"] += int(stats.get("mid") or 0)
+                        wslot["sent_start"] += int(stats.get("sent_start") or 0)
+                    except (TypeError, ValueError):
+                        pass
         taken = 0
         for match in _TEXT_RE.finditer(text):
             taken += 1
@@ -2438,7 +2600,11 @@ def load_terms_from_artifacts(
 
         stems, _bases = collect_lex_name_exclusions(dict(case_acc), dict(pos_acc))
         name_stems = {s for s in stems if s}
-    return counts, surfaces, name_stems, dict(case_acc), dict(pos_acc)
+    work_case_out = {
+        wk: {form: dict(stats) for form, stats in forms.items()}
+        for wk, forms in work_case_pos.items()
+    }
+    return counts, surfaces, name_stems, dict(case_acc), dict(pos_acc), work_case_out
 
 
 def _merge_label_terms(
@@ -2519,7 +2685,7 @@ def build_after_index(
         preview = _canonical_works(
             [d for d in (index.get("documents") or []) if isinstance(d, dict)]
         )
-        loaded, surfaces, name_stems, case_stats, pos_stats = load_terms_from_artifacts(
+        loaded, surfaces, name_stems, case_stats, pos_stats, work_case_pos = load_terms_from_artifacts(
             tenant_id, preview
         )
         _ = use_artifacts  # artifacts always preferred for topic vectors when present
@@ -2548,6 +2714,7 @@ def build_after_index(
             surfaces=surfaces,
             case_stats=case_stats,
             pos_stats=pos_stats,
+            work_case_pos=work_case_pos,
             # force=True means a deliberate rebuild (params/features may have changed).
             force_mode=force_mode or ("full" if force else None),
             llm_generate=llm_generate,
@@ -2711,24 +2878,14 @@ def _link_edges(
 
 
 def theme_link_weights(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """Inter-theme weights: sum of cross edges / sqrt(sizes)."""
-    assign = payload.get("assignments") or {}
-    themes = _theme_by_id(payload)
-    size = {tid: max(1, int((themes.get(tid) or {}).get("size") or 1)) for tid in themes}
-    cross: dict[tuple[str, str], float] = defaultdict(float)
-    for edge in payload.get("work_edges") or []:
-        wa = str(edge["source"])[5:]
-        wb = str(edge["target"])[5:]
-        ta = (assign.get(wa) or {}).get("theme_id")
-        tb = (assign.get(wb) or {}).get("theme_id")
-        if not ta or not tb or ta == tb:
-            continue
-        a, b = (ta, tb) if ta < tb else (tb, ta)
-        cross[(a, b)] += float(edge.get("weight") or 0)
-    weighted = {}
-    for (a, b), raw in cross.items():
-        denom = math.sqrt(size.get(a, 1) * size.get(b, 1))
-        weighted[(a, b)] = raw / denom if denom else raw
+    """Inter-theme weights = cut/min(vol) — same formula as theme_affinity_stats."""
+    from apps.api.services import graph_topics_quality as gtq
+
+    stats = gtq.theme_affinity_stats(payload)
+    weighted: dict[tuple[str, str], float] = {}
+    for key, val in (stats.get("matrix") or {}).items():
+        a, b = str(key).split("|", 1)
+        weighted[(a, b)] = float(val)
     return _link_edges(weighted, "theme_link")
 
 
@@ -2756,7 +2913,8 @@ def _topic_links(payload: dict[str, Any], *, only: set[str] | None = None) -> li
 
 
 def _theme_node(theme: dict[str, Any]) -> dict[str, Any]:
-    return _node(
+    kind = "unthemed" if theme.get("service") == "unthemed" else "theme"
+    node = _node(
         theme["id"],
         "theme",
         str(theme.get("label") or theme["id"]),
@@ -2766,6 +2924,8 @@ def _theme_node(theme: dict[str, Any]) -> dict[str, Any]:
         lang=theme.get("lang"),
         doc_kind=theme.get("doc_kind"),
         attrs={
+            "kind": kind,
+            "service": theme.get("service"),
             "terms": theme.get("terms") or [],
             "authors": theme.get("authors") or [],
             "density": theme.get("density"),
@@ -2775,6 +2935,8 @@ def _theme_node(theme: dict[str, Any]) -> dict[str, Any]:
             "central_works": theme.get("central_works") or [],
         },
     )
+    node["kind"] = kind
+    return node
 
 
 def _topic_node(topic: dict[str, Any]) -> dict[str, Any]:

@@ -416,7 +416,7 @@ def test_label_grounded_and_fallback():
         enabled=True,
         model="x",
         terms=["кавказ", "война", "отряд", "сакля", "горец"],
-        titles=["Набег"],
+        titles=["Набег — Tolstoy"],
         lang="ru",
         cache_key="t1",
         cache={},
@@ -424,23 +424,37 @@ def test_label_grounded_and_fallback():
     )
     assert out["label_source"] == "terms_fallback"
     assert out["label_grounded"] is False
+    assert "—" not in (out["label"] or "")
     assert "кавказ" in (out["label"] or "").casefold() or "войн" in (out["label"] or "").casefold()
 
+    glue = gtq.maybe_llm_label_grounded(
+        enabled=True,
+        model="x",
+        terms=["кавказ", "война", "отряд", "сакля", "горец", "аул"],
+        titles=["Набег — Tolstoy"],
+        lang="ru",
+        cache_key="t2",
+        cache={},
+        generate=lambda _p, _m: "кавказ и война",
+    )
+    assert glue["label_source"] == "terms_fallback"
+    assert glue.get("reject_reason") in {"glue_top6", "ungrounded", None} or glue["label_grounded"] is False
 
-def test_weak_short_work_goes_unthemed():
-    # Dense clique of long works + one short isolate-linked work.
+
+def test_low_confidence_work_goes_unthemed_with_secondary():
+    # Dense clique + one isolate (no edges → confidence 0 → «Без темы»).
     keys = [f"w{i}" for i in range(6)]
     docs = [_doc(k, f"Title {k}", "AuthorX" if i < 3 else "AuthorY") for i, k in enumerate(keys)]
-    edges = _clique(keys, 1.0, ["война", "кавказ", "отряд", "сакля"])
-    terms = {k: Counter({"война": 50, "кавказ": 40, "отряд": 30, "сакля": 20}) for k in keys}
-    # Make w5 short
-    terms["w5"] = Counter({"война": 2})
+    edges = _clique(keys[:5], 1.0, ["война", "кавказ", "отряд", "сакля"])
+    terms = {k: Counter({"война": 50, "кавказ": 40, "отряд": 30, "сакля": 20}) for k in keys[:5]}
+    # Distinct bag so topic_knn does not pull the isolate into the clique.
+    terms["w5"] = Counter({"пароход": 40, "билет": 30, "вокзал": 20, "каюта": 10})
     params = _params(
         topic_resolution=1.0,
         theme_resolution=1.0,
         min_topic_size=2,
-        min_tokens_for_topic=100,
-        min_topic_confidence=0.01,
+        min_tokens_for_topic=1,
+        min_topic_confidence=0.5,
         max_unthemed_share=0.5,
         llm=False,
     )
@@ -449,8 +463,19 @@ def test_weak_short_work_goes_unthemed():
         params=params,
         work_terms=terms,
     )
-    # token_estimate for w5 is 2 < 100 → unthemed or weak mode
     row = payload["assignments"]["w5"]
     topic = next(t for t in payload["topics"] if t["id"] == row["topic_id"])
-    assert topic.get("service") == "unthemed" or (row.get("provenance") or {}).get("mode") == "weak"
-    assert float(payload["stats"].get("unthemed_share") or 0) <= 0.5 + 1e-9
+    theme = next(t for t in payload["themes"] if t["id"] == row.get("theme_id"))
+    assert topic.get("service") == "unthemed"
+    assert theme.get("service") == "unthemed"
+    assert theme.get("label") == "Без темы"
+    assert 0 < float(payload["stats"].get("unthemed_share") or 0) <= 0.5 + 1e-9
+    # Content topics must not own the unthemed theme id.
+    assert all(
+        t.get("theme_id") != theme["id"]
+        for t in payload["topics"]
+        if t.get("service") != "unthemed"
+    )
+    overview = gt.view_overview(payload, limit=50)
+    un = next(n for n in overview["nodes"] if n.get("kind") == "unthemed")
+    assert un["label"] == "Без темы"
