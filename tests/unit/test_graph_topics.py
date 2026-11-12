@@ -402,3 +402,55 @@ def test_label_terms_prefer_links_over_character_names():
     assert merged["a"]["войн"] > merged["a"]["кавказ"]
     # One shared edge-term outranks a capped raw count of an unrelated stem.
     assert merged["a"]["войн"] > 6
+
+
+def test_label_grounded_and_fallback():
+    from apps.api.services import graph_topics_quality as gtq
+
+    ok, hits = gtq.label_grounded("Кавказская война", ["кавказ", "война", "отряд"])
+    assert ok is True
+    assert hits
+    bad, _ = gtq.label_grounded("Фантастический детектив", ["кавказ", "война", "отряд"])
+    assert bad is False
+    out = gtq.maybe_llm_label_grounded(
+        enabled=True,
+        model="x",
+        terms=["кавказ", "война", "отряд", "сакля", "горец"],
+        titles=["Набег"],
+        lang="ru",
+        cache_key="t1",
+        cache={},
+        generate=lambda _p, _m: "Космическая опера",
+    )
+    assert out["label_source"] == "terms_fallback"
+    assert out["label_grounded"] is False
+    assert "кавказ" in (out["label"] or "").casefold() or "войн" in (out["label"] or "").casefold()
+
+
+def test_weak_short_work_goes_unthemed():
+    # Dense clique of long works + one short isolate-linked work.
+    keys = [f"w{i}" for i in range(6)]
+    docs = [_doc(k, f"Title {k}", "AuthorX" if i < 3 else "AuthorY") for i, k in enumerate(keys)]
+    edges = _clique(keys, 1.0, ["война", "кавказ", "отряд", "сакля"])
+    terms = {k: Counter({"война": 50, "кавказ": 40, "отряд": 30, "сакля": 20}) for k in keys}
+    # Make w5 short
+    terms["w5"] = Counter({"война": 2})
+    params = _params(
+        topic_resolution=1.0,
+        theme_resolution=1.0,
+        min_topic_size=2,
+        min_tokens_for_topic=100,
+        min_topic_confidence=0.01,
+        max_unthemed_share=0.5,
+        llm=False,
+    )
+    payload = gt.build_topics_from_index(
+        _index(docs, edges),
+        params=params,
+        work_terms=terms,
+    )
+    # token_estimate for w5 is 2 < 100 → unthemed or weak mode
+    row = payload["assignments"]["w5"]
+    topic = next(t for t in payload["topics"] if t["id"] == row["topic_id"])
+    assert topic.get("service") == "unthemed" or (row.get("provenance") or {}).get("mode") == "weak"
+    assert float(payload["stats"].get("unthemed_share") or 0) <= 0.5 + 1e-9

@@ -187,6 +187,96 @@ def detect_style_stems(
     return style
 
 
+def detect_proper_nouns(
+    case_stats: dict[str, dict[str, int]] | None,
+    pos_stats: dict[str, dict[str, int]] | None,
+    *,
+    min_n: int = 3,
+    min_cap_ratio: float = 0.8,
+    entity_stems: set[str] | None = None,
+) -> tuple[set[str], list[dict[str, Any]]]:
+    """Stems with high mid-sentence capitalization → proper nouns (weight 0).
+
+    ``cap_ratio`` = mid-capital / (mid + sent_start + lower), aggregated by stem.
+    Entity stems from shared_entity are always included.
+    """
+    case_stats = case_stats or {}
+    pos_stats = pos_stats or {}
+    by_stem: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"mid": 0, "sent_start": 0, "lower": 0}
+    )
+    for form, st in case_stats.items():
+        key = str(form or "").casefold().replace("ё", "е")
+        if len(key) < 3:
+            continue
+        if any("а" <= ch <= "я" for ch in key):
+            from apps.api.services.text_entities import stem_ru
+
+            stem = stem_ru(key)
+        else:
+            stem = key
+        ps = pos_stats.get(form) or pos_stats.get(key) or {}
+        slot = by_stem[stem]
+        slot["mid"] += int(ps.get("mid") or 0)
+        slot["sent_start"] += int(ps.get("sent_start") or 0)
+        slot["lower"] += int(st.get("lower") or 0)
+    proper: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    for stem, bag in by_stem.items():
+        mid = int(bag["mid"])
+        start = int(bag["sent_start"])
+        low = int(bag["lower"])
+        total = mid + start + low
+        if total <= 0:
+            continue
+        # Spec: mid-sentence capitals / all mentions.
+        ratio = mid / total
+        # Dialogue-heavy person names are often capitalized at line start
+        # (sent_start≫mid) but almost never lowercase — still proper nouns.
+        upperish = (mid + start) / total
+        is_proper = False
+        source = "cap_ratio"
+        if total >= min_n and ratio >= min_cap_ratio:
+            is_proper = True
+        elif (
+            total >= min_n
+            and mid >= min_n
+            and low <= max(1, int(0.05 * total))
+            and upperish >= 0.9
+        ):
+            is_proper = True
+            source = "cap_dialogue"
+            ratio = upperish
+        if is_proper:
+            proper.add(stem)
+            rows.append(
+                {
+                    "stem": stem,
+                    "cap_ratio": round(ratio, 4),
+                    "n": total,
+                    "mid": mid,
+                    "source": source,
+                }
+            )
+    for stem in entity_stems or ():
+        s = str(stem or "").casefold().replace("ё", "е")
+        if len(s) < 4:
+            continue
+        if any("а" <= ch <= "я" for ch in s):
+            from apps.api.services.text_entities import stem_ru
+
+            s = stem_ru(s)
+        if len(s) < 4:
+            continue
+        if s not in proper:
+            proper.add(s)
+            rows.append(
+                {"stem": s, "cap_ratio": None, "n": None, "mid": None, "source": "entity"}
+            )
+    rows.sort(key=lambda r: (-(float(r["cap_ratio"]) if r["cap_ratio"] is not None else 1.1), str(r["stem"])))
+    return proper, rows
+
+
 def thematic_weight(
     stem: str,
     *,
@@ -194,6 +284,7 @@ def thematic_weight(
     entropy_info: dict[str, Any] | None,
     style_stops: frozenset[str],
     auto_style: set[str],
+    proper_nouns: set[str],
     min_author_entropy: float,
     min_authors: int,
     apply_entropy: bool,
@@ -202,6 +293,13 @@ def thematic_weight(
     s = (stem or "").casefold().replace("ё", "е")
     if len(s) < 4:
         return 0.0
+    if s in proper_nouns:
+        return 0.0
+    if any("а" <= ch <= "я" for ch in s):
+        from apps.api.services.text_entities import stem_ru
+
+        if stem_ru(s) in proper_nouns:
+            return 0.0
     if s in style_stops or s in auto_style:
         return 0.0
     if lang.startswith("ru") and is_ru_gerund_or_archaic(s):
@@ -221,12 +319,17 @@ def build_raw_vectors(
     works: dict[str, dict[str, Any]],
     *,
     params: dict[str, Any],
+    case_stats: dict[str, dict[str, int]] | None = None,
+    pos_stats: dict[str, dict[str, int]] | None = None,
+    entity_stems: set[str] | None = None,
 ) -> tuple[dict[str, dict[str, float]], dict[str, Any]]:
     """TF-log vectors with thematic filters. Returns vectors + debug stats."""
     min_ent = float(params.get("min_author_entropy") or 0.5)
     min_authors = int(params.get("min_topic_authors") or 3)
     term_cap = int(params.get("topic_term_cap") or 2000)
     pre_top = int(params.get("topic_raw_top_k") or 800)
+    min_cap = float(params.get("proper_noun_min_cap_ratio") or 0.8)
+    min_cap_n = int(params.get("proper_noun_min_n") or 3)
     # Cap hapax-heavy novel bags before entropy/style/weighting.
     capped: dict[str, Counter] = {}
     for wk, counts in work_terms.items():
@@ -244,6 +347,13 @@ def build_raw_vectors(
         "en": style_stopwords("en"),
     }
     auto_style = detect_style_stems(capped, works)
+    proper_nouns, proper_rows = detect_proper_nouns(
+        case_stats,
+        pos_stats,
+        min_n=min_cap_n,
+        min_cap_ratio=min_cap,
+        entity_stems=entity_stems,
+    )
     low_entropy: list[tuple[float, str, int]] = []
     for stem, info in entropy.items():
         low_entropy.append((float(info["entropy"]), stem, int(info["n_authors"])))
@@ -252,6 +362,7 @@ def build_raw_vectors(
     vectors: dict[str, dict[str, float]] = {}
     kept = 0
     dropped_style = 0
+    dropped_proper = 0
     for wk, counts in capped.items():
         lang = str((works.get(wk) or {}).get("language") or "ru")
         stops = style_by_lang["en"] if lang.startswith("en") else style_by_lang["ru"]
@@ -264,12 +375,22 @@ def build_raw_vectors(
                 entropy_info=info,
                 style_stops=stops,
                 auto_style=auto_style,
+                proper_nouns=proper_nouns,
                 min_author_entropy=min_ent,
                 min_authors=min_authors,
                 apply_entropy=apply_entropy,
             )
             if mult <= 0:
-                dropped_style += 1
+                key = str(stem).casefold().replace("ё", "е")
+                stemmed = key
+                if any("а" <= ch <= "я" for ch in key):
+                    from apps.api.services.text_entities import stem_ru
+
+                    stemmed = stem_ru(key)
+                if key in proper_nouns or stemmed in proper_nouns:
+                    dropped_proper += 1
+                else:
+                    dropped_style += 1
                 continue
             w = (1.0 + math.log(1.0 + float(tf))) * mult
             if w > 0:
@@ -285,8 +406,12 @@ def build_raw_vectors(
         "low_entropy_top20": [
             {"stem": s, "entropy": e, "n_authors": n} for e, s, n in low_entropy[:20]
         ],
+        "proper_nouns_top30": proper_rows[:30],
+        "proper_nouns_all": sorted(proper_nouns),
+        "proper_nouns_n": len(proper_nouns),
         "kept_weights": kept,
         "dropped_style_hits": dropped_style,
+        "dropped_proper_hits": dropped_proper,
         "style_stop_ru_n": len(style_by_lang["ru"]),
         "topic_term_cap": term_cap,
         "topic_raw_top_k": pre_top,
@@ -466,13 +591,46 @@ def prune_vector(vec: dict[str, float], top_k: int) -> dict[str, float]:
     return _normalize(dict(top))
 
 
+def filter_config_hash(params: dict[str, Any]) -> str:
+    """Stable hash of vector-filter knobs (cache key component)."""
+    import hashlib
+    import json
+
+    keys = (
+        "min_author_entropy",
+        "min_topic_authors",
+        "author_debias_alpha",
+        "topic_term_cap",
+        "topic_raw_top_k",
+        "topic_vector_top_k",
+        "proper_noun_min_cap_ratio",
+        "proper_noun_min_n",
+        "vector_cache_rev",
+        "topics_schema",
+    )
+    payload = {k: params.get(k) for k in keys}
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
+
+
 def build_topic_vectors(
     work_terms: dict[str, Counter],
     works: dict[str, dict[str, Any]],
     params: dict[str, Any],
+    *,
+    case_stats: dict[str, dict[str, int]] | None = None,
+    pos_stats: dict[str, dict[str, int]] | None = None,
+    entity_stems: set[str] | None = None,
 ) -> dict[str, Any]:
     """Full pipeline: filter → debias → normalize. Debug included."""
-    raw, debug = build_raw_vectors(work_terms, works, params=params)
+    raw, debug = build_raw_vectors(
+        work_terms,
+        works,
+        params=params,
+        case_stats=case_stats,
+        pos_stats=pos_stats,
+        entity_stems=entity_stems,
+    )
     alpha = float(params.get("author_debias_alpha") or 0.6)
     vectors = author_debias(raw, works, alpha=alpha)
     top_k = int(params.get("topic_vector_top_k") or 400)
@@ -486,9 +644,11 @@ def build_topic_vectors(
         chunk_threshold=int(params.get("segment_chunk_threshold") or 20),
         top_n=int(params.get("segment_top_terms") or 3),
     )
+    debug["filter_config_hash"] = filter_config_hash(params)
     return {
         "vectors": vectors,
         "debug": debug,
         "segment_terms": segments,
         "alpha": alpha,
+        "proper_nouns": set(debug.get("proper_nouns_all") or []),
     }

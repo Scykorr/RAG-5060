@@ -294,3 +294,25 @@
 - prevent: S58; в отчётах/smoke не вызывать `build_index_for_tenant` ради topics
 - links: `graph_topic_vectors.author_debias`, `graph_topics_report.py`, `graph_index._with_topics`
 - status: fixed
+
+## 2026-11-12 — имена героев в терминах тематик
+- id: E-20261112-topics-proper-nouns
+- symptom: top‑термины «хлестаков, нина, раскольников, федя»; кластеры по персонажам
+- reproduce: report gen11 / early 2c — mid‑cap ratio занижен из‑за dialogue sent_start≫mid
+- root_cause: `cap_ratio=mid/(mid+start+lower)` пропускает имена в репликах; entity ban слишком широкий/не stemmed
+- fix: dialogue heuristic (upperish≥0.9, mid≥min_n, almost no lower); entity → person/place + stem; proper вес 0 в vectors/labels
+- replay: `pytest …::test_proper_noun_*`; report `artifacts/20261112-064335-topics/` no_proper_in_top6
+- prevent: S59; не банить нарицательные (казаки/батареи/учения/станица)
+- links: `graph_topic_vectors.detect_proper_nouns`, `graph_topics_quality.entity_stems_from_index`
+- status: fixed
+
+## 2026-11-12 — recluster/labels ~100s при llm=false
+- id: E-20261112-topics-labels-slow
+- symptom: recluster_demo ~100s даже с `llm=False` и cache hit vectors
+- reproduce: `_decorate` → `_thematic_label_terms` заново считает entropy+weight на всех bags (~94s)
+- root_cause: label path повторял полный thematic filter вместо reuse `vector_debug.auto_style` + proper set
+- fix: быстрый label filter (proper/style/gerund, top_k bag); vec_cache по filter_config_hash; stage_ms
+- replay: recluster ~3s, cached_full ~2s в `artifacts/20261112-064335-topics/`
+- prevent: S59; не звать полный entropy в decorate
+- links: `graph_topics._thematic_label_terms`, `graph_topics_quality.vec_cache`
+- status: fixed

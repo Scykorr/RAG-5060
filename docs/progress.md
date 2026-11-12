@@ -1,3 +1,10 @@
+## 2026-11-12 — Slice 2c (proper nouns, weak texts, grounded labels, cache)
+
+- Proper/dialogue cap + entity person/place ban; weak/short → «Без темы» (unthemed≤10%); theme_resolution 1.3; grounded LLM labels; vec_cache + stage_ms
+- α=0.6 / same_author_factor=0.35 unchanged
+- Report `artifacts/20261112-064335-topics/` **PASS** (purity 0.36, groups 3/3, recluster 3.2s, overlap 1.0)
+- Knowledge: **S59**, **A24**, E-topics-proper / labels-slow; ROADMAP **F04.18h**; mirrors `Обучение/docs/*`
+
 ## 2026-11-11 — Slice 2b (thematic vectors, not author folders)
 
 - Report: `artifacts/20261112-052018-topics/`

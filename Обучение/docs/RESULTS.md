@@ -48,3 +48,8 @@
 | Graph topics 2b | 1 | corpus | lex_same_author_share | 0.346 | ≪1 | PASS | artifacts/20261112-052018-topics |
 | Graph topics 2b | 1 | corpus | expectations_groups | 3/3 | ≥2/3 | PASS | artifacts/20261112-052018-topics |
 | Graph topics 2b | 1 | corpus | recluster_overlap | 1.0 | ≥0.9 | PASS | artifacts/20261112-052018-topics |
+| Graph topics 2c | 1 | corpus | acceptance_all | PASS | PASS | PASS | artifacts/20261112-064335-topics |
+| Graph topics 2c | 1 | corpus | theme_purity_mean | 0.362 | 0.35–0.65 | PASS | artifacts/20261112-064335-topics |
+| Graph topics 2c | 1 | corpus | expectations_groups | 3/3 | 3/3 | PASS | artifacts/20261112-064335-topics |
+| Graph topics 2c | 1 | corpus | recluster_ms | 3204 | ≤30000 | PASS | artifacts/20261112-064335-topics |
+| Graph topics 2c | 1 | corpus | cached_full_ms | 2262 | ≤30000 | PASS | artifacts/20261112-064335-topics |

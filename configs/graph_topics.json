@@ -1,5 +1,5 @@
 {
-  "_note": "Offline topic/theme clustering. Slice 2b: thematic vectors, not raw work_lex_similar.",
+  "_note": "Offline topic/theme clustering. Slice 2b/2c: thematic vectors + proper-noun/weak-work cleanup.",
   "edge_type_weights": {
     "topic_knn": 1.0,
     "work_refers_to": 1.9,
@@ -11,7 +11,7 @@
   "weak_factor": 0.5,
   "min_edge_weight": 0.02,
   "topic_resolution": 2.6,
-  "theme_resolution": 1.0,
+  "theme_resolution": 1.3,
   "min_topic_size": 3,
   "recluster_threshold": 0.2,
   "assign_confidence_min": 0.34,
@@ -40,5 +40,11 @@
   "segment_top_terms": 3,
   "topic_term_cap": 2000,
   "topic_raw_top_k": 800,
-  "topic_vector_top_k": 400
+  "topic_vector_top_k": 400,
+  "proper_noun_min_cap_ratio": 0.8,
+  "proper_noun_min_n": 3,
+  "vector_cache_rev": 3,
+  "min_tokens_for_topic": 1500,
+  "min_topic_confidence": 0.25,
+  "max_unthemed_share": 0.10
 }

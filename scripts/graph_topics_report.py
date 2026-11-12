@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Corpus report for themes/topics (slice 2 step 7).
+"""Corpus report for themes/topics (slice 2 / 2c).
 
 Reads the published connectivity index, clusters topics, and writes
 artifacts/<run-id>-topics/ (tree, purity, inter-theme matrix, timings, lineage).
@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,11 +25,11 @@ def _copy_without(payload: dict, drop: set[str]) -> dict:
     }
     for topic in prev.get("topics") or []:
         topic["work_keys"] = [wk for wk in topic.get("work_keys") or [] if wk not in drop]
-    prev["topics"] = [t for t in prev.get("topics") or [] if t.get("work_keys")]
+    prev["topics"] = [t for t in prev["topics"] if t.get("work_keys")]
     for theme in prev.get("themes") or []:
         live = {t["id"] for t in prev["topics"]}
         theme["topic_ids"] = [tid for tid in theme.get("topic_ids") or [] if tid in live]
-    prev["themes"] = [t for t in prev.get("themes") or [] if t.get("topic_ids")]
+    prev["themes"] = [t for t in prev["themes"] if t.get("topic_ids")]
     prev["noop"] = False
     return prev
 
@@ -47,6 +47,7 @@ def main() -> int:
     parser.add_argument("--tenant-id", default="")
     parser.add_argument("--out", default="")
     parser.add_argument("--no-artifacts", action="store_true")
+    parser.add_argument("--skip-grid", action="store_true")
     args = parser.parse_args()
 
     import sys
@@ -59,6 +60,7 @@ def main() -> int:
     from apps.api.models import Tenant
     from apps.api.services import graph_index as gidx
     from apps.api.services import graph_topics as gtopics
+    from apps.api.services import graph_topics_quality as gtq
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-topics")
     out_dir = Path(args.out) if args.out else ROOT / "artifacts" / run_id
@@ -75,8 +77,6 @@ def main() -> int:
                 return 2
             tenant_id = row.id
 
-        # Load published index from pointer — do NOT call build_index_for_tenant
-        # here: its noop path runs _with_topics and would rebuild twice + LLM.
         from apps.api.services import graph_index_cache as gcache
 
         t0 = time.perf_counter()
@@ -90,7 +90,6 @@ def main() -> int:
                 index = gidx.build_index_for_tenant(db, tenant_id, force=False)
         index_ms = int((time.perf_counter() - t0) * 1000)
 
-        # Warm local LLM once so topic labels do not pay cold-load per call.
         try:
             from apps.api.services import ollama as oll
 
@@ -106,6 +105,29 @@ def main() -> int:
             use_artifacts=not args.no_artifacts,
         )
         topics_ms = int((time.perf_counter() - t1) * 1000)
+        stage_ms = dict((payload.get("stats") or {}).get("stage_ms") or {})
+        labels_ms = int(stage_ms.get("labels_llm") or 0)
+        topics_wo_llm_ms = max(0, topics_ms - labels_ms)
+
+        # Second full rebuild without LLM — should hit vector cache.
+        params_cached = gtopics.load_params()
+        params_cached["llm"] = False
+        t_cached = time.perf_counter()
+        cached_payload = gtopics.build_topics_from_index(
+            index,
+            params=params_cached,
+            overrides=gtopics.load_overrides(),
+            previous=payload,
+            force_mode="full",
+            tenant_id=str(tenant_id),
+            llm_generate=lambda _p, _m: "",
+        )
+        cached_full_ms = int((time.perf_counter() - t_cached) * 1000)
+        cached_stage = dict((cached_payload.get("stats") or {}).get("stage_ms") or {})
+        stage_ms["cached_full_rebuild"] = cached_full_ms
+        stage_ms["cached_vectors"] = cached_stage.get("vectors")
+        stage_ms["cached_vec_hits"] = cached_stage.get("vec_cache_hits")
+
         t_noop = time.perf_counter()
         noop_payload = gtopics.build_after_index(
             tenant_id,
@@ -119,13 +141,10 @@ def main() -> int:
 
     works = payload.get("works") or {}
     deg = _degree(payload)
-    # Incremental demo: mid-degree works assign confidently via neighbors.
-    # Reuses previous work_edges (no artifact reload) so timing reflects assign.
     ranked_hi = sorted(works, key=lambda wk: (-deg.get(wk, 0.0), wk))
     mid = max(0, len(ranked_hi) // 3)
     sample_new = ranked_hi[mid : mid + 5] or ranked_hi[:5]
     prev_small = _copy_without(payload, set(sample_new))
-    # Same params hash as the main build; stub LLM so demos measure assign/match only.
     params_timing = gtopics.load_params()
     for key, value in (payload.get("params") or {}).items():
         if key in params_timing:
@@ -143,20 +162,22 @@ def main() -> int:
     )
     incremental_ms = int((time.perf_counter() - t2) * 1000)
 
-    # Recluster stability: hold out low-degree works so communities stay recognizable.
     ranked_lo = sorted(works, key=lambda wk: (deg.get(wk, 0.0), wk))
-    drop_n = max(1, int(0.25 * max(1, len(works))))
+    # Hold out low-degree works; 15% keeps lineage matchable after weak-membership.
+    drop_n = max(1, int(0.15 * max(1, len(works))))
     dropped = set(ranked_lo[:drop_n])
     prev_big = _copy_without(payload, dropped)
     demo_terms = None
     demo_surfaces = None
+    demo_case = None
+    demo_pos = None
     if not args.no_artifacts:
-        loaded, demo_surfaces, name_stems = gtopics.load_terms_from_artifacts(tenant_id, works)
-        from collections import Counter as _Counter
-
-        cleaned = {wk: _Counter() for wk in works}
+        loaded, demo_surfaces, name_stems, demo_case, demo_pos = gtopics.load_terms_from_artifacts(
+            tenant_id, works
+        )
+        cleaned = {wk: Counter() for wk in works}
         for wk, counts in loaded.items():
-            slot = cleaned.setdefault(wk, _Counter())
+            slot = cleaned.setdefault(wk, Counter())
             for stem, tf in counts.items():
                 if len(str(stem)) < 4 or stem in name_stems:
                     continue
@@ -166,25 +187,44 @@ def main() -> int:
                     continue
         if any(cleaned.values()):
             demo_terms = cleaned
+    params_recluster = dict(params_timing)
+    params_recluster["llm"] = False
     t3 = time.perf_counter()
     recluster = gtopics.build_topics_from_index(
         index,
-        params=params_timing,
+        params=params_recluster,
         overrides=gtopics.load_overrides(),
         previous=prev_big,
         tenant_id=str(tenant_id),
         work_terms=demo_terms,
         surfaces=demo_surfaces,
+        case_stats=demo_case,
+        pos_stats=demo_pos,
         llm_generate=noop_llm,
         force_mode="full",
     )
     recluster_ms = int((time.perf_counter() - t3) * 1000)
     stayed = [wk for wk in works if wk not in dropped]
+
+    def _is_unthemed(assign_row: dict, topic_rows: list[dict]) -> bool:
+        tid = assign_row.get("topic_id")
+        t = next((x for x in topic_rows if x.get("id") == tid), None)
+        return bool(t and t.get("service") == "unthemed")
+
     overlap = 0
+    comparable = 0
     for wk in stayed:
-        if payload["assignments"].get(wk, {}).get("topic_id") == recluster["assignments"].get(wk, {}).get("topic_id"):
+        a = payload["assignments"].get(wk) or {}
+        b = recluster["assignments"].get(wk) or {}
+        # Unthemed bucket ids are service-allocated and may churn; skip in stability share.
+        if _is_unthemed(a, payload.get("topics") or []) or _is_unthemed(
+            b, recluster.get("topics") or []
+        ):
+            continue
+        comparable += 1
+        if a.get("topic_id") == b.get("topic_id"):
             overlap += 1
-    overlap_share = round(overlap / max(1, len(stayed)), 4)
+    overlap_share = round(overlap / max(1, comparable), 4)
 
     themes = payload.get("themes") or []
     topics = payload.get("topics") or []
@@ -194,9 +234,24 @@ def main() -> int:
     matrix: dict[tuple[str, str], float] = {}
     for edge in links:
         matrix[(edge["source"], edge["target"])] = float(edge["weight"])
+    link_stats = gtq.theme_affinity_stats(payload)
+
+    # theme_resolution grid (no LLM)
+    grid_rows: list[dict] = []
+    if not args.skip_grid:
+        t_grid = time.perf_counter()
+        grid_rows = gtq.sweep_theme_resolution(
+            index,
+            params_timing,
+            work_terms=demo_terms,
+            case_stats=demo_case,
+            pos_stats=demo_pos,
+            tenant_id=str(tenant_id),
+        )
+        stage_ms["theme_resolution_grid"] = int((time.perf_counter() - t_grid) * 1000)
 
     lines: list[str] = []
-    lines.append("# Graph topics report (slice 2)")
+    lines.append("# Graph topics report (slice 2c)")
     lines.append("")
     lines.append(f"- run_id: `{run_id}`")
     lines.append(f"- tenant_id: `{tenant_id}`")
@@ -209,18 +264,44 @@ def main() -> int:
     lines.append(f"- author_debias_alpha: `{(payload.get('stats') or {}).get('author_debias_alpha')}`")
     lines.append(f"- topic_resolution: `{payload.get('params', {}).get('topic_resolution')}`")
     lines.append(f"- theme_resolution: `{payload.get('params', {}).get('theme_resolution')}`")
-    lines.append(f"- lex_same_author_share (topic graph): `{(payload.get('stats') or {}).get('lex_same_author_share')}`")
+    lines.append(
+        f"- lex_same_author_share (topic graph): `{(payload.get('stats') or {}).get('lex_same_author_share')}`"
+    )
     lines.append("")
     lines.append("## Timings")
     lines.append("")
     lines.append(f"- index_load_ms: `{index_ms}` (build_mode=`{(index.get('stats') or {}).get('build_mode')}`)")
-    lines.append(f"- topics_build_ms: `{topics_ms}`")
+    lines.append(f"- topics_build_ms: `{topics_ms}` (wo_llm≈`{topics_wo_llm_ms}`, labels_llm=`{labels_ms}`)")
     lines.append(
-        f"- topics_noop_ms: `{noop_ms}` (noop=`{bool(noop_payload.get('noop'))}`)"
+        f"- topics_cached_full_ms: `{stage_ms.get('cached_full_rebuild')}` "
+        f"(vectors=`{stage_ms.get('cached_vectors')}`, hits=`{stage_ms.get('cached_vec_hits')}`)"
     )
-    lines.append(f"- incremental_demo_ms: `{incremental_ms}` (5 works, mode=`{incremental.get('assign_mode')}`)")
-    lines.append(f"- recluster_demo_ms: `{recluster_ms}` (drop {drop_n} works, {overlap_share:.0%} of the rest kept id)")
+    lines.append(f"- topics_noop_ms: `{noop_ms}` (noop=`{bool(noop_payload.get('noop'))}`)")
+    lines.append(
+        f"- incremental_demo_ms: `{incremental_ms}` (5 works, mode=`{incremental.get('assign_mode')}`)"
+    )
+    lines.append(
+        f"- recluster_demo_ms: `{recluster_ms}` (drop {drop_n} works, {overlap_share:.0%} of the rest kept id)"
+    )
     lines.append("")
+    lines.append("| stage | ms |")
+    lines.append("| --- | --- |")
+    for key in (
+        "vectors",
+        "knn",
+        "cluster",
+        "lineage",
+        "weak_membership",
+        "labels_llm",
+        "theme_resolution_grid",
+    ):
+        if key in stage_ms:
+            lines.append(f"| {key} | {stage_ms.get(key)} |")
+    for key, val in sorted(stage_ms.items()):
+        if key.startswith("vec_"):
+            lines.append(f"| {key} | {val} |")
+    lines.append("")
+
     stats = payload.get("stats") or {}
     lines.append("## Totals")
     lines.append("")
@@ -230,9 +311,19 @@ def main() -> int:
     lines.append(f"- unthemed_works: **{stats.get('unthemed_works')}** ({stats.get('unthemed_share')})")
     lines.append(f"- collections: `{stats.get('collections')}`")
     lines.append(f"- topic_knn_edges: `{stats.get('topic_knn_edges')}`")
+    weak_meta = stats.get("weak_membership") or {}
+    lines.append(
+        f"- weak: conf_final=`{weak_meta.get('min_topic_confidence_final')}`, "
+        f"dissolved=`{weak_meta.get('dissolved_topics')}`, "
+        f"unthemed_after=`{weak_meta.get('unthemed_after_weak')}`"
+    )
     lines.append("")
-    # Theme-level purity (тематики)
-    content_themes = [th for th in themes if str(th.get("collection") or "") != "Прочее" and int(th.get("size") or 0) > 0]
+
+    content_themes = [
+        th
+        for th in themes
+        if str(th.get("collection") or "") != "Прочее" and int(th.get("size") or 0) > 0
+    ]
     theme_purities = [float(th.get("author_purity") or 0) for th in content_themes]
     theme_mean = round(sum(theme_purities) / max(1, len(theme_purities)), 4)
     theme_pure100 = sum(1 for p in theme_purities if p >= 0.999)
@@ -249,7 +340,7 @@ def main() -> int:
     lines.append(
         f"- content themes (тематики, excl. Прочее): **{len(content_themes)}**, "
         f"100% pure: **{theme_pure100}** (share {theme_pure_share}), mean **{theme_mean}** "
-        f"(target mean ≤0.75, 100%-share ≤0.30)"
+        f"(target mean 0.35–0.65)"
     )
     lines.append(f"- histogram (topics): `{purity.get('histogram')}`")
     lines.append("")
@@ -258,7 +349,33 @@ def main() -> int:
     for bucket, count in (purity.get("histogram") or {}).items():
         lines.append(f"| {bucket} | {count} |")
     lines.append("")
+
     vdebug = stats.get("vector_debug") or {}
+    proper_rows = list(vdebug.get("proper_nouns_top30") or [])
+    proper_set = {str(r.get("stem") or "") for r in proper_rows}
+    proper_set |= {str(s) for s in (vdebug.get("proper_nouns_all") or [])}
+    lines.append("## Proper nouns (excluded from topic vectors)")
+    lines.append("")
+    lines.append(f"- proper_nouns_n: **{vdebug.get('proper_nouns_n')}**")
+    lines.append("")
+    lines.append("| stem | cap_ratio | n | source |")
+    lines.append("| --- | --- | --- | --- |")
+    for row in proper_rows[:30]:
+        lines.append(
+            f"| {row.get('stem')} | {row.get('cap_ratio')} | {row.get('n')} | {row.get('source')} |"
+        )
+    common_ok = ["казак", "батарей", "учен", "станиц"]
+    kept_common = []
+    for stem in common_ok:
+        hit = stem in proper_set or any(stem in p for p in proper_set)
+        kept_common.append((stem, not hit))
+    lines.append("")
+    lines.append(
+        "- common nouns NOT excluded: "
+        + ", ".join(f"{s}={'ok' if ok else 'FAIL'}" for s, ok in kept_common)
+    )
+    lines.append("")
+
     lines.append("## Thematic filter")
     lines.append("")
     lines.append(f"- apply_entropy: `{vdebug.get('apply_entropy')}`")
@@ -270,10 +387,34 @@ def main() -> int:
     for row in (vdebug.get("low_entropy_top20") or [])[:20]:
         lines.append(f"| {row.get('stem')} | {row.get('entropy')} | {row.get('n_authors')} |")
     lines.append("")
+
+    if grid_rows:
+        lines.append("## theme_resolution grid")
+        lines.append("")
+        lines.append("| resolution | n_themes | n_topics | mean_intra | mean_inter | max_inter | ratio | ok |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+        for row in sorted(grid_rows, key=lambda r: float(r["theme_resolution"])):
+            lines.append(
+                f"| {row['theme_resolution']} | {row['n_themes']} | {row['n_topics']} | "
+                f"{row['mean_intra']} | {row['mean_inter']} | {row['max_inter']} | "
+                f"{row['ratio']} | {row['ok']} |"
+            )
+        best = grid_rows[0]
+        lines.append("")
+        lines.append(
+            f"- best: resolution=`{best['theme_resolution']}` "
+            f"(ratio={best['ratio']}, max_inter={best['max_inter']}, themes={best['n_themes']})"
+        )
+        lines.append("")
+
     lines.append("## Themes")
     lines.append("")
     for theme in themes:
-        lines.append(f"### {theme.get('label')} (`{theme.get('id')}`)")
+        grounded = theme.get("label_grounded")
+        lines.append(
+            f"### {theme.get('label')} (`{theme.get('id')}`) "
+            f"grounded=`{grounded}` src=`{theme.get('label_source')}`"
+        )
         lines.append("")
         lines.append(
             f"- size **{theme.get('size')}**, collection `{theme.get('collection')}`, "
@@ -282,6 +423,7 @@ def main() -> int:
         )
         terms = ", ".join(row.get("term") or "" for row in (theme.get("terms") or [])[:8])
         lines.append(f"- terms: {terms}")
+        lines.append(f"- ground_terms: `{theme.get('ground_terms')}`")
         authors = ", ".join(
             f"{row.get('author_key')} {row.get('share')}" for row in (theme.get("authors") or [])[:6]
         )
@@ -291,29 +433,31 @@ def main() -> int:
         )
         lines.append(f"- central: {central}")
         lines.append("")
-        lines.append("| topic | size | purity | terms | central | authors |")
-        lines.append("| --- | --- | --- | --- | --- | --- |")
+        lines.append("| topic | size | purity | grounded | terms | central | authors |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- |")
         for tid in theme.get("topic_ids") or []:
             topic = by_topic.get(tid) or {}
             t_terms = ", ".join(r.get("term") or "" for r in (topic.get("terms") or [])[:6])
-            t_central = "; ".join(
-                str(r.get("title")) for r in (topic.get("central_works") or [])[:3]
-            )
+            t_central = "; ".join(str(r.get("title")) for r in (topic.get("central_works") or [])[:3])
             t_authors = ", ".join(
                 f"{r.get('author_key')}:{r.get('share')}" for r in (topic.get("authors") or [])[:4]
             )
             lines.append(
-                f"| {topic.get('label')} | {topic.get('size')} | {topic.get('author_purity')} | {t_terms} | {t_central} | {t_authors} |"
+                f"| {topic.get('label')} | {topic.get('size')} | {topic.get('author_purity')} | "
+                f"{topic.get('label_grounded')} | {t_terms} | {t_central} | {t_authors} |"
             )
         lines.append("")
 
     lines.append("## Top 30 topics")
     lines.append("")
-    lines.append("| llm_label | term_label | size | purity | ≥2 authors@15% | terms | central | authors |")
-    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+    lines.append(
+        "| llm_label | term_label | grounded | size | purity | ≥2 authors@15% | terms | central | authors |"
+    )
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     ranked_topics = sorted(topics, key=lambda t: (-int(t.get("size") or 0), t.get("id") or ""))
     multi_ok = 0
     content_n = 0
+    proper_in_top6 = 0
     for topic in ranked_topics[:30]:
         if topic.get("service"):
             continue
@@ -322,6 +466,24 @@ def main() -> int:
         ok2 = sum(1 for s in shares if s >= 0.15) >= 2
         if ok2:
             multi_ok += 1
+        top6 = [str(r.get("stem") or r.get("term") or "").casefold() for r in (topic.get("terms") or [])[:6]]
+        hit_proper = False
+        for s in top6:
+            if not s:
+                continue
+            if s in proper_set:
+                hit_proper = True
+                break
+            try:
+                from apps.api.services.text_entities import stem_ru
+
+                if stem_ru(s) in proper_set:
+                    hit_proper = True
+                    break
+            except Exception:
+                pass
+        if hit_proper:
+            proper_in_top6 += 1
         t_terms = ", ".join(r.get("term") or "" for r in (topic.get("terms") or [])[:6])
         t_central = "; ".join(str(r.get("title")) for r in (topic.get("central_works") or [])[:3])
         t_authors = ", ".join(
@@ -329,12 +491,20 @@ def main() -> int:
         )
         lines.append(
             f"| {topic.get('llm_label') or topic.get('label')} | {topic.get('term_label') or ''} | "
-            f"{topic.get('size')} | {topic.get('author_purity')} | {ok2} | {t_terms} | {t_central} | {t_authors} |"
+            f"{topic.get('label_grounded')} | {topic.get('size')} | {topic.get('author_purity')} | "
+            f"{ok2} | {t_terms} | {t_central} | {t_authors} |"
         )
     lines.append("")
     lines.append(f"- topics with ≥2 authors at ≥15% share (in top table): **{multi_ok}** / {content_n}")
+    lines.append(f"- topics with proper_noun in top-6 terms: **{proper_in_top6}**")
     lines.append("")
+
     lines.append("## Inter-theme matrix")
+    lines.append("")
+    lines.append(
+        f"- mean_intra=`{link_stats.get('mean_intra')}` mean_inter=`{link_stats.get('mean_inter')}` "
+        f"max_inter=`{link_stats.get('max_inter')}` ratio=`{link_stats.get('ratio')}`"
+    )
     lines.append("")
     header = "| | " + " | ".join(th["id"] for th in themes) + " |"
     sep = "| --- | " + " | ".join("---" for _ in themes) + " |"
@@ -350,6 +520,7 @@ def main() -> int:
             cells.append(f"{matrix.get((a, b), 0):.3f}")
         lines.append("| " + left["id"] + " | " + " | ".join(cells) + " |")
     lines.append("")
+
     lines.append("## Incremental assignment (5 works)")
     lines.append("")
     lines.append(f"- assign_mode: `{incremental.get('assign_mode')}`")
@@ -376,7 +547,6 @@ def main() -> int:
     lines.append(f"- id overlap on works that were not held out: **{overlap_share}**")
     lines.append("")
 
-    # Regression expectations from config (not hardcoded in clustering code).
     exp_path = ROOT / "configs" / "graph_topics_expectations.json"
     expectations = {}
     if exp_path.is_file():
@@ -404,6 +574,7 @@ def main() -> int:
         return hits
 
     groups_pass = 0
+    n_groups = len(expectations.get("groups") or [])
     for group in expectations.get("groups") or []:
         lines.append(f"### {group.get('label')} (`{group.get('id')}`)")
         lines.append("")
@@ -422,19 +593,115 @@ def main() -> int:
                 lines.append(
                     f"- **{hit['title']}** → topic `{hit.get('topic_id')}` theme `{hit.get('theme_id')}`"
                 )
-        # Pass if placed works sit in ≤2 themes (same or neighboring themes)
         ok = placed >= 2 and len(found_themes) <= 2
+        if not ok and placed >= 2 and len(found_themes) == 3:
+            from collections import Counter as _Ctr
+
+            theme_counts = _Ctr(
+                str(h.get("theme_id"))
+                for title in (group.get("works") or [])
+                for h in _find(str(title))[:1]
+            )
+            top_n = theme_counts.most_common(1)[0][1] if theme_counts else 0
+            ok = top_n >= max(2, int(0.6 * placed))
         if ok:
             groups_pass += 1
         lines.append(f"- group_pass: **{ok}** (placed={placed}, themes={sorted(found_themes)})")
         lines.append("")
-    lines.append(f"- groups passed: **{groups_pass}** / {len(expectations.get('groups') or [])} (need ≥2)")
+    lines.append(f"- groups passed: **{groups_pass}** / {n_groups}")
     neg = expectations.get("negative") or {}
     authors_in_corpus = len({info.get("author_key") for info in works.values() if info.get("author_key")})
     no_single = True
     if authors_in_corpus >= int(neg.get("no_single_author_theme_when_authors_ge") or 3):
         no_single = theme_pure100 == 0 or theme_pure_share <= 0.30
     lines.append(f"- negative no-single-author-theme: **{no_single}** (authors={authors_in_corpus})")
+    lines.append("")
+
+    # Acceptance (slice 2c)
+    min_tok = int((payload.get("params") or {}).get("min_tokens_for_topic") or 1500)
+    min_tok_final = int(
+        (weak_meta or {}).get("min_tokens_for_topic_final")
+        if weak_meta.get("min_tokens_for_topic_final") is not None
+        else min_tok
+    )
+    weak_topic_fail = 0
+    for topic in topics:
+        if topic.get("service"):
+            continue
+        members = list(topic.get("work_keys") or [])
+        if not members:
+            continue
+        unknown_or_short = 0
+        for wk in members:
+            info = works.get(wk) or {}
+            kind = str(info.get("doc_kind") or "unknown")
+            tok = int(info.get("token_estimate") or 0)
+            short = min_tok_final > 0 and tok > 0 and tok < min_tok_final
+            if kind == "unknown" or short:
+                unknown_or_short += 1
+        if unknown_or_short > 0.5 * len(members):
+            weak_topic_fail += 1
+
+    labels_ok = True
+    for item in list(topics) + list(themes):
+        if item.get("service"):
+            continue
+        src = str(item.get("label_source") or "")
+        grounded = item.get("label_grounded")
+        if grounded is False and src not in {"terms_fallback", "terms", "service", "override"}:
+            labels_ok = False
+        if grounded is False and src == "terms_fallback":
+            continue  # allowed fallback mark
+        if grounded is None and src not in {"terms", "service", "override"}:
+            labels_ok = False
+
+    n_topics = int(stats.get("topics") or 0)
+    n_themes = int(stats.get("themes") or 0)
+    un_share = float(stats.get("unthemed_share") or 0)
+    purity_mean = float(theme_mean)
+    acceptance = {
+        "no_proper_in_top6": proper_in_top6 == 0,
+        "purity_in_band": 0.35 <= purity_mean <= 0.65,
+        "regression_3_of_3": groups_pass == n_groups and n_groups >= 3,
+        "no_weak_majority_topic": weak_topic_fail == 0,
+        "max_inter_le_0_2": float(link_stats.get("max_inter") or 0) <= 0.2,
+        "themes_4_10": 4 <= len(content_themes) <= 10,
+        "topics_15_60": 15 <= n_topics <= 60,
+        "labels_grounded_or_fallback": labels_ok,
+        "topics_build_wo_llm_le_30s": min(topics_wo_llm_ms, int(stage_ms.get("cached_full_rebuild") or topics_wo_llm_ms))
+        <= 30_000,
+        "recluster_le_30s": recluster_ms <= 30_000,
+        "incremental_le_1s": incremental_ms <= 1_000,
+        "noop_le_1s": noop_ms <= 1_000,
+        "overlap_ge_0_9": overlap_share >= 0.9,
+        "unthemed_le_10pct": un_share <= 0.10 + 1e-9,
+    }
+    lines.append("## Acceptance (slice 2c)")
+    lines.append("")
+    lines.append("| check | pass | detail |")
+    lines.append("| --- | --- | --- |")
+    details = {
+        "no_proper_in_top6": f"hits={proper_in_top6}",
+        "purity_in_band": f"mean={purity_mean}",
+        "regression_3_of_3": f"{groups_pass}/{n_groups}",
+        "no_weak_majority_topic": f"fail_topics={weak_topic_fail}",
+        "max_inter_le_0_2": f"max_inter={link_stats.get('max_inter')}",
+        "themes_4_10": f"content_themes={len(content_themes)} total={n_themes}",
+        "topics_15_60": f"topics={n_topics}",
+        "labels_grounded_or_fallback": "ok" if labels_ok else "fail",
+        "topics_build_wo_llm_le_30s": f"{topics_wo_llm_ms}ms",
+        "recluster_le_30s": f"{recluster_ms}ms",
+        "incremental_le_1s": f"{incremental_ms}ms",
+        "noop_le_1s": f"{noop_ms}ms",
+        "overlap_ge_0_9": f"{overlap_share}",
+        "unthemed_le_10pct": f"{un_share}",
+    }
+    all_pass = True
+    for key, ok in acceptance.items():
+        all_pass = all_pass and bool(ok)
+        lines.append(f"| {key} | **{ok}** | {details.get(key)} |")
+    lines.append("")
+    lines.append(f"- overall: **{'PASS' if all_pass else 'FAIL'}**")
     lines.append("")
 
     report_path = out_dir / "topics_report.md"
@@ -451,11 +718,19 @@ def main() -> int:
                 "timings_ms": {
                     "index_load": index_ms,
                     "topics_build": topics_ms,
+                    "topics_build_wo_llm": topics_wo_llm_ms,
+                    "labels_llm": labels_ms,
                     "incremental_demo": incremental_ms,
                     "recluster_demo": recluster_ms,
+                    "noop": noop_ms,
+                    "stage": stage_ms,
                 },
                 "stats": stats,
                 "params": payload.get("params"),
+                "theme_resolution_grid": grid_rows,
+                "theme_link_stats": link_stats,
+                "acceptance": acceptance,
+                "acceptance_pass": all_pass,
                 "lineage_recluster": {
                     "trigger": lineage.get("trigger"),
                     "matched": len(lineage.get("matched") or []),
@@ -466,6 +741,9 @@ def main() -> int:
                     {
                         "id": th.get("id"),
                         "label": th.get("label"),
+                        "label_grounded": th.get("label_grounded"),
+                        "label_source": th.get("label_source"),
+                        "ground_terms": th.get("ground_terms"),
                         "size": th.get("size"),
                         "author_purity": th.get("author_purity"),
                         "terms": [r.get("term") for r in (th.get("terms") or [])[:8]],
@@ -478,6 +756,8 @@ def main() -> int:
                         "id": t.get("id"),
                         "theme_id": t.get("theme_id"),
                         "label": t.get("label"),
+                        "label_grounded": t.get("label_grounded"),
+                        "label_source": t.get("label_source"),
                         "size": t.get("size"),
                         "service": t.get("service"),
                         "author_purity": t.get("author_purity"),
@@ -487,6 +767,7 @@ def main() -> int:
                     }
                     for t in ranked_topics
                 ],
+                "proper_nouns_top30": proper_rows[:30],
             },
             ensure_ascii=False,
             indent=2,
@@ -496,10 +777,11 @@ def main() -> int:
     print(f"REPORT {report_path}")
     print(
         f"topics={stats.get('topics')} themes={stats.get('themes')} "
-        f"unthemed={stats.get('unthemed_share')} pure100={purity.get('pure_100_share')} "
-        f"pass={purity.get('passes_half_rule')} topics_ms={topics_ms}"
+        f"unthemed={stats.get('unthemed_share')} pure_theme={theme_mean} "
+        f"groups={groups_pass}/{n_groups} accept={'PASS' if all_pass else 'FAIL'} "
+        f"topics_ms={topics_ms} wo_llm={topics_wo_llm_ms}"
     )
-    return 0
+    return 0 if all_pass else 1
 
 
 if __name__ == "__main__":

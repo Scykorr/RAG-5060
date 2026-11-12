@@ -132,3 +132,79 @@ def test_cluster_graph_excludes_work_lex_from_fusion():
     types = {e["type"] for e in graph["work_edges"]}
     assert "work_lex_similar" not in types
     assert "topic_knn" in types or graph["adj"]["w1"] or graph["adj"]["w2"]
+
+
+def test_proper_noun_cap_ratio_and_entity_ban():
+    case = {
+        "Хлестаков": {"upper": 5, "lower": 0},
+        "хлестаков": {"upper": 0, "lower": 1},
+        "казаки": {"upper": 1, "lower": 20},
+        "батареи": {"upper": 0, "lower": 15},
+        "учения": {"upper": 2, "lower": 12},
+        "станица": {"upper": 1, "lower": 10},
+    }
+    pos = {
+        "Хлестаков": {"mid": 5, "sent_start": 0},
+        "хлестаков": {"mid": 0, "sent_start": 0},
+        "казаки": {"mid": 1, "sent_start": 0},
+        "батареи": {"mid": 0, "sent_start": 0},
+        "учения": {"mid": 1, "sent_start": 1},
+        "станица": {"mid": 0, "sent_start": 1},
+    }
+    proper, rows = gtv.detect_proper_nouns(
+        case, pos, min_n=3, min_cap_ratio=0.8, entity_stems={"раскольников"}
+    )
+    # stems of Хлестаков / Раскольников
+    assert any("хлестаков" in s or s.startswith("хлестак") for s in proper)
+    assert "раскольников" in proper or any("раскольник" in s for s in proper)
+    assert not any(s.startswith("казак") for s in proper)
+    assert not any(s.startswith("батарей") or s.startswith("батаре") for s in proper)
+    assert not any(s.startswith("учен") for s in proper)
+    assert not any(s.startswith("станиц") for s in proper)
+    assert rows and rows[0].get("cap_ratio") is not None or any(r.get("source") == "entity" for r in rows)
+
+
+def test_proper_noun_dialogue_line_starts():
+    # Character name mostly at dialogue/line starts, almost never lowercase.
+    case = {"Хлестаков": {"upper": 270, "lower": 0}, "Нина": {"upper": 100, "lower": 1}}
+    pos = {
+        "Хлестаков": {"mid": 10, "sent_start": 260},
+        "Нина": {"mid": 40, "sent_start": 60},
+    }
+    proper, rows = gtv.detect_proper_nouns(case, pos, min_n=3, min_cap_ratio=0.8)
+    assert any(s.startswith("хлестак") for s in proper)
+    assert any(s.startswith("нин") for s in proper)
+    assert any(r.get("source") == "cap_dialogue" for r in rows)
+
+
+def test_proper_noun_zero_weight_in_vectors():
+    works = {
+        "w1": {"author_key": "A", "language": "ru", "collection": "c"},
+        "w2": {"author_key": "B", "language": "ru", "collection": "c"},
+        "w3": {"author_key": "C", "language": "ru", "collection": "c"},
+    }
+    terms = {
+        "w1": Counter({"хлестаков": 12, "война": 5, "казак": 4}),
+        "w2": Counter({"хлестаков": 8, "война": 6, "казак": 3}),
+        "w3": Counter({"война": 5, "казак": 5, "станиц": 3}),
+    }
+    case = {"Хлестаков": {"upper": 10, "lower": 0}, "казак": {"upper": 1, "lower": 30}}
+    pos = {"Хлестаков": {"mid": 10, "sent_start": 0}, "казак": {"mid": 1, "sent_start": 0}}
+    params = gt.load_params()
+    raw, debug = gtv.build_raw_vectors(
+        terms, works, params=params, case_stats=case, pos_stats=pos
+    )
+    assert debug["proper_nouns_n"] >= 1
+    for wk in terms:
+        assert not any(str(s).startswith("хлестак") for s in raw[wk])
+        assert "казак" in raw[wk] or "война" in raw[wk]
+
+
+def test_filter_config_hash_stable():
+    p = gt.load_params()
+    a = gtv.filter_config_hash(p)
+    b = gtv.filter_config_hash(dict(p))
+    assert a == b
+    p2 = dict(p)
+    p2["proper_noun_min_cap_ratio"] = 0.9
+    assert gtv.filter_config_hash(p2) != a
