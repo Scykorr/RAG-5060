@@ -5,9 +5,10 @@
 - Cluster graph: `topic_knn` (k=10, cross-author quota), `same_author_factor` **0.35**; `work_lex_similar` weight 0 (viz only)
 - Quality: lex_same_author_share **0.3458** (was 0.978); theme mean purity **0.3682** (≤0.75); 100% pure themes **0**; expectations **3/3**
 - Labels: thematic c-TF-IDF + Ollama `qwen3:8b` (fallback terms); secondary_topics in API
-- Perf: noop **17ms**; recluster id overlap **1.0**; full w/ LLM ~137s (cluster-only ~70s); incremental assign mode after graph reuse
+- Perf: noop **14ms**; recluster id overlap **1.0**; full w/ LLM ~144s (cluster-only ~70s); incremental **21ms** after graph reuse
 - Config: `configs/graph_topics_expectations.json`, `topic_style_stopwords` in lexicon; pytest topic unit **22 passed**
 - No α-grid needed (purity already ≤0.75 at α=0.6 / factor=0.35)
+- Knowledge: **S58**, **A23**, E-20261112-topics-author-folder / report-hang; ROADMAP **F04.18f/g**, **F15.6b**; mirrors `Обучение/docs/*` + RESULTS
 
 ## 2026-11-11 — Slice 2 steps 1–7 (themes/topics)
 

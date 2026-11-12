@@ -275,6 +275,8 @@ Haystack Apache-2.0 допустим как последующая библио�
 - [x] F04.18c. P2 (lifecycle clarifications): params_hash∋lexicon SHA1; atomic publish + current pointer; per-tenant file lock; stale after ingestion + `GRAPH_AUTO_REBUILD`; tenant-scoped invalidate; acceptance test 6 (edition/volume).
 - [x] F04.18d. P2 (slice 1e): restore connectivity recall — duplicates/contains, work-level lex (dual sig + soft kNN + cross-theme), co_cited filter, entity rarity, author/refers fixes, overrides, noop; INDEX_VERSION=11; report `artifacts/20261111-062930-graph-index/` (isolated_works 1.3%; noop≈1.9s; full≈139s over 70s target).
 - [x] F04.18e. P2 (slice 1e-M multilang): ru/en/mixed + doc_kind; nested `graph_lexicon.json`; per-lang stem/IDF/lex (no cross-lang lex); language-agnostic identifiers → `shared_entity` `cross_lang`; literary rules gated; technical `edition_of` + tech refers; INDEX_VERSION=14; S56/A21; report `artifacts/20261111-072215-graph-index/`; fixtures `tests/fixtures/graph_multilang/`.
+- [x] F04.18f. P2 (slice 2): themes/topics Louvain offline + stable ids/incremental + level API (`view=levels`, `/themes`, `/topics`); INDEX_VERSION stays 16; S57/A22; report `artifacts/20261111-104731-topics/` (lifecycle OK; purity still author-heavy → 2b).
+- [x] F04.18g. P2 (slice 2b): thematic `topic_vectors` (entropy/style/debias) + `topic_knn` + `same_author_factor=0.35` + LLM/term labels + expectations config; S58/A23; report `artifacts/20261112-052018-topics/` (theme purity 0.37, lex_same_author 0.35, expectations 3/3).
 - [ ] F04.19. Запускать Label Studio и массовую авторазметку отдельным профилем/сеансом; измерить дополнительную RAM. Не добавлять их поверх уже выделенных 20 ГБ WSL без пересчёта бюджета. LLM-разметка использует общую очередь GPU и уступает chat.
 
 **Приёмка:** имеется схема и инструкция, проверенная выборка, версионный экспорт/импорт, прослеживаемость исправлений; автоматически предложенные метки отличимы от проверенных. Бесплатные инструменты не заменяют предметные правила и экспертную ответственность.
@@ -404,6 +406,7 @@ Offline автоусиление ответов на корпусе (не fine-t
 - [x] F15.5. Graph visual polish: animated layout/fit, hover highlight, pulse select, ambient canvas (no CDN).
 - [x] F15.6. Obsidian-like UX on Cytoscape (no D3): degree size, prefix colors, hide orphans, BFS chain depth, click→local, sparse-edge CTA.
 - [x] F15.6a. Offline connectivity index (F04.18/a/b): layers + lifecycle + 1d quality; skills S54/S55, abilities A19/A20.
+- [x] F15.6b. Theme/topic levels API (F04.18f/g): overview levels + thematic clustering; S57/S58, A22/A23; no dedicated UI tab yet.
 - [ ] F15.7. P1/P2: real embedding ANN после N1; LLM relation detector OFF by default; entity graph.
 
 **Приёмка:** реальные рёбра из корпуса, ACL, offline UI, без CDN; chat/ingestion не сломаны.

@@ -272,3 +272,25 @@
 - prevent: S56
 - links: `graph_lang.extract_identifiers`
 - status: fixed
+
+## 2026-11-12 — темы = папки автора / стилевые подписи
+- id: E-20261112-topics-author-folder
+- symptom: `lex_same_author_share≈0.98`, mean author purity≈0.91, theme 100% одного автора; подписи «нешто, дескать, схвативши»
+- reproduce: report `artifacts/20261111-104731-topics/` (slice 2 до 2b)
+- root_cause: кластеризация по сырому `work_lex_similar` ловит идиолект/эпоху; c‑TF‑IDF без thematic filter
+- fix: `topic_vectors` (entropy, style stops, gerunds, noun boost, author debias α=0.6) + kNN `topic_knn`, `same_author_factor=0.35`; labels только thematic dict + LLM fallback; expectations в `configs/graph_topics_expectations.json`
+- replay: `pytest tests/unit/test_graph_topic_vectors.py tests/unit/test_graph_topics.py` (22); `bash scripts/_run_topics2b_report.sh` → `artifacts/20261112-052018-topics/` (theme purity 0.37, lex_share 0.35, expectations 3/3)
+- prevent: S58, A23; не кластеризовать темы на `work_lex_similar`; не хардкодить авторов в коде
+- links: `graph_topic_vectors.py`, `configs/graph_topics.json`, `graph_topics_report.py`
+- status: fixed
+
+## 2026-11-12 — topics report висит / O(n²) debias / двойной rebuild
+- id: E-20261112-topics-report-hang
+- symptom: `graph_topics_report` после `graph_index_noop` молчит минутами; CPU 100% или ждёт Ollama
+- reproduce: `build_index_for_tenant` в отчёте → `_with_topics` + leave‑one‑out mean O(n²·vocab) на Чехове; LLM timeout 45s×N
+- root_cause: noop index всегда зовёт topics; наивный leave‑one‑out; отчёт грузил index через full build path
+- fix: author_debias через pre‑sum; term_cap/top_k; отчёт читает pointer/`read_index`; LLM timeout 90s + warm; incremental reuse `work_edges` без re‑decorate
+- replay: report timings noop≈14ms, incremental≈21ms; cluster probe `artifacts/_topics2b_fast.log`
+- prevent: S58; в отчётах/smoke не вызывать `build_index_for_tenant` ради topics
+- links: `graph_topic_vectors.author_debias`, `graph_topics_report.py`, `graph_index._with_topics`
+- status: fixed

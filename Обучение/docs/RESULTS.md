@@ -44,3 +44,7 @@
 | Тест 3 | 9 | sample | contain | 0.45 | 0.55 | FAIL | artifacts/test3/attempt9 |
 | Тест 3 | 10 | sample | contain | 0.95 | 0.55 | PASS | artifacts/test3/attempt10 |
 | Classic | 19 | unique-needle | contain | 0.75 | 0.55 | PASS | artifacts/classic/attempt19 |
+| Graph topics 2b | 1 | corpus | theme_purity_mean | 0.368 | ≤0.75 | PASS | artifacts/20261112-052018-topics |
+| Graph topics 2b | 1 | corpus | lex_same_author_share | 0.346 | ≪1 | PASS | artifacts/20261112-052018-topics |
+| Graph topics 2b | 1 | corpus | expectations_groups | 3/3 | ≥2/3 | PASS | artifacts/20261112-052018-topics |
+| Graph topics 2b | 1 | corpus | recluster_overlap | 1.0 | ≥0.9 | PASS | artifacts/20261112-052018-topics |
