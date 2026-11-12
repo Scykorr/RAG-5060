@@ -1,0 +1,78 @@
+/** Russian UI strings for the Obsidian-style graph (en later). */
+(function (global) {
+  "use strict";
+  const RU = {
+    tab: "Граф",
+    overview: "Обзор",
+    theme: "Тема",
+    topic: "Тематика",
+    node: "Узел",
+    local: "Локальный граф",
+    settings: "Настройки",
+    filters: "Фильтры",
+    groups: "Группы",
+    display: "Отображение",
+    forces: "Силы",
+    search: "Поиск узлов…",
+    searchHint: "Enter — фокус на первом совпадении",
+    nodeTypes: "Типы узлов",
+    edgeTypes: "Типы связей",
+    onlyExisting: "Только существующие",
+    showOrphans: "Сироты",
+    showUnthemed: "Без темы",
+    language: "Язык",
+    docKind: "Тип документа",
+    minWeight: "Мин. вес ребра",
+    newGroup: "Новая группа",
+    colorByThemes: "Раскрасить по темам",
+    arrows: "Стрелки",
+    textFade: "Порог подписей",
+    nodeSize: "Размер узлов",
+    edgeWidth: "Толщина связей",
+    animate: "Анимация",
+    forceCenter: "Сила центра",
+    forceCharge: "Отталкивание",
+    forceLink: "Сила связи",
+    forceDistance: "Длина связи",
+    resetSettings: "Сбросить настройки",
+    rebuild: "Перестроить граф",
+    fit: "Вписать",
+    zoomIn: "Крупнее",
+    zoomOut: "Мельче",
+    stale: "Граф устарел — перестроить?",
+    truncated: "Показано {n} из {m} узлов",
+    showMore: "Показать больше",
+    openDoc: "Открыть документ",
+    showLocal: "Показать локальный граф",
+    back: "Назад",
+    depth: "Глубина",
+    incoming: "Входящие",
+    outgoing: "Исходящие",
+    neighbors: "Соседние связи",
+    noWebgl: "WebGL недоступен — список узлов",
+    empty: "Нет данных уровня. Постройте индекс и темы.",
+    loading: "Загрузка графа…",
+    author: "Автор",
+    collection: "Коллекция",
+    secondary: "Вторичные тематики",
+    provenance: "Связи",
+    type_theme: "темы",
+    type_topic: "тематики",
+    type_work: "произведения",
+    type_document: "документы",
+    type_author: "авторы",
+    type_collection: "коллекции",
+  };
+
+  function t(key, vars) {
+    let s = RU[key] != null ? RU[key] : key;
+    if (vars) {
+      Object.keys(vars).forEach((k) => {
+        s = s.replace(new RegExp("\\{" + k + "\\}", "g"), String(vars[k]));
+      });
+    }
+    return s;
+  }
+
+  global.GraphI18n = { t, RU };
+})(typeof window !== "undefined" ? window : globalThis);

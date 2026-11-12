@@ -133,8 +133,17 @@
       },
       setDisplay: (d) => {
         Object.assign(state.display, d || {});
-        if (state.kind === "sigma") refreshStyles(state);
+        if (state.kind === "sigma") {
+          if (state.sigma && state.sigma.setSetting) {
+            const thr = state.display.labelThreshold != null ? state.display.labelThreshold : 0.55;
+            // Higher threshold → fewer labels (Obsidian text-fade).
+            state.sigma.setSetting("labelRenderedSizeThreshold", 4 + (1 - thr) * 28);
+          }
+          refreshStyles(state);
+        }
       },
+      fit: () => fitView(state),
+      zoomBy: (factor) => zoomBy(state, factor),
       highlight: (h) => {
         state.highlight = h || {};
         if (state.kind === "sigma") refreshStyles(state);
@@ -232,7 +241,8 @@
         y: n.y != null ? n.y : Math.sin(angle) * r + (Math.random() - 0.5) * 8,
         size: nodeRadius(n, state.display),
         color: n.color || state.display.nodeColor,
-        type: n.type,
+        // Do NOT set graphology/sigma `type` — that selects a WebGL program (circle/…).
+        nodeKind: n.type,
         degree: n.degree,
         ghost: n.ghost,
         external: n.external,
@@ -246,7 +256,7 @@
           weight: e.weight,
           size: Math.max(0.4, e.weight * 2 * (state.display.edgeScale || 1)),
           color: state.display.edgeColor,
-          type: e.type,
+          edgeKind: e.type,
           directed: e.directed,
         });
       } catch (_) {
@@ -308,7 +318,7 @@
           y,
           size: nodeRadius(n, state.display),
           color: n.color || state.display.nodeColor,
-          type: n.type,
+          nodeKind: n.type,
           degree: n.degree,
           ghost: n.ghost,
         });
@@ -334,7 +344,7 @@
             weight: e.weight,
             size: Math.max(0.4, e.weight * 2 * (state.display.edgeScale || 1)),
             color: state.display.edgeColor,
-            type: e.type,
+            edgeKind: e.type,
             directed: e.directed,
           });
         } catch (_) {}
@@ -387,7 +397,42 @@
           g.setNodeAttribute(n.id, "y", n.y);
         });
         if (state.sigma) state.sigma.refresh();
+        if (state.sim && state.sim.alpha() < 0.01) state.sim.stop();
       });
+  }
+
+  function fitView(state) {
+    if (state.kind !== "sigma" || !state.sigma || !state.graph) return;
+    const g = state.graph;
+    let minX = Infinity,
+      minY = Infinity,
+      maxX = -Infinity,
+      maxY = -Infinity,
+      n = 0;
+    g.forEachNode((_id, a) => {
+      minX = Math.min(minX, a.x);
+      minY = Math.min(minY, a.y);
+      maxX = Math.max(maxX, a.x);
+      maxY = Math.max(maxY, a.y);
+      n += 1;
+    });
+    if (!n || !state.sigma.getCamera) return;
+    const cam = state.sigma.getCamera();
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    const w = Math.max(40, maxX - minX);
+    const h = Math.max(40, maxY - minY);
+    const vw = state.container.clientWidth || 800;
+    const vh = state.container.clientHeight || 600;
+    const ratio = Math.max(w / vw, h / vh) * 1.25;
+    cam.animate({ x: cx, y: cy, ratio: Math.max(0.08, ratio) }, { duration: 280 });
+  }
+
+  function zoomBy(state, factor) {
+    if (state.kind !== "sigma" || !state.sigma || !state.sigma.getCamera) return;
+    const cam = state.sigma.getCamera();
+    const next = Math.min(8, Math.max(0.05, cam.ratio * (factor || 1)));
+    cam.animate({ ratio: next }, { duration: 120 });
   }
 
   function refreshStyles(state) {
@@ -409,7 +454,11 @@
         if (hot) color = d.accent;
       }
       g.setNodeAttribute(id, "color", color);
-      g.setNodeAttribute(id, "size", nodeRadius(n || { size: 1, degree: attrs.degree || 0, type: attrs.type }, d));
+      g.setNodeAttribute(
+        id,
+        "size",
+        nodeRadius(n || { size: 1, degree: attrs.degree || 0, type: attrs.nodeKind || "work" }, d)
+      );
       // sigma 2 uses color alpha via hex; approximate dim by blending toward bg
       if (opacity < 1 && !String(color).startsWith("#7f")) {
         g.setNodeAttribute(id, "color", mixAlpha(color, opacity));

@@ -41,7 +41,7 @@
         <button class="nav-btn" data-tab="dispatcher">Dashboard</button>
         <button class="nav-btn" data-tab="system">System</button>
         <button class="nav-btn" data-tab="documents">Документы</button>
-        <button class="nav-btn" data-tab="graph">Граф связей</button>
+        <button class="nav-btn" data-tab="graph">Граф</button>
         <button class="nav-btn" data-tab="storage">Хранилище</button>
         <button class="nav-btn" data-tab="quality">Качество</button>
         <button class="nav-btn" data-tab="models">Модели</button>
@@ -173,76 +173,35 @@
         </section>
 
         <section id="panel-graph" class="panel hidden">
-          <div class="graph-layout">
-            <aside class="card graph-filters">
-              <strong>Фильтры</strong>
-              <div class="form-row">
-                <label class="label">Режим</label>
-                <select id="graph-mode">
-                  <option value="global">Вся база</option>
-                  <option value="local">Локальный граф</option>
-                </select>
+          <div id="graph-stage" class="graph-stage">
+            <div class="graph-topbar">
+              <nav id="graph-crumbs" class="graph-crumbs" aria-label="Навигация графа"></nav>
+              <div class="graph-topbar-actions">
+                <button type="button" class="btn ghost" id="btn-graph-back" title="Назад">←</button>
+                <button type="button" class="btn ghost" id="btn-graph-theme" title="Светлая/тёмная тема графа">◐</button>
+                <button type="button" class="btn ghost" id="btn-graph-rebuild" title="Перестроить граф">↻</button>
+                <button type="button" class="graph-icon-btn" id="btn-graph-settings" title="Настройки" aria-label="Настройки">⚙</button>
               </div>
-              <div class="form-row">
-                <label class="label">Центр (document id)</label>
-                <input id="graph-center" type="text" placeholder="UUID документа" />
-              </div>
-              <div class="form-row">
-                <label class="label">Глубина</label>
-                <select id="graph-depth">
-                  <option value="1" selected>1</option>
-                  <option value="2">2</option>
-                  <option value="3">3</option>
-                </select>
-              </div>
-              <div class="form-row">
-                <label class="label">Префикс корпуса</label>
-                <input id="graph-prefix" type="text" placeholder="classic_ или wildlife_" />
-              </div>
-              <div class="form-row">
-                <label class="label">Поиск по имени</label>
-                <input id="graph-search" type="search" placeholder="название…" />
-              </div>
-              <div class="form-row">
-                <label class="label">Типы связей</label>
-                <label class="label chk"><input type="checkbox" class="graph-type" value="SEMANTIC_SIMILAR" checked /> Похож по смыслу</label>
-                <label class="label chk"><input type="checkbox" class="graph-type" value="EXPLICIT_REFERENCE" checked /> Ссылается на</label>
-                <label class="label chk"><input type="checkbox" class="graph-type" value="SAME_FAMILY" checked /> Версия/семейство</label>
-                <label class="label chk"><input type="checkbox" class="graph-type" value="MANUAL_LINK" checked /> Связь эксперта</label>
-              </div>
-              <div class="form-row">
-                <label class="label">Мин. сходство (Jaccard)</label>
-                <input id="graph-min-score" type="number" min="0" max="1" step="0.05" value="0.22" />
-                <p class="muted" style="margin:0">Это сходство токенов, не вероятность истинности.</p>
-              </div>
-              <div style="display:flex;gap:0.4rem;flex-wrap:wrap">
-                <button class="btn primary" type="button" id="btn-graph-load">Показать</button>
-                <button class="btn" type="button" id="btn-graph-fit">По размеру</button>
-                <button class="btn ghost" type="button" id="btn-graph-reset">Сбросить</button>
-              </div>
-              <div style="display:flex;gap:0.4rem;flex-wrap:wrap;margin-top:0.5rem">
-                <button class="btn" type="button" id="btn-graph-rebuild" title="Только admin">Анализ корпуса</button>
-                <button class="btn ghost" type="button" id="btn-graph-rebuild-doc">Анализ центра</button>
-              </div>
-              <p class="muted" id="graph-status-line" style="margin-top:0.75rem">—</p>
-              <div class="graph-legend muted">
-                <div><span class="lg sem"></span> Похож (лексич.)</div>
-                <div><span class="lg ref"></span> Ссылка</div>
-                <div><span class="lg fam"></span> Семейство</div>
-                <div><span class="lg man"></span> Вручную</div>
-              </div>
-            </aside>
-            <div class="card graph-canvas-wrap">
-              <div id="graph-banner" class="graph-banner muted hidden"></div>
-              <div id="graph-cy" class="graph-cy" aria-label="Холст графа связей"></div>
-              <div id="graph-empty" class="graph-empty muted">Загрузите документы и нажмите «Показать» или «Анализ корпуса».</div>
             </div>
-            <aside class="card graph-details" id="graph-details">
-              <strong>Сведения</strong>
-              <p class="muted" id="graph-details-body">Выберите узел или связь.</p>
-              <div id="graph-details-actions" style="display:none;margin-top:0.75rem;gap:0.4rem;flex-wrap:wrap"></div>
-              <h3 class="section-title" style="margin-top:1rem">Связанные документы</h3>
-              <div id="graph-relations-table" class="muted">—</div>
+            <div id="graph-banner" class="graph-banner muted hidden"></div>
+            <div id="graph-truncated" class="graph-truncated muted hidden"></div>
+            <div id="graph-local-bar" class="graph-local-bar hidden"></div>
+            <div id="graph-canvas" class="graph-canvas" aria-label="Холст графа"></div>
+            <div id="graph-empty" class="graph-empty muted hidden">Нет данных уровня. Постройте индекс и темы.</div>
+            <div class="graph-zoom-controls">
+              <button type="button" class="graph-icon-btn" id="btn-graph-zoom-in" title="Крупнее">+</button>
+              <button type="button" class="graph-icon-btn" id="btn-graph-zoom-out" title="Мельче">−</button>
+              <button type="button" class="graph-icon-btn" id="btn-graph-fit" title="Вписать">⛶</button>
+            </div>
+            <p class="graph-status muted" id="graph-status-line">—</p>
+            <aside id="graph-settings-panel" class="graph-settings-panel hidden" aria-label="Настройки графа"></aside>
+            <aside id="graph-side" class="graph-side hidden" aria-label="Карточка узла">
+              <div class="graph-side-head">
+                <strong>Узел</strong>
+                <button type="button" class="graph-icon-btn" id="graph-side-close" aria-label="Закрыть">×</button>
+              </div>
+              <div id="graph-side-body" class="graph-side-body muted">Выберите узел</div>
+              <div id="graph-side-actions" class="graph-side-actions" style="display:none"></div>
             </aside>
           </div>
         </section>
@@ -371,7 +330,13 @@
 
     <!-- app.js first: login must work even if graph assets fail -->
     <script src="/app.js"></script>
-    <script src="/vendor/cytoscape.min.js" defer></script>
+    <script src="/vendor/graphology/graphology.umd.min.js" defer></script>
+    <script src="/vendor/sigma/sigma.min.js" defer></script>
+    <script src="/vendor/d3/d3.min.js" defer></script>
+    <script src="/js/graph/i18n.js" defer></script>
+    <script src="/js/graph/graph-settings.js" defer></script>
+    <script src="/js/graph/graph-view.js" defer></script>
+    <script src="/js/graph/graph-app.js" defer></script>
     <script src="/graph.js" defer></script>
   </body>
 </html>
