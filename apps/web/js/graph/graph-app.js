@@ -69,8 +69,8 @@
     return {
       accent: cssVar("--graph-accent", "#7f6df2"),
       nodeColor: light ? "#666666" : "#999999",
-      edgeColor: light ? "rgba(102,102,102,0.4)" : "rgba(153,153,153,0.4)",
-      labelColor: cssVar("--text", light ? "#222222" : "#d7e0f2"),
+      edgeColor: light ? "rgba(154,154,154,0.42)" : "rgba(138,138,138,0.38)",
+      labelColor: light ? "#222222" : "#dcddde",
       bg: cssVar("--graph-bg", light ? "#ffffff" : "#1e1e1e"),
     };
   }
@@ -359,6 +359,8 @@
       accent: colors.accent,
       nodeColor: colors.nodeColor,
       edgeColor: colors.edgeColor,
+      labelColor: colors.labelColor,
+      bg: colors.bg,
     });
     view.setForces(state.settings.forces);
     const k = posCacheKey();
@@ -919,12 +921,17 @@
       try {
         localStorage.setItem("rag5060.ui.theme", next);
       } catch (_) {}
+      // Update sigma settings in place (no layout reset / no page reload).
       if (state.view) {
-        state.view.destroy();
-        state.view = null;
+        const colors = themeColors();
+        state.view.setDisplay({
+          accent: colors.accent,
+          nodeColor: colors.nodeColor,
+          edgeColor: colors.edgeColor,
+          labelColor: colors.labelColor,
+          bg: colors.bg,
+        });
       }
-      ensureView();
-      if (state.raw) applyFiltersLive();
     });
     document.getElementById("btn-graph-fit")?.addEventListener("click", () => state.view?.fit());
     document.getElementById("btn-graph-zoom-in")?.addEventListener("click", () => state.view?.zoomBy(0.8));

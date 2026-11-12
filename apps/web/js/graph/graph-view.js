@@ -1,5 +1,5 @@
 /**
- * Graph view adapter — graphology + sigma (WebGL) + d3-force.
+ * Graph view adapter — graphology + sigma 3 (WebGL) + d3-force.
  * Swap the engine here without touching the Obsidian-like UI shell.
  *
  * API: create, setData, updateData, setForces, setDisplay, highlight, focusNode, destroy
@@ -7,6 +7,16 @@
 /* global graphology, Sigma, d3 */
 (function (global) {
   "use strict";
+
+  const DIRECTED_EDGE_KINDS = new Set([
+    "refers_to",
+    "work_refers_to",
+    "mentions_author",
+    "wrote",
+    "contains",
+    "part_of",
+    "EXPLICIT_REFERENCE",
+  ]);
 
   function webglOk() {
     try {
@@ -38,6 +48,142 @@
       EdgeRectangleProgram: pick("EdgeRectangleProgram") || pick("EdgeLineProgram"),
       NodeCircleProgram: pick("NodeCircleProgram"),
       createNodeBorderProgram: pick("createNodeBorderProgram"),
+    };
+  }
+
+  function cssVar(name, fallback) {
+    try {
+      const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+      return v || fallback;
+    } catch (_) {
+      return fallback;
+    }
+  }
+
+  function isLightTheme() {
+    return document.documentElement.getAttribute("data-theme") === "light";
+  }
+
+  function readThemePalette(display) {
+    const light = isLightTheme();
+    const d = display || {};
+    return {
+      light,
+      bg: d.bg || cssVar("--graph-bg", light ? "#ffffff" : "#1e1e1e"),
+      accent: d.accent || cssVar("--graph-accent", "#7f6df2"),
+      nodeColor: d.nodeColor || (light ? "#666666" : "#999999"),
+      edgeColor: d.edgeColor || (light ? "rgba(154,154,154,0.42)" : "rgba(138,138,138,0.38)"),
+      labelColor: d.labelColor || (light ? "#222222" : "#dcddde"),
+      hoverPlate: light ? "rgba(255,255,255,0.92)" : "rgba(42,42,42,0.9)",
+      hoverText: light ? "#222222" : "#dcddde",
+      dimEdge: light ? "rgba(154,154,154,0.18)" : "rgba(138,138,138,0.14)",
+    };
+  }
+
+  function parseHex(hex) {
+    const h = String(hex || "").replace("#", "").trim();
+    if (h.length === 3) {
+      return {
+        r: parseInt(h[0] + h[0], 16),
+        g: parseInt(h[1] + h[1], 16),
+        b: parseInt(h[2] + h[2], 16),
+      };
+    }
+    if (h.length >= 6) {
+      return {
+        r: parseInt(h.slice(0, 2), 16),
+        g: parseInt(h.slice(2, 4), 16),
+        b: parseInt(h.slice(4, 6), 16),
+      };
+    }
+    return null;
+  }
+
+  function toHex(r, g, b) {
+    const c = (n) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, "0");
+    return `#${c(r)}${c(g)}${c(b)}`;
+  }
+
+  /** Mix node color toward background; amount=0.15 → ~15% original chroma left. */
+  function blendTowardBg(color, bg, amount) {
+    const a = Math.max(0, Math.min(1, amount == null ? 0.15 : amount));
+    const c = parseHex(color) || parseHex("#999999");
+    const b = parseHex(bg) || { r: 30, g: 30, b: 30 };
+    return toHex(c.r * a + b.r * (1 - a), c.g * a + b.g * (1 - a), c.b * a + b.b * (1 - a));
+  }
+
+  function relativeLuminance(hex) {
+    const c = parseHex(hex);
+    if (!c) return 0;
+    const f = (v) => {
+      const s = v / 255;
+      return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+    };
+    return 0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b);
+  }
+
+  function contrastRatio(fg, bg) {
+    const L1 = relativeLuminance(fg);
+    const L2 = relativeLuminance(bg);
+    const hi = Math.max(L1, L2);
+    const lo = Math.min(L1, L2);
+    return (hi + 0.05) / (lo + 0.05);
+  }
+
+  function drawRoundedRect(ctx, x, y, w, h, r) {
+    const rr = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + rr, y);
+    ctx.arcTo(x + w, y, x + w, y + h, rr);
+    ctx.arcTo(x + w, y + h, x, y + h, rr);
+    ctx.arcTo(x, y + h, x, y, rr);
+    ctx.arcTo(x, y, x + w, y, rr);
+    ctx.closePath();
+  }
+
+  function makeDrawNodeLabel(getPalette) {
+    return function drawNodeLabel(context, data, settings) {
+      if (!data.label) return;
+      const p = getPalette();
+      const size = settings.labelSize || 12;
+      const font = `${settings.labelWeight || "400"} ${size}px ${settings.labelFont || "sans-serif"}`;
+      context.font = font;
+      context.fillStyle = p.labelColor;
+      context.textAlign = "center";
+      context.textBaseline = "top";
+      context.fillText(data.label, data.x, data.y + data.size + 4);
+    };
+  }
+
+  function makeDrawNodeHover(getPalette) {
+    return function drawNodeHover(context, data, settings) {
+      if (!data.label) return;
+      const p = getPalette();
+      const size = data.size || 4;
+      // Accent ring — no white halo around the disc.
+      context.beginPath();
+      context.arc(data.x, data.y, size + 3, 0, Math.PI * 2);
+      context.strokeStyle = p.accent;
+      context.lineWidth = 2;
+      context.stroke();
+
+      const labelSize = settings.labelSize || 12;
+      const font = `600 ${labelSize}px ${settings.labelFont || "sans-serif"}`;
+      context.font = font;
+      const padX = 6;
+      const padY = 4;
+      const metrics = context.measureText(data.label);
+      const tw = metrics.width + padX * 2;
+      const th = labelSize + padY * 2;
+      const lx = data.x - tw / 2;
+      const ly = data.y + size + 6;
+      drawRoundedRect(context, lx, ly, tw, th, 4);
+      context.fillStyle = p.hoverPlate;
+      context.fill();
+      context.fillStyle = p.hoverText;
+      context.textAlign = "center";
+      context.textBaseline = "middle";
+      context.fillText(data.label, data.x, ly + th / 2);
     };
   }
 
@@ -76,9 +222,13 @@
         accent: opts.accent || "#7f6df2",
         nodeColor: opts.nodeColor || "#999999",
         edgeColor: opts.edgeColor || "rgba(153,153,153,0.4)",
+        labelColor: opts.labelColor || "#dcddde",
+        bg: opts.bg || "#1e1e1e",
         dimOpacity: 0.15,
       },
       highlight: { focus: null, neighbors: null },
+      highlightFade: 0,
+      _fadeRaf: 0,
       pinned: new Set(),
       onClick: opts.onClick || null,
       onHover: opts.onHover || null,
@@ -95,13 +245,14 @@
     const nodeProgramClasses = {};
     if (programs.NodeCircleProgram) nodeProgramClasses.circle = programs.NodeCircleProgram;
 
-    // Sigma 3 settings (UMD). Reducers / custom hover label draw land in later 3b steps.
+    const getPalette = () => readThemePalette(state.display);
+
     state.sigma = new S(state.graph, container, {
       renderLabels: true,
       labelFont: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
       labelSize: 12,
       labelWeight: "400",
-      labelColor: { color: opts.labelColor || "#d7e0f2" },
+      labelColor: { color: getPalette().labelColor },
       labelGridCellSize: 100,
       labelDensity: 1,
       defaultEdgeType: "line",
@@ -112,8 +263,13 @@
       nodeProgramClasses: Object.keys(nodeProgramClasses).length ? nodeProgramClasses : undefined,
       zIndex: true,
       allowInvalidContainer: true,
+      defaultDrawNodeLabel: makeDrawNodeLabel(getPalette),
+      defaultDrawNodeHover: makeDrawNodeHover(getPalette),
+      nodeReducer: (node, data) => reduceNode(state, node, data),
+      edgeReducer: (edge, data) => reduceEdge(state, edge, data),
     });
 
+    applySigmaTheme(state);
     wireSigmaEvents(state);
     applyForces(state);
     if (state.onReady) state.onReady({ kind: "sigma", webgl: true });
@@ -158,19 +314,16 @@
       setDisplay: (d) => {
         Object.assign(state.display, d || {});
         if (state.kind === "sigma") {
-          if (state.sigma && state.sigma.setSetting) {
-            const thr = state.display.labelThreshold != null ? state.display.labelThreshold : 0.55;
-            // Higher threshold → fewer labels (Obsidian text-fade).
-            state.sigma.setSetting("labelRenderedSizeThreshold", 4 + (1 - thr) * 28);
-          }
-          refreshStyles(state);
+          applySigmaTheme(state);
+          applyEdgeTypes(state);
+          refreshBaseAttrs(state);
+          if (state.sigma) state.sigma.refresh();
         }
       },
       fit: () => fitView(state),
       zoomBy: (factor) => zoomBy(state, factor),
       highlight: (h) => {
-        state.highlight = h || {};
-        if (state.kind === "sigma") refreshStyles(state);
+        animateHighlight(state, h || {});
         if (state.kind === "fallback") renderFallbackList(state);
       },
       focusNode: (id) => focusNode(state, id),
@@ -186,8 +339,134 @@
       resize: () => {
         if (state.sigma && state.sigma.resize) state.sigma.resize();
       },
+      themeContrast: () => {
+        const p = readThemePalette(state.display);
+        return {
+          darkOrLight: p.light ? "light" : "dark",
+          hoverTextOnPlate: contrastRatio(p.hoverText, p.light ? "#ffffff" : "#2a2a2a"),
+          labelOnBg: contrastRatio(p.labelColor, p.bg),
+        };
+      },
       destroy: () => destroy(state),
     };
+  }
+
+  function applySigmaTheme(state) {
+    if (!state.sigma || !state.sigma.setSetting) return;
+    const p = readThemePalette(state.display);
+    state.display.bg = p.bg;
+    state.display.accent = p.accent;
+    state.display.labelColor = p.labelColor;
+    state.display.nodeColor = state.display.nodeColor || p.nodeColor;
+    state.display.edgeColor = state.display.edgeColor || p.edgeColor;
+    const getPalette = () => readThemePalette(state.display);
+    state.sigma.setSetting("labelColor", { color: p.labelColor });
+    state.sigma.setSetting("defaultNodeColor", p.nodeColor);
+    state.sigma.setSetting("defaultEdgeColor", p.edgeColor);
+    state.sigma.setSetting("defaultDrawNodeLabel", makeDrawNodeLabel(getPalette));
+    state.sigma.setSetting("defaultDrawNodeHover", makeDrawNodeHover(getPalette));
+    const thr = state.display.labelThreshold != null ? state.display.labelThreshold : 0.55;
+    state.sigma.setSetting("labelRenderedSizeThreshold", 4 + (1 - thr) * 28);
+  }
+
+  function animateHighlight(state, h) {
+    state.highlight = h || {};
+    if (state.kind !== "sigma") return;
+    const target = state.highlight.focus ? 1 : 0;
+    if (state._fadeRaf) cancelAnimationFrame(state._fadeRaf);
+    const start = state.highlightFade || 0;
+    const t0 = performance.now();
+    const dur = 180;
+    const tick = (now) => {
+      const t = Math.min(1, (now - t0) / dur);
+      const ease = t * (2 - t);
+      state.highlightFade = start + (target - start) * ease;
+      if (state.sigma) state.sigma.refresh();
+      if (t < 1) state._fadeRaf = requestAnimationFrame(tick);
+      else state._fadeRaf = 0;
+    };
+    state._fadeRaf = requestAnimationFrame(tick);
+  }
+
+  function reduceNode(state, node, data) {
+    const hi = state.highlight || {};
+    const fade = state.highlightFade || 0;
+    const focus = hi.focus;
+    const nbrs = hi.neighbors instanceof Set ? hi.neighbors : new Set(hi.neighbors || []);
+    const dimming = !!(focus || nbrs.size) && fade > 0.01;
+    const p = readThemePalette(state.display);
+    const baseColor = data.color || state.display.nodeColor || p.nodeColor;
+
+    if (!dimming) {
+      return { ...data, zIndex: data.zIndex || 0 };
+    }
+
+    const hot = node === focus || nbrs.has(node);
+    if (hot) {
+      return {
+        ...data,
+        color: baseColor,
+        forceLabel: true,
+        zIndex: 2,
+        highlighted: true,
+      };
+    }
+
+    // fade=1 → keep ~15% of node color mixed into bg (opaque, not alpha).
+    return {
+      ...data,
+      color: blendTowardBg(baseColor, p.bg, 1 - fade * 0.85),
+      label: null,
+      forceLabel: false,
+      zIndex: 0,
+      highlighted: false,
+    };
+  }
+
+  function reduceEdge(state, edge, data) {
+    const g = state.graph;
+    const hi = state.highlight || {};
+    const fade = state.highlightFade || 0;
+    const focus = hi.focus;
+    const nbrs = hi.neighbors instanceof Set ? hi.neighbors : new Set(hi.neighbors || []);
+    const dimming = !!(focus || nbrs.size) && fade > 0.01;
+    const p = readThemePalette(state.display);
+    const extremities = g.extremities(edge);
+    const source = extremities[0];
+    const target = extremities[1];
+    const weight = data.weight || 0.2;
+    const scale = state.display.edgeScale || 1;
+    let size = Math.max(1, weight * 2.2 * scale);
+    let color = state.display.edgeColor || p.edgeColor;
+    let zIndex = 0;
+    const directed = !!(data.directed || DIRECTED_EDGE_KINDS.has(data.edgeKind));
+    let type = data.type || "line";
+    if (state.display.arrows && directed && state._sigmaPrograms && state._sigmaPrograms.EdgeArrowProgram) {
+      type = "arrow";
+    } else {
+      type = "line";
+    }
+
+    if (dimming) {
+      const hot =
+        source === focus ||
+        target === focus ||
+        (nbrs.has(source) && (target === focus || nbrs.has(target))) ||
+        (nbrs.has(target) && source === focus);
+      if (hot) {
+        color = p.accent;
+        size = Math.max(1.5, Math.min(2.5, size * 1.6));
+        zIndex = 2;
+      } else {
+        color = p.dimEdge;
+        size = Math.max(1, size * 0.85);
+        zIndex = 0;
+      }
+    } else {
+      size = Math.max(1, size);
+    }
+
+    return { ...data, color, size, type, zIndex };
   }
 
   function normalizeNodes(raw) {
@@ -219,15 +498,14 @@
   }
 
   function isDirected(type) {
-    return (
-      type === "refers_to" ||
-      type === "work_refers_to" ||
-      type === "mentions_author" ||
-      type === "wrote" ||
-      type === "contains" ||
-      type === "part_of" ||
-      type === "EXPLICIT_REFERENCE"
-    );
+    return DIRECTED_EDGE_KINDS.has(type);
+  }
+
+  function edgeGraphType(state, e) {
+    if (state.display.arrows && e.directed && state._sigmaPrograms && state._sigmaPrograms.EdgeArrowProgram) {
+      return "arrow";
+    }
+    return "line";
   }
 
   function nodeRadius(n, display) {
@@ -235,6 +513,42 @@
     const base = 3 + Math.sqrt(deg + Math.max(1, n.size)) * 2.2;
     const typeBoost = n.type === "theme" ? 2.2 : n.type === "topic" ? 1.5 : 1;
     return Math.max(3, base * typeBoost * (display.nodeScale || 1));
+  }
+
+  function applyEdgeTypes(state) {
+    if (state.kind !== "sigma" || !state.graph) return;
+    state.graph.forEachEdge((eid, attrs) => {
+      const directed = !!(attrs.directed || DIRECTED_EDGE_KINDS.has(attrs.edgeKind));
+      const type =
+        state.display.arrows && directed && state._sigmaPrograms && state._sigmaPrograms.EdgeArrowProgram
+          ? "arrow"
+          : "line";
+      state.graph.setEdgeAttribute(eid, "type", type);
+    });
+  }
+
+  function refreshBaseAttrs(state) {
+    if (state.kind !== "sigma") return;
+    const g = state.graph;
+    const d = state.display;
+    const p = readThemePalette(d);
+    g.forEachNode((id, attrs) => {
+      const n = state.nodes.get(id);
+      const color = (n && n.color) || d.nodeColor || p.nodeColor;
+      g.setNodeAttribute(id, "color", color);
+      g.setNodeAttribute(
+        id,
+        "size",
+        nodeRadius(n || { size: 1, degree: attrs.degree || 0, type: attrs.nodeKind || "work" }, d)
+      );
+    });
+    g.forEachEdge((eid, attrs) => {
+      const e = state.edges.get(eid);
+      const size = Math.max(1, (e ? e.weight : 0.2) * 2.2 * (d.edgeScale || 1));
+      g.setEdgeAttribute(eid, "color", d.edgeColor || p.edgeColor);
+      g.setEdgeAttribute(eid, "size", size);
+      g.setEdgeAttribute(eid, "type", edgeGraphType(state, e || { directed: attrs.directed }));
+    });
   }
 
   function setData(state, payload) {
@@ -254,8 +568,6 @@
 
     const g = state.graph;
     g.clear();
-    const w = state.container.clientWidth || 800;
-    const h = state.container.clientHeight || 600;
     nodes.forEach((n, i) => {
       const angle = (i / Math.max(1, nodes.length)) * Math.PI * 2;
       const r = 40 + (i % 7) * 18;
@@ -265,11 +577,11 @@
         y: n.y != null ? n.y : Math.sin(angle) * r + (Math.random() - 0.5) * 8,
         size: nodeRadius(n, state.display),
         color: n.color || state.display.nodeColor,
-        // Do NOT set graphology/sigma `type` — that selects a WebGL program (circle/…).
         nodeKind: n.type,
         degree: n.degree,
         ghost: n.ghost,
         external: n.external,
+        zIndex: 0,
       });
     });
     state.edges.forEach((e) => {
@@ -278,17 +590,19 @@
       try {
         g.addEdgeWithKey(e.id, e.source, e.target, {
           weight: e.weight,
-          size: Math.max(0.4, e.weight * 2 * (state.display.edgeScale || 1)),
+          size: Math.max(1, e.weight * 2 * (state.display.edgeScale || 1)),
           color: state.display.edgeColor,
           edgeKind: e.type,
           directed: e.directed,
+          type: edgeGraphType(state, e),
+          zIndex: 0,
         });
       } catch (_) {
         /* parallel edge */
       }
     });
     applyForces(state, true);
-    refreshStyles(state);
+    refreshBaseAttrs(state);
     if (state.sigma && state.sigma.refresh) state.sigma.refresh();
   }
 
@@ -305,7 +619,6 @@
     const nextIds = new Set(incoming.map((n) => n.id));
     const keepPos = getPositions(state);
 
-    // Remove gone nodes
     [...state.nodes.keys()].forEach((id) => {
       if (!nextIds.has(id) && g.hasNode(id)) {
         try {
@@ -345,6 +658,7 @@
           nodeKind: n.type,
           degree: n.degree,
           ghost: n.ghost,
+          zIndex: 0,
         });
       }
     });
@@ -366,16 +680,19 @@
         try {
           g.addEdgeWithKey(e.id, e.source, e.target, {
             weight: e.weight,
-            size: Math.max(0.4, e.weight * 2 * (state.display.edgeScale || 1)),
+            size: Math.max(1, e.weight * 2 * (state.display.edgeScale || 1)),
             color: state.display.edgeColor,
             edgeKind: e.type,
             directed: e.directed,
+            type: edgeGraphType(state, e),
+            zIndex: 0,
           });
         } catch (_) {}
       }
     });
     applyForces(state, true);
-    refreshStyles(state);
+    refreshBaseAttrs(state);
+    if (state.sigma) state.sigma.refresh();
   }
 
   function applyForces(state, reheat) {
@@ -459,77 +776,6 @@
     cam.animate({ ratio: next }, { duration: 120 });
   }
 
-  function refreshStyles(state) {
-    if (state.kind !== "sigma") return;
-    const g = state.graph;
-    const d = state.display;
-    const hi = state.highlight || {};
-    const focus = hi.focus;
-    const nbrs = hi.neighbors instanceof Set ? hi.neighbors : new Set(hi.neighbors || []);
-    const dimming = !!(focus || nbrs.size);
-
-    g.forEachNode((id, attrs) => {
-      const n = state.nodes.get(id);
-      let color = (n && n.color) || d.nodeColor;
-      let opacity = attrs.ghost ? 0.3 : 1;
-      if (dimming) {
-        const hot = id === focus || nbrs.has(id);
-        opacity = hot ? 1 : d.dimOpacity;
-        if (hot) color = d.accent;
-      }
-      g.setNodeAttribute(id, "color", color);
-      g.setNodeAttribute(
-        id,
-        "size",
-        nodeRadius(n || { size: 1, degree: attrs.degree || 0, type: attrs.nodeKind || "work" }, d)
-      );
-      // sigma 2 uses color alpha via hex; approximate dim by blending toward bg
-      if (opacity < 1 && !String(color).startsWith("#7f")) {
-        g.setNodeAttribute(id, "color", mixAlpha(color, opacity));
-      }
-    });
-
-    g.forEachEdge((eid, attrs, source, target) => {
-      const e = state.edges.get(eid);
-      let color = d.edgeColor;
-      let size = Math.max(0.35, (e ? e.weight : 0.2) * 2.2 * (d.edgeScale || 1));
-      if (dimming) {
-        const hot =
-          source === focus ||
-          target === focus ||
-          (nbrs.has(source) && (target === focus || nbrs.has(target))) ||
-          (nbrs.has(target) && source === focus);
-        if (hot) {
-          color = d.accent;
-          size *= 1.8;
-        } else {
-          color = mixAlpha("#999999", d.dimOpacity);
-        }
-      }
-      g.setEdgeAttribute(eid, "color", color);
-      g.setEdgeAttribute(eid, "size", size);
-    });
-    if (state.sigma) state.sigma.refresh();
-  }
-
-  function mixAlpha(hex, a) {
-    // Return rgba string for partial opacity
-    const h = String(hex || "#999999").replace("#", "");
-    if (h.length === 3) {
-      const r = parseInt(h[0] + h[0], 16);
-      const g = parseInt(h[1] + h[1], 16);
-      const b = parseInt(h[2] + h[2], 16);
-      return `rgba(${r},${g},${b},${a})`;
-    }
-    if (h.length >= 6) {
-      const r = parseInt(h.slice(0, 2), 16);
-      const g = parseInt(h.slice(2, 4), 16);
-      const b = parseInt(h.slice(4, 6), 16);
-      return `rgba(${r},${g},${b},${a})`;
-    }
-    return hex;
-  }
-
   function wireSigmaEvents(state) {
     const s = state.sigma;
     if (!s || !s.on) return;
@@ -539,63 +785,72 @@
     s.on("enterNode", ({ node }) => {
       const nbrs = new Set();
       state.graph.forEachNeighbor(node, (nb) => nbrs.add(nb));
-      state.highlight = { focus: node, neighbors: nbrs };
-      refreshStyles(state);
+      animateHighlight(state, { focus: node, neighbors: nbrs });
       if (state.onHover) state.onHover({ id: node, neighbors: [...nbrs] });
     });
     s.on("leaveNode", () => {
-      state.highlight = {};
-      refreshStyles(state);
+      animateHighlight(state, {});
       if (state.onHover) state.onHover(null);
     });
-    // Drag via camera / custom: sigma 2 has no built-in node drag; use mouse down + reheat
+    // Drag (refined in 3b step 3.5) — prevent camera pan while dragging.
     let drag = null;
+    let dragMoved = false;
+    const mouseCaptor = s.getMouseCaptor && s.getMouseCaptor();
     s.on("downNode", (e) => {
-      drag = { id: e.node };
+      if (e.preventSigmaDefault) e.preventSigmaDefault();
+      drag = { id: e.node, x0: e.event.x, y0: e.event.y };
+      dragMoved = false;
       state.pinned.add(e.node);
+      state.container.style.cursor = "grabbing";
       if (state.sim) state.sim.alphaTarget(0.3).restart();
     });
-    const onMove = (ev) => {
-      if (!drag || !state.sigma) return;
-      const pos = state.sigma.viewportToGraph
-        ? state.sigma.viewportToGraph({ x: ev.offsetX, y: ev.offsetY })
-        : null;
-      if (!pos) return;
-      const g = state.graph;
-      if (!g.hasNode(drag.id)) return;
-      g.setNodeAttribute(drag.id, "x", pos.x);
-      g.setNodeAttribute(drag.id, "y", pos.y);
-      if (state.sim) {
-        const n = state.sim.nodes().find((x) => x.id === drag.id);
-        if (n) {
-          n.fx = pos.x;
-          n.fy = pos.y;
-          n.x = pos.x;
-          n.y = pos.y;
+    if (mouseCaptor) {
+      mouseCaptor.on("mousemovebody", (e) => {
+        if (!drag) return;
+        if (e.preventSigmaDefault) e.preventSigmaDefault();
+        const dx = (e.x || 0) - (drag.x0 || 0);
+        const dy = (e.y || 0) - (drag.y0 || 0);
+        if (Math.hypot(dx, dy) > 3) dragMoved = true;
+        const pos = state.sigma.viewportToGraph
+          ? state.sigma.viewportToGraph({ x: e.x, y: e.y })
+          : null;
+        if (!pos || !state.graph.hasNode(drag.id)) return;
+        state.graph.setNodeAttribute(drag.id, "x", pos.x);
+        state.graph.setNodeAttribute(drag.id, "y", pos.y);
+        if (state.sim) {
+          const n = state.sim.nodes().find((x) => x.id === drag.id);
+          if (n) {
+            n.fx = pos.x;
+            n.fy = pos.y;
+            n.x = pos.x;
+            n.y = pos.y;
+          }
         }
-      }
-      state.sigma.refresh();
-    };
-    const onUp = () => {
-      if (!drag) return;
-      const id = drag.id;
-      drag = null;
-      if (state.sim) {
-        const n = state.sim.nodes().find((x) => x.id === id);
-        if (n) {
-          n.fx = n.x;
-          n.fy = n.y;
+        state.sigma.refresh();
+      });
+      mouseCaptor.on("mouseup", () => {
+        if (!drag) return;
+        const id = drag.id;
+        const wasDrag = dragMoved;
+        drag = null;
+        state.container.style.cursor = "";
+        if (state.sim) {
+          const n = state.sim.nodes().find((x) => x.id === id);
+          if (n) {
+            n.fx = n.x;
+            n.fy = n.y;
+          }
+          state.sim.alphaTarget(0);
         }
-        state.sim.alphaTarget(0);
-      }
-      // stay pinned where dropped (Obsidian-like until «Перестроить»)
-    };
-    state.container.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-    state._dragClean = () => {
-      state.container.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-    };
+        dragMoved = wasDrag;
+      });
+    }
+    s.on("enterNode", () => {
+      if (!drag) state.container.style.cursor = "grab";
+    });
+    s.on("leaveNode", () => {
+      if (!drag) state.container.style.cursor = "";
+    });
   }
 
   function focusNode(state, id) {
@@ -606,8 +861,9 @@
       const cam = state.sigma.getCamera();
       cam.animate({ x: attrs.x, y: attrs.y, ratio: cam.ratio }, { duration: 280 });
     }
-    state.highlight = { focus: id, neighbors: new Set(state.graph.neighbors(id)) };
-    refreshStyles(state);
+    const nbrs = new Set();
+    state.graph.forEachNeighbor(id, (nb) => nbrs.add(nb));
+    animateHighlight(state, { focus: id, neighbors: nbrs });
   }
 
   function getPositions(state) {
@@ -653,6 +909,7 @@
 
   function destroy(state) {
     state.destroyed = true;
+    if (state._fadeRaf) cancelAnimationFrame(state._fadeRaf);
     if (state.sim) state.sim.stop();
     if (state._dragClean) state._dragClean();
     if (state.sigma) {
@@ -669,11 +926,13 @@
     return String(s)
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
-  }
-  function escapeAttr(s) {
-    return escapeHtml(s).replace(/"/g, "&quot;");
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
   }
 
-  global.GraphView = { create, webglOk };
+  function escapeAttr(s) {
+    return escapeHtml(s).replace(/'/g, "&#39;");
+  }
+
+  global.GraphView = { create };
 })(typeof window !== "undefined" ? window : globalThis);
