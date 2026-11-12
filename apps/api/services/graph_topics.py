@@ -2949,10 +2949,13 @@ def view_overview(
     *,
     limit: int | None = None,
     collection: str | None = None,
+    include_topics: bool = True,
 ) -> dict[str, Any]:
+    """Global level: themes as hubs + their topics (Obsidian-like overview)."""
     params = payload.get("params") or load_params()
     cap = node_limit(params, limit)
     themes = list(payload.get("themes") or [])
+    topics_by_id = _topic_by_id(payload)
     if collection:
         wanted = collection
         keep_ids = set()
@@ -2960,15 +2963,43 @@ def view_overview(
             if theme.get("collection") == wanted:
                 keep_ids.add(theme["id"])
                 continue
-            # any member work in the collection
             for tid in theme.get("topic_ids") or []:
-                topic = _topic_by_id(payload).get(tid) or {}
+                topic = topics_by_id.get(tid) or {}
                 if topic.get("collection") == wanted:
                     keep_ids.add(theme["id"])
         themes = [t for t in themes if t["id"] in keep_ids]
     nodes = [_theme_node(t) for t in themes]
-    ids = {n["id"] for n in nodes}
-    edges = [e for e in theme_link_weights(payload) if e["source"] in ids and e["target"] in ids]
+    theme_ids = {n["id"] for n in nodes}
+    edges: list[dict[str, Any]] = [
+        e for e in theme_link_weights(payload) if e["source"] in theme_ids and e["target"] in theme_ids
+    ]
+    if include_topics:
+        topic_ids: set[str] = set()
+        for theme in themes:
+            for tid in theme.get("topic_ids") or []:
+                if tid in topics_by_id:
+                    topic_ids.add(tid)
+        for tid in sorted(topic_ids):
+            nodes.append(_topic_node(topics_by_id[tid]))
+        for theme in themes:
+            for tid in theme.get("topic_ids") or []:
+                if tid not in topic_ids:
+                    continue
+                edges.append(
+                    {
+                        "id": make_edge_id(theme["id"], tid, "has_topic"),
+                        "source": theme["id"],
+                        "target": tid,
+                        "type": "has_topic",
+                        "weight": 1.0,
+                        "weak": False,
+                        "provenance": {"level": "hierarchy"},
+                    }
+                )
+        # Soft topic↔topic links inside the overview (helps layout).
+        for edge in _topic_links(payload):
+            if edge["source"] in topic_ids and edge["target"] in topic_ids:
+                edges.append(edge)
     return _envelope(
         payload,
         level="overview",
@@ -2984,17 +3015,25 @@ def view_overview(
 
 
 def view_theme(payload: dict[str, Any], theme_id: str, *, limit: int | None = None) -> dict[str, Any] | None:
+    """Theme level: topics + member works; outer topic/work links as ghost nodes."""
     theme = _theme_by_id(payload).get(theme_id)
     if not theme:
         return None
     params = payload.get("params") or load_params()
     cap = node_limit(params, limit)
     topics = _topic_by_id(payload)
+    works = payload.get("works") or {}
+    assign = payload.get("assignments") or {}
     inside = [topics[tid] for tid in theme.get("topic_ids") or [] if tid in topics]
     inside_ids = {t["id"] for t in inside}
+    work_ids: set[str] = set()
+    for t in inside:
+        for wk in t.get("work_keys") or []:
+            if wk in works:
+                work_ids.add(wk)
     links = _topic_links(payload)
-    external_ids = set()
-    kept_links = []
+    external_topic_ids: set[str] = set()
+    kept_links: list[dict[str, Any]] = []
     for edge in links:
         a_in = edge["source"] in inside_ids
         b_in = edge["target"] in inside_ids
@@ -3002,12 +3041,46 @@ def view_theme(payload: dict[str, Any], theme_id: str, *, limit: int | None = No
             kept_links.append(edge)
         elif a_in or b_in:
             kept_links.append(edge)
-            external_ids.add(edge["target"] if a_in else edge["source"])
+            external_topic_ids.add(edge["target"] if a_in else edge["source"])
     nodes = [_topic_node(t) for t in inside]
-    for tid in sorted(external_ids):
+    for tid in sorted(external_topic_ids):
         if tid in topics:
             node = _topic_node(topics[tid])
             node["attrs"]["external"] = True
+            node["attrs"]["ghost"] = True
+            nodes.append(node)
+    for wk in sorted(work_ids):
+        nodes.append(_work_node(payload, wk))
+        tid = (assign.get(wk) or {}).get("topic_id")
+        if tid:
+            kept_links.append(
+                {
+                    "id": make_edge_id(tid, f"work:{wk}", "has_work"),
+                    "source": tid,
+                    "target": f"work:{wk}",
+                    "type": "has_work",
+                    "weight": 1.0,
+                    "weak": False,
+                    "provenance": {"level": "hierarchy"},
+                }
+            )
+    member_work_nodes = {f"work:{wk}" for wk in work_ids}
+    ghost_works: set[str] = set()
+    for edge in payload.get("work_edges") or []:
+        a_in = edge["source"] in member_work_nodes
+        b_in = edge["target"] in member_work_nodes
+        if a_in and b_in:
+            kept_links.append(edge)
+        elif a_in or b_in:
+            kept_links.append(edge)
+            other = edge["target"] if a_in else edge["source"]
+            if other.startswith("work:"):
+                ghost_works.add(other[5:])
+    for wk in sorted(ghost_works):
+        if wk in works and wk not in work_ids:
+            node = _work_node(payload, wk)
+            node["attrs"]["external"] = True
+            node["attrs"]["ghost"] = True
             nodes.append(node)
     return _envelope(payload, level="theme", nodes=nodes, edges=kept_links, limit=cap, seed=theme_id)
 
@@ -3101,10 +3174,16 @@ def view_local(
     depth: int = 1,
     types: list[str] | None = None,
     limit: int | None = None,
+    directions: set[str] | None = None,
 ) -> dict[str, Any] | None:
+    """Local graph (Obsidian-like). ``directions`` ⊆ {in, out, undirected}."""
     params = payload.get("params") or load_params()
     cap = node_limit(params, limit)
     depth = max(1, min(3, int(depth)))
+    dirs = directions or {"in", "out", "undirected"}
+    want_in = "in" in dirs
+    want_out = "out" in dirs
+    want_und = "undirected" in dirs or "both" in dirs or "neighbor" in dirs
     nodes = _all_nodes(payload)
     by_id = {n["id"]: n for n in nodes}
     if node_id not in by_id:
@@ -3113,10 +3192,32 @@ def view_local(
     allowed = _normalize_types(types)
     if allowed is not None:
         edges = [e for e in edges if e["type"] in allowed]
+    directed_types = {
+        "refers_to",
+        "work_refers_to",
+        "mentions_author",
+        "wrote",
+        "contains",
+        "part_of",
+        "has_topic",
+        "has_work",
+    }
     adj: dict[str, list[str]] = defaultdict(list)
     for edge in edges:
-        adj[edge["source"]].append(edge["target"])
-        adj[edge["target"]].append(edge["source"])
+        typ = str(edge.get("type") or "")
+        src, tgt = edge["source"], edge["target"]
+        is_dir = typ in directed_types
+        if is_dir:
+            if want_out:
+                adj[src].append(tgt)
+            if want_in:
+                adj[tgt].append(src)
+            if want_und and not want_in and not want_out:
+                adj[src].append(tgt)
+                adj[tgt].append(src)
+        elif want_und:
+            adj[src].append(tgt)
+            adj[tgt].append(src)
     seen = {node_id}
     frontier = [node_id]
     for _ in range(depth):
@@ -3128,8 +3229,17 @@ def view_local(
                     nxt.append(nb)
         frontier = nxt
     kept_nodes = [by_id[nid] for nid in sorted(seen) if nid in by_id]
-    # seed first stability: sorted is fine; envelope ranks by size
-    kept_edges = [e for e in edges if e["source"] in seen and e["target"] in seen]
+    kept_edges = []
+    for edge in edges:
+        if edge["source"] not in seen or edge["target"] not in seen:
+            continue
+        typ = str(edge.get("type") or "")
+        is_dir = typ in directed_types
+        if is_dir:
+            if want_out or want_in or want_und:
+                kept_edges.append(edge)
+        elif want_und:
+            kept_edges.append(edge)
     return _envelope(
         payload, level="local", nodes=kept_nodes, edges=kept_edges, limit=cap, seed=node_id
     )

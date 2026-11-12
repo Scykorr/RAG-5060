@@ -43,10 +43,17 @@ def graph_overview(
     view: str = Query(default=""),
     limit: int | None = Query(default=None),
     collection: str = "",
+    include_topics: bool = Query(default=True),
 ):
     """Explorer totals, or level view of themes when ``view=levels``."""
     if view in {"levels", "themes"}:
-        return _level_overview(request, user, limit=limit, collection=collection)
+        return _level_overview(
+            request,
+            user,
+            limit=limit,
+            collection=collection,
+            include_topics=include_topics,
+        )
     return GraphService(db, user).overview()
 
 
@@ -448,13 +455,19 @@ def _level_overview(
     *,
     limit: int | None,
     collection: str,
+    include_topics: bool = True,
 ):
     from apps.api.services.graph_topics import view_overview
 
     payload = _topics_payload(user)
     return _level_json(
         request,
-        view_overview(payload, limit=limit, collection=collection or None),
+        view_overview(
+            payload,
+            limit=limit,
+            collection=collection or None,
+            include_topics=include_topics,
+        ),
     )
 
 
@@ -495,16 +508,22 @@ def graph_local(
     user: Annotated[AuthUser, Depends(get_current_user)],
     depth: int = Query(default=1, ge=1, le=3),
     types: str = "",
+    directions: str = Query(
+        default="in,out,undirected",
+        description="Comma list: in,out,undirected (Obsidian local-graph dirs)",
+    ),
     limit: int | None = Query(default=None),
 ):
     from apps.api.services.graph_topics import view_local
 
     wanted = [part.strip() for part in types.split(",") if part.strip()]
+    dirs = {part.strip() for part in directions.split(",") if part.strip()} or None
     body = view_local(
         _topics_payload(user),
         node_id,
         depth=depth,
         types=wanted or None,
+        directions=dirs,
         limit=limit,
     )
     if not body:
