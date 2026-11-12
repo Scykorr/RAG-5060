@@ -58,8 +58,17 @@ def ctfidf(
     return out
 
 
-def default_label(terms: list[str], central_title: str | None, *, n_terms: int = 3) -> str:
-    """2–4 characteristic terms and the central work title."""
+def default_label(
+    terms: list[str],
+    central_title: str | None = None,
+    *,
+    n_terms: int = 3,
+    with_title: bool = False,
+) -> str:
+    """Fallback label: up to ``n_terms`` characteristic terms (no work title by default).
+
+    Slice 2d: spare titles are ``term1, term2, term3`` — never ``terms — <work>``.
+    """
     picked: list[str] = []
     for raw in terms:
         t = str(raw or "").strip()
@@ -68,17 +77,18 @@ def default_label(terms: list[str], central_title: str | None, *, n_terms: int =
         if t.casefold() in {p.casefold() for p in picked}:
             continue
         picked.append(t)
-        if len(picked) >= max(2, min(4, n_terms)):
+        if len(picked) >= max(1, min(4, n_terms)):
             break
-    title = (central_title or "").strip()
-    if len(title) > 64:
-        title = title[:61].rstrip() + "…"
-    head = ", ".join(picked[:4])
-    if head and title:
-        return f"{head} — {title}"
-    if head:
-        return head
-    return title or "Тема"
+    head = ", ".join(picked[:n_terms])
+    if with_title:
+        title = (central_title or "").strip()
+        if len(title) > 64:
+            title = title[:61].rstrip() + "…"
+        if head and title:
+            return f"{head} — {title}"
+        if title and not head:
+            return title
+    return head or "Тема"
 
 
 def maybe_llm_label(
