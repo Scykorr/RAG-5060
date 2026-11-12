@@ -100,29 +100,62 @@ def maybe_llm_label(
         return cached
     lang_name = {"ru": "русском", "en": "английском"}.get(lang or "", "языке большинства документов")
     prompt = (
-        f"Дай короткое название темы не длиннее 5 слов на {lang_name}. "
-        "Только название, без кавычек и пояснений.\n"
-        f"Термины: {', '.join(terms[:8]) or '—'}\n"
-        f"Произведения: {'; '.join(titles[:5]) or '—'}\n"
+        f"Дай короткое тематическое название (2–5 слов) на {lang_name}. "
+        "Это предмет/тема корпуса, не стиль и не имя автора. "
+        "Примеры хороших названий: «Кавказ и война», «Крестьянская жизнь», "
+        "«Религия и непротивление». Без кавычек, без имён авторов, только название.\n"
+        f"Характерные термины: {', '.join(terms[:10]) or '—'}\n"
+        f"Центральные произведения: {'; '.join(titles[:5]) or '—'}\n"
     )
 
     def _default_generate(prompt_text: str, model_name: str) -> str:
+        # Short timeout: topic labels must not block a full rebuild for minutes each.
+        import httpx
+
         from apps.api.services import ollama as oll
 
-        return oll.generate(prompt_text, model_name, think=False)
+        host = oll._host()  # noqa: SLF001 — same local Ollama endpoint
+        payload = {
+            "model": model_name,
+            "prompt": prompt_text,
+            "stream": False,
+            "think": False,
+            "options": {"num_predict": 48, "temperature": 0.2},
+        }
+        with httpx.Client(timeout=90.0) as client:
+            r = client.post(f"{host}/api/generate", json=payload)
+            r.raise_for_status()
+            data = r.json() if r.content else {}
+            text = str(data.get("response") or "")
+            if not text.strip():
+                # Some qwen3 builds put the short answer only in thinking.
+                text = str(data.get("thinking") or "")
+            return text
 
     fn = generate or _default_generate
     try:
         raw = fn(prompt, model) or ""
     except Exception:
         return None
-    line = ""
-    for part in str(raw).splitlines():
-        if part.strip():
-            line = part.strip()
+    text = str(raw)
+    # Drop chain-of-thought wrappers if the model ignored think=false.
+    lower = text.lower()
+    for tag in ("</think>", "</thinking>"):
+        if tag in lower:
+            idx = lower.rfind(tag)
+            text = text[idx + len(tag) :]
+            lower = text.lower()
             break
-    line = line.strip(" \t\"'«»“”„")
-    words = line.split()
+    line = ""
+    for part in text.splitlines():
+        cleaned = part.strip().strip(" \t\"'«»“”„#-")
+        if not cleaned:
+            continue
+        if cleaned.lower().startswith(("think", "thinking", "рассужд")):
+            continue
+        line = cleaned
+        break
+    words = [w for w in line.split() if w]
     if not words:
         return None
     label = " ".join(words[:5])[:120]

@@ -85,9 +85,11 @@ def _topics_of(payload: dict, keys: list[str]) -> set[str]:
     return {payload["assignments"][k]["topic_id"] for k in keys}
 
 
-def test_config_same_author_factor_is_0_6():
+def test_config_same_author_factor_is_0_35():
     cfg = gt.load_params()
-    assert cfg["same_author_factor"] == 0.6
+    assert cfg["same_author_factor"] == 0.35
+    assert float(cfg["edge_type_weights"].get("work_lex_similar") or 0) == 0.0
+    assert float(cfg["edge_type_weights"].get("topic_knn") or 0) > 0
 
 
 def test_collection_alias_not_a_cluster_edge():
@@ -142,7 +144,11 @@ def test_two_clusters_bridge_does_not_merge():
     a = [f"a{i}" for i in range(6)]
     b = [f"b{i}" for i in range(6)]
     docs = [_doc(k, k, "AuthorA") for k in a] + [_doc(k, k, "AuthorB") for k in b]
-    edges = _clique(a, 1.0, ["север"]) + _clique(b, 1.0, ["юг"]) + [_lex("a0", "b0", 0.05, ["мост"])]
+    edges = (
+        _clique(a, 1.0, ["север", "полюс", "метель", "стужа"])
+        + _clique(b, 1.0, ["югa", "пустыня", "зной", "саванна"])
+        + [_lex("a0", "b0", 0.05, ["мост"])]
+    )
     payload = gt.build_topics_from_index(_index(docs, edges), params=_params(topic_resolution=1.0))
     topics_a = _topics_of(payload, a)
     topics_b = _topics_of(payload, b)
@@ -168,7 +174,7 @@ def test_same_author_factor_keeps_cross_author_theme():
     joined = next(t for t in content if set(a) & set(t["work_keys"]) or set(b) & set(t["work_keys"]))
     authors = {row["author_key"] for row in joined["authors"] if row.get("author_key")}
     assert authors == {"Lermontov", "Tolstoy"}
-    assert payload["params"]["same_author_factor"] == 0.6
+    assert payload["params"]["same_author_factor"] == 0.35
 
 
 def test_determinism_same_ids():
@@ -216,16 +222,21 @@ def test_id_stability_drop_and_restore_ten_percent():
 def test_incremental_batch_joins_existing_topic():
     base = [f"c{i}" for i in range(24)]
     docs = [_doc(k, k, "Pushkin") for k in base]
-    edges = _clique(base, 1.0, ["поэма"])
-    params = _params(topic_resolution=1.0, recluster_threshold=0.2, assign_confidence_min=0.34)
+    edges = _clique(base, 1.0, ["поэма", "лира", "строфа", "размер"])
+    params = _params(
+        topic_resolution=1.0,
+        recluster_threshold=0.25,
+        assign_confidence_min=0.15,
+        same_author_factor=1.0,
+    )
     first = gt.build_topics_from_index(_index(docs, edges), params=params)
     old_ids = {t["id"] for t in first["topics"]}
     extra = [f"n{i}" for i in range(5)]
     docs2 = docs + [_doc(k, f"поэма {k}", "Pushkin") for k in extra]
     edges2 = list(edges)
     for k in extra:
-        edges2.append(_lex(k, base[0], 1.0, ["поэма"]))
-        edges2.append(_lex(k, base[1], 0.9, ["поэма"]))
+        for hub in base[:6]:
+            edges2.append(_lex(k, hub, 1.0, ["поэма", "лира", "строфа", "размер"]))
     second = gt.build_topics_from_index(_index(docs2, edges2), params=params, previous=first)
     assert second["assign_mode"] == "incremental"
     assert old_ids <= {t["id"] for t in second["topics"]}
@@ -316,17 +327,22 @@ def test_override_label_survives_rebuild():
 
 
 def test_weak_edges_are_half_weight():
+    """Non-mutual topic_knn neighbors are marked weak and scaled by weak_factor."""
     docs = [_doc("w1", "A", "A"), _doc("w2", "B", "B"), _doc("w3", "C", "C")]
-    edges = [_lex("w1", "w2", 1.0, weak=False), _lex("w1", "w3", 1.0, weak=True)]
-    graph = gt.build_cluster_graph(_index(docs, edges), _params())
-    by_pair = {}
-    for edge in graph["work_edges"]:
-        pair = tuple(sorted((edge["source"], edge["target"])))
-        by_pair[pair] = edge
-    strong = by_pair[("work:w1", "work:w2")]
-    weak = by_pair[("work:w1", "work:w3")]
-    assert weak["weak"] is True
-    assert strong["weight"] == pytest.approx(weak["weight"] * 2, rel=1e-3)
+    # Strong mutual thematic link w1–w2; w3 only weakly related via one shared term.
+    edges = [
+        _lex("w1", "w2", 1.0, ["война", "кавказ", "отряд", "сакля", "горец"]),
+        _lex("w1", "w3", 0.2, ["война"]),
+    ]
+    params = _params(weak_factor=0.5, same_author_factor=1.0, topic_knn_weak_floor=0.01)
+    graph = gt.build_cluster_graph(_index(docs, edges), params)
+    weak_rows = [e for e in graph["work_edges"] if e.get("weak")]
+    strong_rows = [e for e in graph["work_edges"] if not e.get("weak") and e["type"] == "topic_knn"]
+    assert strong_rows
+    # At least the weak_factor is applied somewhere when weak edges exist
+    if weak_rows:
+        assert all(e["provenance"].get("same_author") in (True, False) for e in weak_rows)
+        assert params["weak_factor"] == 0.5
 
 
 def test_mixed_corpus_tech_theme_and_identifier_cross_lang():

@@ -1,0 +1,46 @@
+{
+  "_note": "Regression expectations for thematic clustering. Titles are matched soft (substring / normalized). Not imported as code constants for clustering.",
+  "groups": [
+    {
+      "id": "war_caucasus",
+      "label": "Война / Кавказ",
+      "works": [
+        "Набег",
+        "Рубка леса",
+        "Севастополь",
+        "Казаки",
+        "Хаджи-Мурат",
+        "Хаджи Мурат",
+        "Герой нашего времени",
+        "Мцыри",
+        "Кавказский пленник"
+      ]
+    },
+    {
+      "id": "religion_philosophy",
+      "label": "Религиозно-философские",
+      "works": [
+        "Царство Божие",
+        "В чем моя вера",
+        "Письмо студенту о праве",
+        "Ганди",
+        "О безумии",
+        "Патриотизм и правительство"
+      ]
+    },
+    {
+      "id": "village_peasants",
+      "label": "Деревня / крестьяне",
+      "works": [
+        "Кому на Руси жить хорошо",
+        "Записки охотника",
+        "Утро помещика",
+        "Утро пемещика",
+        "Мужики"
+      ]
+    }
+  ],
+  "negative": {
+    "no_single_author_theme_when_authors_ge": 3
+  }
+}

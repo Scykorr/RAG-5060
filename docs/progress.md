@@ -1,3 +1,14 @@
+## 2026-11-11 — Slice 2b (thematic vectors, not author folders)
+
+- Report: `artifacts/20261112-052018-topics/`
+- `topic_vectors`: author-entropy ≥0.5 & ≥3 authors, style stops + auto-style, ru gerunds, noun boost, leave-one-out debias α=0.6, term_cap/top_k for speed
+- Cluster graph: `topic_knn` (k=10, cross-author quota), `same_author_factor` **0.35**; `work_lex_similar` weight 0 (viz only)
+- Quality: lex_same_author_share **0.3458** (was 0.978); theme mean purity **0.3682** (≤0.75); 100% pure themes **0**; expectations **3/3**
+- Labels: thematic c-TF-IDF + Ollama `qwen3:8b` (fallback terms); secondary_topics in API
+- Perf: noop **17ms**; recluster id overlap **1.0**; full w/ LLM ~137s (cluster-only ~70s); incremental assign mode after graph reuse
+- Config: `configs/graph_topics_expectations.json`, `topic_style_stopwords` in lexicon; pytest topic unit **22 passed**
+- No α-grid needed (purity already ≤0.75 at α=0.6 / factor=0.35)
+
 ## 2026-11-11 — Slice 2 steps 1–7 (themes/topics)
 
 - INDEX_VERSION stays **16** (collection is an alias of `in_theme`; no index rebuild)

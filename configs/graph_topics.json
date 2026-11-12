@@ -1,12 +1,13 @@
 {
-  "_note": "Offline topic/theme clustering parameters. No corpus-specific titles or authors.",
+  "_note": "Offline topic/theme clustering. Slice 2b: thematic vectors, not raw work_lex_similar.",
   "edge_type_weights": {
-    "work_lex_similar": 0.45,
+    "topic_knn": 1.0,
     "work_refers_to": 1.9,
     "work_shared_entity": 1.8,
-    "contains": 0.3
+    "contains": 0.3,
+    "work_lex_similar": 0.0
   },
-  "same_author_factor": 0.6,
+  "same_author_factor": 0.35,
   "weak_factor": 0.5,
   "min_edge_weight": 0.02,
   "topic_resolution": 2.6,
@@ -18,12 +19,26 @@
   "seed": 42,
   "max_passes": 16,
   "max_levels": 6,
-  "llm": false,
+  "llm": true,
   "llm_model": "qwen3:8b",
   "node_limit_default": 1500,
   "node_limit_max": 3000,
   "label_terms": 3,
   "characteristic_terms": 10,
   "central_works": 5,
-  "topics_schema": 1
+  "topics_schema": 2,
+  "min_author_entropy": 0.5,
+  "min_topic_authors": 3,
+  "author_debias_alpha": 0.6,
+  "topic_knn_k": 10,
+  "cross_author_min_neighbors": 3,
+  "cross_author_min_sim": 0.15,
+  "topic_knn_weak_floor": 0.08,
+  "secondary_max": 2,
+  "secondary_score_ratio": 0.6,
+  "segment_chunk_threshold": 20,
+  "segment_top_terms": 3,
+  "topic_term_cap": 2000,
+  "topic_raw_top_k": 800,
+  "topic_vector_top_k": 400
 }

@@ -28,7 +28,8 @@ _ROOT = Path(__file__).resolve().parents[3]
 _PARAMS_PATH = _ROOT / "configs" / "graph_topics.json"
 _OVERRIDES_PATH = _ROOT / "configs" / "graph_topics_overrides.json"
 
-_CLUSTER_TYPES = ("work_lex_similar", "work_refers_to", "work_shared_entity", "contains")
+# work_lex_similar is display-only for topics (weight 0); clustering uses topic_knn.
+_CLUSTER_TYPES = ("topic_knn", "work_refers_to", "work_shared_entity", "contains")
 _DIRECTED = {
     "wrote",
     "part_of",
@@ -45,12 +46,13 @@ _DIRECTED = {
 
 _DEFAULTS: dict[str, Any] = {
     "edge_type_weights": {
-        "work_lex_similar": 0.45,
+        "topic_knn": 1.0,
         "work_refers_to": 1.9,
         "work_shared_entity": 1.8,
         "contains": 0.3,
+        "work_lex_similar": 0.0,
     },
-    "same_author_factor": 0.6,
+    "same_author_factor": 0.35,
     "weak_factor": 0.5,
     "min_edge_weight": 0.02,
     "topic_resolution": 2.6,
@@ -62,14 +64,28 @@ _DEFAULTS: dict[str, Any] = {
     "seed": 42,
     "max_passes": 16,
     "max_levels": 6,
-    "llm": False,
+    "llm": True,
     "llm_model": "qwen3:8b",
     "node_limit_default": 1500,
     "node_limit_max": 3000,
     "label_terms": 3,
     "characteristic_terms": 10,
     "central_works": 5,
-    "topics_schema": 1,
+    "topics_schema": 2,
+    "min_author_entropy": 0.5,
+    "min_topic_authors": 3,
+    "author_debias_alpha": 0.6,
+    "topic_knn_k": 10,
+    "cross_author_min_neighbors": 3,
+    "cross_author_min_sim": 0.15,
+    "topic_knn_weak_floor": 0.08,
+    "secondary_max": 2,
+    "secondary_score_ratio": 0.6,
+    "segment_chunk_threshold": 20,
+    "segment_top_terms": 3,
+    "topic_term_cap": 2000,
+    "topic_raw_top_k": 800,
+    "topic_vector_top_k": 400,
 }
 
 
@@ -112,6 +128,11 @@ def load_params(path: str | Path | None = None) -> dict[str, Any]:
         "recluster_threshold",
         "assign_confidence_min",
         "jaccard_match",
+        "min_author_entropy",
+        "author_debias_alpha",
+        "cross_author_min_sim",
+        "topic_knn_weak_floor",
+        "secondary_score_ratio",
     ):
         cfg[num_key] = float(cfg[num_key])
     for int_key in (
@@ -125,6 +146,15 @@ def load_params(path: str | Path | None = None) -> dict[str, Any]:
         "characteristic_terms",
         "central_works",
         "topics_schema",
+        "min_topic_authors",
+        "topic_knn_k",
+        "cross_author_min_neighbors",
+        "secondary_max",
+        "segment_chunk_threshold",
+        "segment_top_terms",
+        "topic_term_cap",
+        "topic_raw_top_k",
+        "topic_vector_top_k",
     ):
         cfg[int_key] = int(cfg[int_key])
     cfg["llm"] = bool(cfg["llm"])
@@ -334,16 +364,47 @@ def _work_key_of(node: str, known: set[str]) -> str | None:
     return text if text in known else None
 
 
+def _work_terms_from_index_edges(
+    index: dict[str, Any],
+    works: dict[str, dict[str, Any]],
+) -> dict[str, Counter]:
+    """Fallback term bags from lex-edge provenance (unit tests / no artifacts)."""
+    counts: dict[str, Counter] = {wk: Counter() for wk in works}
+    known = set(works)
+    for edge in index.get("edges") or []:
+        if not isinstance(edge, dict):
+            continue
+        if str(edge.get("type") or "") != "work_lex_similar":
+            continue
+        terms = _collect_terms(edge.get("provenance") or {})
+        if not terms:
+            continue
+        wa = _work_key_of(str(edge.get("source")), known)
+        wb = _work_key_of(str(edge.get("target")), known)
+        for wk in (wa, wb):
+            if not wk:
+                continue
+            for term in terms:
+                stem = str(term).strip()
+                if len(stem) >= 4:
+                    counts[wk][stem] += 1
+    return counts
+
+
 def build_cluster_graph(
     index: dict[str, Any],
     params: dict[str, Any],
+    *,
+    work_terms: dict[str, Counter] | None = None,
 ) -> dict[str, Any]:
     """Canonical works and content edges used for Louvain.
 
-    Weights are a normalized sum of lex / refers / strong shared-entity / contains.
-    Same-author links are multiplied by ``same_author_factor``. Weak links by
-    ``weak_factor``. Structural edges are ignored.
+    Clustering edges: ``topic_knn`` (thematic vectors) + refers + strong
+    shared_entity + contains. ``work_lex_similar`` is not fused into the topic
+    graph (weight 0) — it remains available on the connectivity index for UI.
     """
+    from apps.api.services import graph_topic_vectors as gtv
+
     docs = [d for d in (index.get("documents") or []) if isinstance(d, dict)]
     works = _canonical_works(docs)
     known = set(works)
@@ -352,6 +413,18 @@ def build_cluster_graph(
     same_factor = float(params["same_author_factor"])
     weak_factor = float(params["weak_factor"])
     min_w = float(params["min_edge_weight"])
+
+    term_bags = work_terms or _work_terms_from_index_edges(index, works)
+    built = gtv.build_topic_vectors(term_bags, works, params)
+    vectors = built["vectors"]
+    knn = gtv.knn_edges(
+        vectors,
+        works,
+        k=int(params.get("topic_knn_k") or 10),
+        cross_author_min=int(params.get("cross_author_min_neighbors") or 3),
+        cross_author_min_sim=float(params.get("cross_author_min_sim") or 0.15),
+        weak_floor=float(params.get("topic_knn_weak_floor") or 0.08),
+    )
 
     raw: dict[tuple[str, str, str], float] = {}
     meta: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -366,7 +439,6 @@ def build_cluster_graph(
         slot = meta.setdefault(key, {"weak": False, "provenance": {}})
         if prov.get("weak") or prov.get("weak") is True:
             slot["weak"] = True
-        # keep the heavier provenance blob
         terms = _collect_terms(prov)
         if terms:
             merged = list(slot["provenance"].get("terms") or [])
@@ -380,6 +452,16 @@ def build_cluster_graph(
             copied["_w"] = float(raw_w)
             slot["provenance"] = copied
 
+    for edge in knn:
+        wa = _work_key_of(str(edge.get("source")), known)
+        wb = _work_key_of(str(edge.get("target")), known)
+        if not wa or not wb:
+            continue
+        prov = dict(edge.get("provenance") or {})
+        if edge.get("weak"):
+            prov["weak"] = True
+        _add(wa, wb, "topic_knn", float(edge.get("weight") or 0), prov)
+
     for edge in index.get("edges") or []:
         if not isinstance(edge, dict):
             continue
@@ -390,7 +472,7 @@ def build_cluster_graph(
         weight = float(edge.get("weight") or 0)
         if weight <= 0 or is_collection_edge(edge):
             continue
-        if typ in {"wrote", "part_of", "work_meta", "work_mentions_author", "mentions_author"}:
+        if typ in {"wrote", "part_of", "work_meta", "work_mentions_author", "mentions_author", "work_lex_similar"}:
             continue
         if typ == "contains":
             da = by_doc.get(str(edge.get("source")))
@@ -401,7 +483,7 @@ def build_cluster_graph(
             wb = str(db.get("work_key") or "")
             _add(wa, wb, "contains", weight, prov)
             continue
-        if typ not in _CLUSTER_TYPES:
+        if typ not in {"work_refers_to", "work_shared_entity"}:
             continue
         if typ == "work_shared_entity" and not _shared_ok(prov):
             continue
@@ -417,6 +499,8 @@ def build_cluster_graph(
 
     fused: dict[tuple[str, str], dict[str, Any]] = {}
     work_edges: list[dict[str, Any]] = []
+    same_author_edges = 0
+    topic_knn_edges = 0
     for (wa, wb, typ), value in sorted(raw.items()):
         peak = max_raw.get(typ) or 1.0
         coeff = float(weights_cfg.get(typ) or 0)
@@ -433,8 +517,11 @@ def build_cluster_graph(
         if ak_a and ak_b and ak_a == ak_b:
             same = True
             scaled *= same_factor
+            same_author_edges += 1
         if scaled <= 0:
             continue
+        if typ == "topic_knn":
+            topic_knn_edges += 1
         prov = _slim_provenance(slot["provenance"])
         prov.pop("_w", None)
         prov["raw"] = round(value, 6)
@@ -470,8 +557,6 @@ def build_cluster_graph(
         adj[wa][wb] = bucket["weight"]
         adj[wb][wa] = bucket["weight"]
 
-    # Drop display edges that were filtered by the fused floor (both ends now unlinked
-    # for that pair). Keep them if the pair survived.
     alive = {tuple(sorted((a, b))) for a, nbrs in adj.items() for b in nbrs}
     work_edges = [
         e
@@ -479,7 +564,18 @@ def build_cluster_graph(
         if tuple(sorted((e["source"][5:], e["target"][5:]))) in alive
     ]
     work_edges.sort(key=lambda e: (e["type"], e["source"], e["target"]))
-    return {"works": works, "adj": adj, "work_edges": work_edges, "fused": fused}
+    n_edges = max(1, len(work_edges))
+    return {
+        "works": works,
+        "adj": adj,
+        "work_edges": work_edges,
+        "fused": fused,
+        "vectors": vectors,
+        "vector_debug": built.get("debug") or {},
+        "segment_terms": built.get("segment_terms") or {},
+        "lex_same_author_share": round(same_author_edges / n_edges, 4),
+        "topic_knn_edges": topic_knn_edges,
+    }
 
 
 def _degree0(works: dict[str, Any], adj: dict[str, dict[str, float]]) -> list[str]:
@@ -839,9 +935,11 @@ def _ban_terms(works: dict[str, dict[str, Any]]) -> set[str]:
             ban.add(str(info["author_ru"]).casefold())
     try:
         from apps.api.services.graph_lexicon import lang_frozenset
+        from apps.api.services import graph_topic_vectors as gtv
 
         for lang in ("ru", "en"):
             ban |= {str(x).casefold() for x in lang_frozenset(lang, "lex_stopwords")}
+            ban |= {str(x).casefold() for x in gtv.style_stopwords(lang)}
     except Exception:
         pass
     return ban
@@ -853,7 +951,7 @@ def _terms_from_edges(
 ) -> dict[str, Counter]:
     counts: dict[str, Counter] = {wk: Counter() for wk in works}
     for edge in work_edges:
-        if edge.get("type") != "work_lex_similar":
+        if edge.get("type") not in {"topic_knn", "work_lex_similar"}:
             continue
         terms = _collect_terms(edge.get("provenance") or {})
         for endpoint in (edge["source"], edge["target"]):
@@ -986,6 +1084,49 @@ def _density(members: set[str], adj: dict[str, dict[str, float]]) -> float:
     return round((2.0 * edges) / (n * (n - 1)), 4)
 
 
+def _thematic_label_terms(
+    work_terms: dict[str, Counter],
+    works: dict[str, dict[str, Any]],
+    params: dict[str, Any],
+) -> dict[str, Counter]:
+    """Label vocabulary = thematic dictionary only (style/low-entropy dropped)."""
+    from apps.api.services import graph_topic_vectors as gtv
+
+    min_ent = float(params.get("min_author_entropy") or 0.5)
+    min_authors = int(params.get("min_topic_authors") or 3)
+    entropy = gtv.author_term_entropy(work_terms, works)
+    groups = {gtv._source_group(w) for w in works.values()}  # noqa: SLF001
+    author_groups = {g for g in groups if g and str(g).startswith("author:")}
+    apply_entropy = len(author_groups) >= min_authors
+    style_by_lang = {"ru": gtv.style_stopwords("ru"), "en": gtv.style_stopwords("en")}
+    auto_style = gtv.detect_style_stems(work_terms, works)
+    out: dict[str, Counter] = {}
+    for wk, counts in work_terms.items():
+        lang = str((works.get(wk) or {}).get("language") or "ru")
+        stops = style_by_lang["en"] if lang.startswith("en") else style_by_lang["ru"]
+        slot: Counter = Counter()
+        for stem, tf in counts.items():
+            mult = gtv.thematic_weight(
+                str(stem),
+                lang=lang,
+                entropy_info=entropy.get(str(stem)),
+                style_stops=stops,
+                auto_style=auto_style,
+                min_author_entropy=min_ent,
+                min_authors=min_authors,
+                apply_entropy=apply_entropy,
+            )
+            # Labels drop downweighted author-private stems (vectors keep ×0.1).
+            if mult < 0.5:
+                continue
+            try:
+                slot[str(stem)] += int(tf)
+            except (TypeError, ValueError):
+                continue
+        out[wk] = slot
+    return out
+
+
 def _decorate(
     topics: list[dict[str, Any]],
     themes: list[dict[str, Any]],
@@ -1000,6 +1141,7 @@ def _decorate(
     llm_generate: Callable[[str, str], str] | None,
 ) -> None:
     ban = _ban_terms(works)
+    label_terms = _thematic_label_terms(work_terms, works, params)
     topic_members = {t["id"]: set(t["work_keys"]) for t in topics}
     # Per-language class counts (topic id → stem counts) using each work's language.
     by_lang: dict[str, dict[str, Counter]] = defaultdict(dict)
@@ -1007,7 +1149,7 @@ def _decorate(
         for wk in members:
             lang = str(works[wk].get("language") or "unknown")
             slot = by_lang[lang].setdefault(tid, Counter())
-            slot.update(work_terms.get(wk) or {})
+            slot.update(label_terms.get(wk) or {})
     term_maps: dict[str, dict[str, list[dict[str, Any]]]] = {}
     for lang, classes in by_lang.items():
         term_maps[lang] = labels.ctfidf(
@@ -1068,11 +1210,21 @@ def _decorate(
             topic["label"] = "Разное"
             topic["label_source"] = "service"
         else:
-            term_names = [row["term"] for row in topic["terms"]]
+            # Prefer display surfaces that look like full words (≥ stem length).
+            term_names = []
+            for row in topic["terms"]:
+                display = str(row.get("term") or row.get("stem") or "").strip()
+                stem = str(row.get("stem") or "").strip()
+                if display and (not stem or len(display) >= len(stem)):
+                    term_names.append(display)
+                elif stem:
+                    term_names.append(stem)
             title = topic["central_works"][0]["title"] if topic["central_works"] else None
-            topic["label"] = labels.default_label(
+            term_label = labels.default_label(
                 term_names, title, n_terms=int(params["label_terms"])
             )
+            topic["term_label"] = term_label
+            topic["label"] = term_label
             topic["label_source"] = "terms"
             cache_key = hashlib.sha1(
                 ("|".join(topic["work_keys"])).encode("utf-8")
@@ -1080,7 +1232,7 @@ def _decorate(
             llm = labels.maybe_llm_label(
                 enabled=bool(params.get("llm")),
                 model=str(params.get("llm_model") or "qwen3:8b"),
-                terms=term_names,
+                terms=term_names[:10],
                 titles=[c["title"] for c in topic["central_works"]],
                 lang=maj_lang,
                 cache_key=cache_key,
@@ -1088,8 +1240,11 @@ def _decorate(
                 generate=llm_generate,
             )
             if llm:
+                topic["llm_label"] = llm
                 topic["label"] = llm
                 topic["label_source"] = "llm"
+            else:
+                topic["llm_label"] = None
         spec = topic_over.get(topic["id"]) or {}
         if isinstance(spec, dict) and spec.get("label"):
             topic["label"] = str(spec["label"])
@@ -1193,15 +1348,58 @@ def build_topics_from_index(
     t0 = time.perf_counter()
     params = params or load_params()
     overrides = overrides or {"topics": {}, "themes": {}, "merges": [], "splits": []}
-    graph = build_cluster_graph(index, params)
-    works: dict[str, dict[str, Any]] = graph["works"]
-    adj: dict[str, dict[str, float]] = graph["adj"]
-    work_edges: list[dict[str, Any]] = graph["work_edges"]
+    ph = topics_params_hash(params, overrides)
+    docs = [d for d in (index.get("documents") or []) if isinstance(d, dict)]
+    works_preview = _canonical_works(docs)
+    can_reuse = (
+        force_mode != "full"
+        and previous is not None
+        and bool(previous.get("work_edges"))
+        and previous.get("index_fingerprint") == index.get("fingerprint")
+        and previous.get("topics_params_hash") == ph
+        and set(previous.get("works") or {}) == set(works_preview)
+    )
+    if can_reuse:
+        works = {wk: dict(info) for wk, info in (previous.get("works") or {}).items()}
+        for wk, info in works_preview.items():
+            slot = works.setdefault(wk, dict(info))
+            slot.update(info)
+        work_edges = list(previous.get("work_edges") or [])
+        adj: dict[str, dict[str, float]] = {wk: {} for wk in works}
+        min_w = float(params["min_edge_weight"])
+        for edge in work_edges:
+            wa, wb = str(edge["source"])[5:], str(edge["target"])[5:]
+            if wa not in adj or wb not in adj:
+                continue
+            weight = float(edge.get("weight") or 0)
+            if weight < min_w:
+                continue
+            adj[wa][wb] = max(float(adj[wa].get(wb) or 0), weight)
+            adj[wb][wa] = adj[wa][wb]
+        prev_stats = previous.get("stats") or {}
+        graph = {
+            "works": works,
+            "adj": adj,
+            "work_edges": work_edges,
+            "segment_terms": prev_stats.get("segment_terms") or {},
+            "lex_same_author_share": prev_stats.get("lex_same_author_share"),
+            "topic_knn_edges": prev_stats.get("topic_knn_edges"),
+            "vector_debug": prev_stats.get("vector_debug") or {},
+        }
+    else:
+        graph = build_cluster_graph(index, params, work_terms=work_terms)
+        works = graph["works"]
+        adj = graph["adj"]
+        work_edges = graph["work_edges"]
     if work_terms is None:
         work_terms = _terms_from_edges(work_edges, works)
     surfaces = surfaces or {}
+    # Prefer surface forms that look like full words (not truncated stems) for labels.
+    for stem, surf in list(surfaces.items()):
+        if surf and len(str(surf)) >= len(str(stem)):
+            continue
+        surfaces[stem] = stem
     label_cache = dict((previous or {}).get("label_cache") or {})
-    ph = topics_params_hash(params, overrides)
     prev_ph = (previous or {}).get("topics_params_hash")
     old_assign = dict((previous or {}).get("assignments") or {})
     current = set(works)
@@ -1233,7 +1431,8 @@ def build_topics_from_index(
             mode = "incremental"
             trigger = "incremental"
     elif mode == "full":
-        trigger = "full"
+        # force=True with no previous is still an initial build for lineage.
+        trigger = "initial" if previous is None else "full"
 
     seq = {
         "topic": int(((previous or {}).get("id_seq") or {}).get("topic") or 0),
@@ -1275,9 +1474,57 @@ def build_topics_from_index(
                 "split": [],
                 "merge": [],
             }
-            _decorate(
-                topics, themes, works, adj, work_edges, params, overrides, work_terms, surfaces, label_cache, llm_generate
-            )
+            # Keep prior labels; only refresh sizes/authors for membership deltas.
+            prev_topics = {t["id"]: t for t in (previous.get("topics") or [])}
+            prev_themes = {t["id"]: t for t in (previous.get("themes") or [])}
+            for topic in topics:
+                old = prev_topics.get(topic["id"]) or {}
+                members = set(topic["work_keys"])
+                topic["size"] = len(members)
+                topic["work_keys"] = sorted(members)
+                topic["authors"] = _author_rows(members, works)
+                topic["author_purity"] = round(_purity(members, works), 4)
+                for key in (
+                    "label",
+                    "term_label",
+                    "llm_label",
+                    "label_source",
+                    "terms",
+                    "terms_by_lang",
+                    "central_works",
+                    "lang",
+                    "languages",
+                    "doc_kind",
+                    "doc_kinds",
+                    "collection",
+                    "service",
+                ):
+                    if key in old and key not in topic:
+                        topic[key] = old[key]
+                    elif key in old and key in {
+                        "label",
+                        "term_label",
+                        "llm_label",
+                        "label_source",
+                        "terms",
+                        "central_works",
+                    }:
+                        topic[key] = old[key]
+            for theme in themes:
+                old = prev_themes.get(theme["id"]) or {}
+                for key in ("label", "label_source", "terms", "central_works", "collection"):
+                    if key in old:
+                        theme[key] = old[key]
+                t_members: set[str] = set()
+                for topic in topics:
+                    if topic.get("theme_id") == theme["id"]:
+                        t_members.update(topic.get("work_keys") or [])
+                theme["size"] = len(t_members)
+                theme["authors"] = _author_rows(t_members, works)
+                theme["author_purity"] = round(_purity(t_members, works), 4)
+                theme["topic_ids"] = sorted(
+                    t["id"] for t in topics if t.get("theme_id") == theme["id"]
+                )
             return _package(
                 index=index,
                 tenant_id=tenant_id,
@@ -1295,6 +1542,12 @@ def build_topics_from_index(
                 assign_mode="incremental",
                 terms_source=terms_source,
                 built_ms=int((time.perf_counter() - t0) * 1000),
+                extra_stats={
+                    "lex_same_author_share": graph.get("lex_same_author_share"),
+                    "vector_debug": graph.get("vector_debug") or {},
+                    "topic_knn_edges": graph.get("topic_knn_edges"),
+                    "segment_terms": graph.get("segment_terms") or {},
+                },
             )
 
     raw_topics, raw_themes = _cluster_components(works, adj, params)
@@ -1411,7 +1664,16 @@ def build_topics_from_index(
                 "theme_id": topic["theme_id"],
                 "confidence": 1.0,
                 "provenance": {"mode": "cluster"},
+                "secondary": [],
             }
+    _assign_secondary(
+        assignments,
+        works,
+        topics,
+        adj,
+        params,
+        segment_terms=graph.get("segment_terms") or {},
+    )
     _decorate(
         topics, themes, works, adj, work_edges, params, overrides, work_terms, surfaces, label_cache, llm_generate
     )
@@ -1432,6 +1694,12 @@ def build_topics_from_index(
         assign_mode="full",
         terms_source=terms_source,
         built_ms=int((time.perf_counter() - t0) * 1000),
+        extra_stats={
+            "lex_same_author_share": graph.get("lex_same_author_share"),
+            "vector_debug": graph.get("vector_debug") or {},
+            "topic_knn_edges": graph.get("topic_knn_edges"),
+            "segment_terms": graph.get("segment_terms") or {},
+        },
     )
 
 
@@ -1579,6 +1847,66 @@ def _incremental(
     }
 
 
+def _assign_secondary(
+    assignments: dict[str, Any],
+    works: dict[str, dict[str, Any]],
+    topics: list[dict[str, Any]],
+    adj: dict[str, dict[str, float]],
+    params: dict[str, Any],
+    *,
+    segment_terms: dict[str, list[str]] | None = None,
+) -> None:
+    """Soft secondary topics for large/multi-segment works (not duplicated in overview)."""
+    max_sec = int(params.get("secondary_max") or 2)
+    ratio = float(params.get("secondary_score_ratio") or 0.6)
+    if max_sec <= 0:
+        return
+    by_topic = {t["id"]: set(t.get("work_keys") or []) for t in topics if not t.get("service")}
+    theme_of = {t["id"]: t.get("theme_id") for t in topics}
+    segment_terms = segment_terms or {}
+    for wk, row in assignments.items():
+        primary = row.get("topic_id")
+        if not primary:
+            continue
+        # Score other topics by neighbor weight into that topic
+        scores: Counter[str] = Counter()
+        for nb, w in (adj.get(wk) or {}).items():
+            for tid, members in by_topic.items():
+                if tid == primary:
+                    continue
+                if nb in members:
+                    scores[tid] += float(w)
+        # Soft boost: large works with segment terms that appear in other topic labels/terms
+        if wk in segment_terms:
+            for tid, members in by_topic.items():
+                if tid == primary:
+                    continue
+                # weak prior so segment-only works can get a secondary
+                scores[tid] += 0.01 * len(segment_terms[wk])
+        if not scores:
+            row["secondary"] = []
+            continue
+        primary_score = sum(float(w) for nb, w in (adj.get(wk) or {}).items() if nb in (by_topic.get(primary) or set()))
+        primary_score = max(primary_score, max(scores.values()) if scores else 0.0, 1e-6)
+        picked = []
+        for tid, sc in scores.most_common(max_sec + 2):
+            if sc / primary_score < ratio:
+                continue
+            picked.append(
+                {
+                    "topic_id": tid,
+                    "theme_id": theme_of.get(tid),
+                    "score": round(sc / primary_score, 4),
+                }
+            )
+            if len(picked) >= max_sec:
+                break
+        row["secondary"] = picked
+        # Mirror onto work card for API
+        if wk in works:
+            works[wk]["secondary_topics"] = picked
+
+
 def _package(
     *,
     index: dict[str, Any],
@@ -1597,6 +1925,7 @@ def _package(
     assign_mode: str,
     terms_source: str,
     built_ms: int,
+    extra_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # Ensure theme topic_ids reflect final topics and drop helper keys.
     live = {t["id"] for t in topics}
@@ -1656,11 +1985,13 @@ def _package(
             "unthemed_share": round(unthemed / n_works, 4) if n_works else 0.0,
             "author_purity": purity,
             "same_author_factor": params["same_author_factor"],
+            "author_debias_alpha": params.get("author_debias_alpha"),
             "terms_source": terms_source,
             "collections": [
                 {"collection": name, **counts}
                 for name, counts in sorted(collections.items())
             ],
+            **(extra_stats or {}),
         },
         "themes": theme_rows,
         "topics": topics,
@@ -1857,21 +2188,28 @@ def build_after_index(
         work_terms = None
         surfaces = None
         terms_source = "provenance"
-        if use_artifacts:
-            preview = _canonical_works(
-                [d for d in (index.get("documents") or []) if isinstance(d, dict)]
-            )
-            loaded, surfaces, name_stems = load_terms_from_artifacts(tenant_id, preview)
-            if name_stems and any(loaded[w] for w in loaded):
-                graph = build_cluster_graph(index, params)
-                provenance = _terms_from_edges(graph["work_edges"], graph["works"])
-                work_terms = _merge_label_terms(graph["works"], provenance, loaded, name_stems)
-                terms_source = "mixed"
-            elif any(loaded[w] for w in loaded):
-                # Name heuristic missing: keep edge terms so character names
-                # from raw counts cannot become the label.
-                surfaces = surfaces or {}
-                terms_source = "provenance"
+        # Prefer artifact term bags for thematic vectors (always when available).
+        preview = _canonical_works(
+            [d for d in (index.get("documents") or []) if isinstance(d, dict)]
+        )
+        loaded, surfaces, name_stems = load_terms_from_artifacts(tenant_id, preview)
+        _ = use_artifacts  # artifacts always preferred for topic vectors when present
+        if any(loaded.get(w) for w in loaded):
+            # Strip proper names; keep raw thematic counts for vectors + labels.
+            cleaned: dict[str, Counter] = {wk: Counter() for wk in preview}
+            for wk, counts in loaded.items():
+                slot = cleaned.setdefault(wk, Counter())
+                for stem, tf in counts.items():
+                    text = str(stem)
+                    if len(text) < 4 or text in name_stems:
+                        continue
+                    try:
+                        slot[text] += int(tf)
+                    except (TypeError, ValueError):
+                        continue
+            work_terms = cleaned
+            terms_source = "artifacts" if not name_stems else "mixed"
+            surfaces = surfaces or {}
         payload = build_topics_from_index(
             index,
             params=params,
@@ -1879,7 +2217,8 @@ def build_after_index(
             previous=previous,
             work_terms=work_terms,
             surfaces=surfaces,
-            force_mode=force_mode,
+            # force=True means a deliberate rebuild (params/features may have changed).
+            force_mode=force_mode or ("full" if force else None),
             llm_generate=llm_generate,
             terms_source=terms_source,
             tenant_id=str(tenant_id),
@@ -2150,6 +2489,7 @@ def _work_node(payload: dict[str, Any], wk: str) -> dict[str, Any]:
             "author_ru": info.get("author_ru"),
             "document_ids": info.get("document_ids") or [],
             "filename": info.get("filename"),
+            "secondary": list(assign.get("secondary") or info.get("secondary_topics") or []),
         },
     )
 
@@ -2348,6 +2688,15 @@ def view_topic(payload: dict[str, Any], topic_id: str, *, limit: int | None = No
     params = payload.get("params") or load_params()
     cap = node_limit(params, limit)
     works = payload.get("works") or {}
+    # Secondary members: works whose primary topic is elsewhere but list this as secondary.
+    secondary_members = []
+    for wk, assign in (payload.get("assignments") or {}).items():
+        if assign.get("topic_id") == topic_id:
+            continue
+        for sec in assign.get("secondary") or []:
+            if sec.get("topic_id") == topic_id:
+                secondary_members.append({"work_key": wk, "score": sec.get("score")})
+                break
     nodes = [_work_node(payload, wk) for wk in topic.get("work_keys") or [] if wk in works]
     author_ids = set()
     edges: list[dict[str, Any]] = []
@@ -2396,7 +2745,11 @@ def view_topic(payload: dict[str, Any], topic_id: str, *, limit: int | None = No
             node = _topic_node(topics[tid])
             node["attrs"]["neighbor"] = True
             nodes.append(node)
-    return _envelope(payload, level="topic", nodes=nodes, edges=edges, limit=cap, seed=topic_id)
+    body = _envelope(payload, level="topic", nodes=nodes, edges=edges, limit=cap, seed=topic_id)
+    body["secondary"] = secondary_members
+    body["term_label"] = topic.get("term_label")
+    body["llm_label"] = topic.get("llm_label")
+    return body
 
 
 def _normalize_types(types: list[str] | None) -> set[str] | None:
@@ -2489,9 +2842,11 @@ def view_node(payload: dict[str, Any], node_id: str, *, limit: int | None = None
             if node_id in (info.get("document_ids") or []):
                 wk = key
                 break
+    secondary = []
     if wk and wk in works:
         info = works[wk]
         assign = (payload.get("assignments") or {}).get(wk) or {}
+        secondary = list(assign.get("secondary") or info.get("secondary_topics") or [])
         for did in info.get("document_ids") or []:
             documents.append(
                 {
@@ -2511,6 +2866,8 @@ def view_node(payload: dict[str, Any], node_id: str, *, limit: int | None = None
         if node["id"] == node_id:
             node["attrs"]["documents"] = documents
             node["attrs"]["chunks"] = chunks[:30]
+            node["attrs"]["secondary"] = secondary
+    local["secondary"] = secondary
     local["meta"]["level"] = "node"
     return local
 
