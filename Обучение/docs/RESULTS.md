@@ -53,3 +53,7 @@
 | Graph topics 2c | 1 | corpus | expectations_groups | 3/3 | 3/3 | PASS | artifacts/20261112-064335-topics |
 | Graph topics 2c | 1 | corpus | recluster_ms | 3204 | ≤30000 | PASS | artifacts/20261112-064335-topics |
 | Graph topics 2c | 1 | corpus | cached_full_ms | 2262 | ≤30000 | PASS | artifacts/20261112-064335-topics |
+
+## 2026-11-12 Slice 3 Graph UI
+- artifacts/20261112-graph-s3/ REPORT + screenshots; overview 37ms / 61 FPS; zero external Network
+

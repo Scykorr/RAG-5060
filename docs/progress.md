@@ -1,3 +1,11 @@
+## 2026-11-12 — Slice 3 (Obsidian Graph UI)
+
+- Vendor: graphology 0.25.4 + sigma 2.4.0 + d3 7.9 (offline under `apps/web/vendor/`); adapter `js/graph/graph-view.js`
+- Shell: levels overview/theme/topic/local, hash crumbs, settings parity, Obsidian look (`#1e1e1e` / `#7f6df2`), position cache, rebuild/stale
+- Smoke: overview 31/217 in 37 ms, 61 FPS; theme 97/730; local 122/941; **0 external** Network
+- Fix: sigma `nodeKind` not `type` (E-20261112-sigma-node-type); API image rebuilt for level routes
+- Knowledge: **S60**, **A25**; ROADMAP **F15.6c**; report `artifacts/20261112-graph-s3/`
+
 ## 2026-11-12 — Slice 2c (proper nouns, weak texts, grounded labels, cache)
 
 - Proper/dialogue cap + entity person/place ban; weak/short → «Без темы» (unthemed≤10%); theme_resolution 1.3; grounded LLM labels; vec_cache + stage_ms

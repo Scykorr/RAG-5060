@@ -316,3 +316,14 @@
 - prevent: S59; не звать полный entropy в decorate
 - links: `graph_topics._thematic_label_terms`, `graph_topics_quality.vec_cache`
 - status: fixed
+
+## 2026-11-12 — Sigma: could not find program for node type «theme»
+- id: E-20261112-sigma-node-type
+- symptom: вкладка «Граф» 0 узлов при живом API levels; console `Sigma: could not find a suitable program for node type "theme"`
+- reproduce: `GraphView.setData` с `type: "theme"|"topic"|"work"` в атрибутах graphology
+- root_cause: в sigma/graphology поле `type` выбирает WebGL‑программу узла (circle/…), а не доменный тип
+- fix: писать семантику в `nodeKind` / `edgeKind`; не задавать `type` на узлах/рёбрах
+- replay: открыть `/#graph/overview` → статус «N узлов · M связей» (N>0); без ошибки в console
+- prevent: S60; любые данные в GraphView только через адаптер
+- links: `apps/web/js/graph/graph-view.js`
+- status: fixed

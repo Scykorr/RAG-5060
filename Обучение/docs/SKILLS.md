@@ -82,6 +82,7 @@
 | S57 | Themes/topics поверх connectivity index | После rebuild индекса / level API, без UI-вкладки | 1) Louvain stdlib (`graph_louvain`, seed из `configs/graph_topics.json`); lifecycle: id Jaccard≥0.5, incremental ≤20%, reset → `graph/topics/<tenant>.json`; 2) `in_theme` = collection, не смысловая тема; 3) API: `GET /api/graph/overview?view=levels`, `/themes/{id}`, `/topics/{id}`, `/local/{id}`, `/search`, `/nodes/{id}` (+`secondary`); `POST /rebuild?scope=index\|topics\|all`; 4) **признаки кластеризации — S58** (не сырой `work_lex_similar`) | `pytest tests/unit/test_graph_topics.py tests/unit/test_graph_topics_api.py`; A22/A23 |
 | S58 | Тематические topic_vectors (не идиолект автора) | Themes «папками автора» / подписи «дескать, нешто» / purity≫0.75 | 1) Векторы: `graph_topic_vectors` — entropy≥`min_author_entropy` у ≥3 авторов (иначе ×0.1), `topic_style_stopwords`+auto-style, ru‑деепричастия, noun boost, leave‑one‑out debias α=`author_debias_alpha`, cap/`topic_vector_top_k`; 2) Граф тем: kNN `topic_knn` (не `work_lex_similar`), `same_author_factor=0.35`, cross‑author quota; 3) Подписи: c‑TF‑IDF только по thematic dict (low‑entropy drop), LLM `qwen3:8b` с timeout/fallback; 4) Ожидания в `configs/graph_topics_expectations.json` (не в коде); отчёт `scripts/graph_topics_report.py` — грузить index из pointer (не `build_index_for_tenant`: `_with_topics` удвоит сборку) | `pytest tests/unit/test_graph_topic_vectors.py tests/unit/test_graph_topics.py`; report `artifacts/20261112-052018-topics/`; A23; E‑topics‑author‑folder |
 | S59 | Чистка тематик 2c (proper / weak / labels / cache) | Имена в top‑терминах; короткие тексты «ломают» темы; медленный topics_build/recluster; неверные LLM‑подписи | 1) Proper: `cap_ratio` mid‑cap ≥0.8 **или** dialogue‑heuristic (upperish≥0.9, almost no lower) + person/place entity stems → вес 0 в topic_vectors (shared_entity не трогать); 2) Weak: short/low‑conf → «Без темы» + dissolve >50% weak; снижать conf/−tokens пока unthemed≤10%; 3) Labels: grounded LLM (`label_grounded`, 1 retry, terms fallback) и для themes; быстрый `_thematic_label_terms` без повторного entropy; 4) Cache: `vec_cache/(filter_config_hash)` по (work, content_hash); stage_ms; α/`same_author_factor` не менять | `pytest …topic_vectors/topics` (28); report `artifacts/20261112-064335-topics/` PASS; A24; E‑topics‑proper / labels‑slow |
+| S60 | Obsidian Graph UI (sigma+d3, offline) | Вкладка «Граф»; уровни/настройки/look | 1) Vendor: `apps/web/vendor/{graphology,sigma,d3}` — без CDN; 2) Рендер только через `GraphView` (`js/graph/graph-view.js`); семантика узла в `nodeKind`, **не** в sigma `type`; 3) Shell: `graph-app.js` — hash `#graph/overview|theme|topic|local`, крошки, side panel, settings (filters/groups/display/forces) в localStorage per tenant+level; 4) Позиции кэш + `updateData` incremental; reset-rag → `GraphSettings.clearPositions`; 5) API: `overview?view=levels`, themes/topics/local?directions=, search, rebuild; UI strings в `i18n.js` | Report `artifacts/20261112-graph-s3/`; A25; E‑sigma‑node‑type |
 
 ---
 
@@ -94,7 +95,7 @@
 | Корпус / prefix / reset | S06, S11, S21, S27, S28, S30–S32, S54 |
 | Intent / catalog | S33, S34 |
 | Login / WSL / UI port | S37–S45, S47, S49, S52 |
-| Graph Explorer | S50, S53, S54, S55, S56, S57, S58, S59 |
+| Graph Explorer | S50, S53, S54, S55, S56, S57, S58, S59, S60 |
 | Offline / deps | S29, S46, S54 |
-| Graph | S35, S36, S50, S54, S55, S56, S57, S58, S59 |
+| Graph | S35, S36, S50, S54, S55, S56, S57, S58, S59, S60 |
 | Ритуал агента | S23, S48, S51 |

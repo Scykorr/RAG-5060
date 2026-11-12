@@ -408,6 +408,7 @@ Offline автоусиление ответов на корпусе (не fine-t
 - [x] F15.6. Obsidian-like UX on Cytoscape (no D3): degree size, prefix colors, hide orphans, BFS chain depth, click→local, sparse-edge CTA.
 - [x] F15.6a. Offline connectivity index (F04.18/a/b): layers + lifecycle + 1d quality; skills S54/S55, abilities A19/A20.
 - [x] F15.6b. Theme/topic levels API (F04.18f/g/h): overview levels + thematic clustering + 2c cleanup; S57/S58/S59, A22/A23/A24; no dedicated UI tab yet.
+- [x] F15.6c. Obsidian Graph UI (Slice 3): sigma+d3-force vendor offline; levels/hash/settings/look; S60/A25; report `artifacts/20261112-graph-s3/`.
 - [ ] F15.7. P1/P2: real embedding ANN после N1; LLM relation detector OFF by default; entity graph.
 
 **Приёмка:** реальные рёбра из корпуса, ACL, offline UI, без CDN; chat/ingestion не сломаны.
