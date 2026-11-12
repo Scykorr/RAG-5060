@@ -383,7 +383,10 @@ def stem_ru(token: str) -> str:
 
 def tokenize(text: str) -> list[str]:
     """Simple lexical tokenizer: unicode letters/digits length ≥2, stop-filtered."""
-    raw = re.findall(r"[0-9A-Za-zА-Яа-яЁё]{2,}", text or "", flags=re.UNICODE)
+    from apps.api.services.graph_text_clean import normalize_homoglyphs
+
+    cleaned, _ = normalize_homoglyphs(text or "")
+    raw = re.findall(r"[0-9A-Za-zА-Яа-яЁё]{2,}", cleaned, flags=re.UNICODE)
     out: list[str] = []
     for t in raw:
         key = norm_ru(t)
@@ -397,7 +400,10 @@ def tokenize(text: str) -> list[str]:
 
 def tokenize_lex(text: str) -> list[str]:
     """Tokenizer for lex_similar: letters only, len≥4, stemmed, RU stops filtered."""
-    raw = re.findall(r"[A-Za-zА-Яа-яЁё]{4,}", text or "", flags=re.UNICODE)
+    from apps.api.services.graph_text_clean import normalize_homoglyphs
+
+    cleaned, _ = normalize_homoglyphs(text or "")
+    raw = re.findall(r"[A-Za-zА-Яа-яЁё]{4,}", cleaned, flags=re.UNICODE)
     out: list[str] = []
     for t in raw:
         key = norm_ru(t)

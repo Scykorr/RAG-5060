@@ -1,6 +1,40 @@
-"""Tests for clean_chunk_for_graph (slice 1c step 1)."""
+"""Tests for clean_chunk_for_graph (slice 1c step 1 + 2d homoglyphs)."""
 
-from apps.api.services.graph_text_clean import clean_chunk_for_graph
+from apps.api.services.graph_text_clean import (
+    clean_chunk_for_graph,
+    fix_mixed_script_token,
+    normalize_homoglyphs,
+)
+
+
+def test_homoglyph_cyrillic_dominant():
+    assert fix_mixed_script_token("cказал") == ("сказал", True)
+    assert fix_mixed_script_token("cнег") == ("снег", True)
+    assert fix_mixed_script_token("bзжелт") == ("взжелт", True)
+    assert fix_mixed_script_token("Bасильевн") == ("Васильевн", True)
+    # Pure Latin untouched
+    assert fix_mixed_script_token("TLS") == ("TLS", False)
+    assert fix_mixed_script_token("certificate") == ("certificate", False)
+
+
+def test_normalize_homoglyphs_in_text_and_clean_chunk():
+    text, fixes = normalize_homoglyphs("Он cказал про cнег и RFC.")
+    assert "сказал" in text
+    assert "снег" in text
+    assert "RFC" in text
+    assert any(a == "cказал" and b == "сказал" for a, b in fixes)
+    raw = (
+        "Произведение русской классики\n"
+        "Автор/папка: Chekhov\n"
+        "Файл: x.txt\n"
+        "\n"
+        "Он cказал: — Вот и cон.\n"
+        "The certificate uses TLS.\n"
+    )
+    clean, info = clean_chunk_for_graph(raw, chunk_ordinal=2)
+    assert "сказал" in clean
+    assert "TLS" in clean
+    assert int(info.get("homoglyph_fixes") or 0) >= 1
 
 
 def test_strips_author_papka_file_banner():

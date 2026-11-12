@@ -49,7 +49,7 @@ from apps.api.services.text_entities import (
 
 log = structlog.get_logger()
 
-INDEX_VERSION = 16  # slice-2 step0: refers/entity/lang/stage/shingles + fp-heal
+INDEX_VERSION = 17  # slice-2d: mixed Latin/Cyrillic homoglyph normalization in clean_chunk
 
 # Filename grammar tokens (source-site / language folder markers), not corpus content.
 SOURCE_TOKENS = frozenset({"ch", "eb"})
@@ -567,6 +567,27 @@ def _is_sentence_start(text: str, idx: int) -> bool:
     if text[j] == "-" and (j == 0 or text[j - 1] in "\n \t-"):
         return True
     return False
+
+
+_PLAY_SPEAKER_LINE_RE = re.compile(
+    r"^[\t ]*([A-ZА-ЯЁ][A-Za-zА-Яа-яЁё\-]{1,40}"
+    r"(?:\s+[A-ZА-ЯЁ][A-Za-zА-Яа-яЁё\-]{1,40}){0,2})\s*[\.\(]",
+    flags=re.UNICODE,
+)
+
+
+def _is_play_speaker_at(text: str, idx: int) -> bool:
+    """True if token at idx is a play cue name: ``ТРЕПЛЕВ.`` / ``Треплев (входя).``."""
+    if idx < 0 or idx >= len(text):
+        return False
+    line_start = text.rfind("\n", 0, idx) + 1
+    nl = text.find("\n", idx)
+    line = text[line_start : nl if nl >= 0 else len(text)]
+    m = _PLAY_SPEAKER_LINE_RE.match(line)
+    if not m:
+        return False
+    rel = idx - line_start
+    return m.start(1) <= rel < m.end(1)
 
 
 def _window(text: str, idx: int, length: int, radius: int = 48) -> str:
@@ -2892,6 +2913,8 @@ def _build_doc_artifact(
     identifiers: list[str] = []
     identifier_kinds: dict[str, str] = {}
     identifier_chunks: dict[str, list[str]] = defaultdict(list)
+    homoglyph_fixes = 0
+    homoglyph_examples: list[tuple[str, str]] = []
     raw_texts = [t for _, _, t in raw_chunks]
     chash = gcache.content_hash(
         version_id=version_id, filename=meta.filename, chunk_texts=raw_texts
@@ -2924,6 +2947,13 @@ def _build_doc_artifact(
         chars_removed += removed
         if removed > 0 and len(examples) < 2:
             examples.append({"before": (text or "")[:220], "after": clean[:220]})
+        hf = int(hdr.get("homoglyph_fixes") or 0)
+        homoglyph_fixes += hf
+        for pair in hdr.get("homoglyph_examples") or []:
+            if len(homoglyph_examples) >= 40:
+                break
+            if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                homoglyph_examples.append((str(pair[0]), str(pair[1])))
         clang = glang.detect_language(clean)
         chunk_langs.append(clang)
         clean_chunks.append({"id": chunk_id, "ordinal": ord_n, "text": clean, "language": clang})
@@ -2934,7 +2964,10 @@ def _build_doc_artifact(
                 key = norm_ru(w)
                 if w[0].isupper():
                     case_stats[key]["upper"] += 1
-                    if _is_sentence_start(clean, m.start()):
+                    # Play speaker cues are proper names, not sentence starts.
+                    if _is_play_speaker_at(clean, m.start()):
+                        pos_stats[key]["mid"] += 1
+                    elif _is_sentence_start(clean, m.start()):
                         pos_stats[key]["sent_start"] += 1
                     else:
                         pos_stats[key]["mid"] += 1
@@ -3019,6 +3052,8 @@ def _build_doc_artifact(
         "pos_stats": {k: dict(v) for k, v in pos_stats.items()},
         "chars_removed": chars_removed,
         "examples": examples,
+        "homoglyph_fixes": homoglyph_fixes,
+        "homoglyph_examples": [{"before": a, "after": b} for a, b in homoglyph_examples[:20]],
         "word_count": word_count,
         "minhash": minhash,
         "shingles": shingle_payload,
@@ -3354,9 +3389,15 @@ def build_index_for_tenant(
     identifier_chunks: dict[str, dict[str, list[str]]] = {}
     case_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"upper": 0, "lower": 0})
     pos_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"sent_start": 0, "mid": 0})
+    work_case_pos: dict[str, dict[str, dict[str, int]]] = defaultdict(
+        lambda: defaultdict(lambda: {"mid": 0, "lower": 0, "sent_start": 0})
+    )
     chunk_rows: list[tuple[str, str, str]] = []
     clean_chars_removed = 0
     clean_examples: list[dict[str, str]] = []
+    homoglyph_fix = 0
+    homoglyph_examples: list[dict[str, str]] = []
+    en_homoglyph_touched = 0
     chunk_total = 0
     for meta in docs:
         art = artifacts[meta.document_id]
@@ -3371,13 +3412,34 @@ def build_index_for_tenant(
         doc_identifiers[meta.document_id] = list(art.get("identifiers") or [])
         identifier_kinds_by_doc[meta.document_id] = dict(art.get("identifier_kinds") or {})
         identifier_chunks[meta.document_id] = dict(art.get("identifier_chunks") or {})
+        wk = str(meta.work_key or meta.document_id)
         for k, v in (art.get("case_stats") or {}).items():
             case_stats[k]["upper"] += int(v.get("upper") or 0)
             case_stats[k]["lower"] += int(v.get("lower") or 0)
+            work_case_pos[wk][k]["lower"] += int(v.get("lower") or 0)
         for k, v in (art.get("pos_stats") or {}).items():
             pos_stats[k]["sent_start"] += int(v.get("sent_start") or 0)
             pos_stats[k]["mid"] += int(v.get("mid") or 0)
+            work_case_pos[wk][k]["mid"] += int(v.get("mid") or 0)
+            work_case_pos[wk][k]["sent_start"] += int(v.get("sent_start") or 0)
         clean_chars_removed += int(art.get("chars_removed") or 0)
+        hfixes = int(art.get("homoglyph_fixes") or 0)
+        homoglyph_fix += hfixes
+        lang_art = str(art.get("language") or meta.language or "")
+        if hfixes and lang_art.startswith("en"):
+            en_homoglyph_touched += 1
+        for hex_ in art.get("homoglyph_examples") or []:
+            if len(homoglyph_examples) >= 20:
+                break
+            if isinstance(hex_, dict) and hex_.get("before") and hex_.get("after"):
+                homoglyph_examples.append(
+                    {
+                        "before": str(hex_["before"]),
+                        "after": str(hex_["after"]),
+                        "doc_id": meta.document_id,
+                        "language": lang_art,
+                    }
+                )
         for ex in art.get("examples") or []:
             if len(clean_examples) < 5:
                 clean_examples.append({"doc_id": meta.document_id, **ex})
@@ -3664,6 +3726,9 @@ def build_index_for_tenant(
                 "chars_removed": clean_chars_removed,
                 "chunks_touched": sum(1 for a in artifacts.values() if int(a.get("chars_removed") or 0) > 0),
                 "examples": clean_examples,
+                "homoglyph_fixes": homoglyph_fix,
+                "homoglyph_examples": homoglyph_examples[:20],
+                "en_docs_homoglyph_touched": en_homoglyph_touched,
             },
             "layer_ms": layer_ms,
             "build_mode": build_mode,

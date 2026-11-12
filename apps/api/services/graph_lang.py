@@ -351,9 +351,11 @@ def stem_token(token: str, lang: str) -> str:
 
 def tokenize_lex_lang(text: str, lang: str) -> list[str]:
     """Lex tokens for a language: letters ≥4, stemmed, stop/style filtered."""
+    from apps.api.services.graph_text_clean import normalize_homoglyphs
     from apps.api.services.text_entities import norm_ru
 
     if lang == "en":
+        # Pure English path: do not rewrite Latin lookalikes.
         raw = re.findall(r"[A-Za-z]{4,}", text or "")
         stops = glex.lang_frozenset("en", "lex_stopwords") | glex.lang_frozenset(
             "en", "style_burst_hints"
@@ -368,7 +370,8 @@ def tokenize_lex_lang(text: str, lang: str) -> list[str]:
             out.append(stem_en(key))
         return out
     # ru / mixed / unknown → Russian pipeline (mixed uses caller's chunk lang)
-    raw = re.findall(r"[A-Za-zА-Яа-яЁё]{4,}", text or "", flags=re.UNICODE)
+    cleaned, _ = normalize_homoglyphs(text or "")
+    raw = re.findall(r"[A-Za-zА-Яа-яЁё]{4,}", cleaned, flags=re.UNICODE)
     stops = glex.lang_frozenset("ru", "lex_stopwords") | glex.lang_frozenset(
         "ru", "style_burst_hints"
     ) | glex.lang_frozenset("ru", "speech_verbs") | glex.lang_frozenset(

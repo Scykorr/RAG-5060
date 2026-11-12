@@ -33,6 +33,70 @@ from typing import Any, Mapping
 
 from apps.api.services.text_entities import norm_ru
 
+# Latin lookalikes that appear inside mostly-Cyrillic OCR/typo tokens (cказал → сказал).
+_LATIN_TO_CYR = str.maketrans(
+    {
+        "a": "а",
+        "A": "А",
+        "c": "с",
+        "C": "С",
+        "e": "е",
+        "E": "Е",
+        "o": "о",
+        "O": "О",
+        "p": "р",
+        "P": "Р",
+        "x": "х",
+        "X": "Х",
+        "y": "у",
+        "k": "к",
+        "K": "К",
+        "m": "м",
+        "M": "М",
+        "t": "т",
+        "T": "Т",
+        "b": "в",
+        "B": "В",
+        "H": "Н",
+    }
+)
+_CYR_RE = re.compile(r"[А-Яа-яЁё]")
+_LAT_RE = re.compile(r"[A-Za-z]")
+_WORD_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+", flags=re.UNICODE)
+
+
+def fix_mixed_script_token(token: str) -> tuple[str, bool]:
+    """If token mixes scripts and Cyrillic dominates, map Latin lookalikes → Cyrillic.
+
+    Pure Latin tokens (English) are left untouched.
+    """
+    if not token:
+        return token, False
+    cyr = len(_CYR_RE.findall(token))
+    lat = len(_LAT_RE.findall(token))
+    if cyr <= 0 or lat <= 0:
+        return token, False
+    if cyr < lat:
+        return token, False
+    fixed = token.translate(_LATIN_TO_CYR)
+    return fixed, fixed != token
+
+
+def normalize_homoglyphs(text: str) -> tuple[str, list[tuple[str, str]]]:
+    """Rewrite mixed Latin/Cyrillic tokens in ``text``. Returns (new_text, fixes)."""
+    if not text:
+        return "", []
+    fixes: list[tuple[str, str]] = []
+
+    def _repl(m: re.Match[str]) -> str:
+        raw = m.group(0)
+        fixed, changed = fix_mixed_script_token(raw)
+        if changed:
+            fixes.append((raw, fixed))
+        return fixed
+
+    return _WORD_RE.sub(_repl, text), fixes
+
 # Labels that start a header field line (exact corpus markers).
 _HEADER_LABELS = (
     "Автор/папка",
@@ -358,6 +422,10 @@ def clean_chunk_for_graph(
 
     clean = "\n".join(lines).strip()
     clean = strip_stage_directions(clean)
+    clean, homo_fixes = normalize_homoglyphs(clean)
+    if homo_fixes:
+        header_info["homoglyph_fixes"] = len(homo_fixes)
+        header_info["homoglyph_examples"] = homo_fixes[:20]
     # Collapse runs of blank lines left by stripping
     clean = re.sub(r"\n{3,}", "\n\n", clean)
     header_info["chars_removed"] = max(0, len(raw) - len(clean))
